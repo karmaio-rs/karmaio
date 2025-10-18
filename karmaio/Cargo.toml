@@ -1,0 +1,18 @@
+[package]
+name = "karmaio"
+description = "A modern fast multi-threaded share-nothing asynchronous runtime for Rust"
+repository = "https://github.com/octavezero/karmaio"
+homepage = "https://github.com/octavezero/karmaio"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
+authors = ["Tarak Sharma <tarak@taraksharma.com>"]
+
+version = "0.1.0"
+
+categories = ["asynchronous", "network-programming"]
+keywords = ["io", "thread-per-core", "iouring", "async", "futures"]
+
+rust-version = "1.90"
+edition = "2024"
+
+[dependencies]

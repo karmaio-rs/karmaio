@@ -152,13 +152,12 @@ impl State {
             state.unset_running();
 
             if !state.is_notified() {
-                state.ref_dec();
-
-                if state.ref_count() == 0 {
-                    action = TransitionToIdle::OkDealloc;
-                } else {
-                    action = TransitionToIdle::Ok;
-                }
+                // The task is now idle. The ref count that "ran" the task
+                // is not decremented here. It is the responsibility of the
+                // task handle that was `run` to be dropped, which will dec
+                // the ref count. If the future is pending, it should have
+                // cloned the waker, incrementing the ref count.
+                action = TransitionToIdle::Ok;
             } else {
                 // The caller will schedule a new notification, so we create a
                 // new ref-count for the notification. Our own ref-count is kept

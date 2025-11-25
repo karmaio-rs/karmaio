@@ -5,12 +5,15 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use crate::task::{
-    Schedule, Task,
-    state::{Snapshot, TransitionToIdle, TransitionToRunning},
-    trailer::Trailer,
-    utils::UnsafeCellExt,
-    waker::waker_ref,
+use crate::{
+    runtime::Schedule,
+    task::{
+        Task,
+        state::{Snapshot, TransitionToIdle, TransitionToRunning},
+        trailer::Trailer,
+        utils::UnsafeCellExt,
+        waker::waker_ref,
+    },
 };
 
 use super::{header::Header, internal::InternalTask, raw::RawTask};

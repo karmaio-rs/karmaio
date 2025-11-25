@@ -1,6 +1,9 @@
 use std::{ptr::NonNull, task::Waker};
 
-use crate::task::{Schedule, header::Header, internal::InternalTask, state::TransitionToNotified};
+use crate::{
+    runtime::Schedule,
+    task::{header::Header, internal::InternalTask, state::TransitionToNotified},
+};
 
 pub(crate) struct RawTask {
     task_ptr: NonNull<Header>,

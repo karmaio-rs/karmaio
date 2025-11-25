@@ -4,9 +4,12 @@ use std::{
     task::{Context, Poll},
 };
 
-use crate::task::{state::State, vtable::VTable};
+use crate::{
+    runtime::Schedule,
+    task::{state::State, vtable::VTable},
+};
 
-use super::{Schedule, header::Header, trailer::Trailer, utils::UnsafeCellExt};
+use super::{header::Header, trailer::Trailer, utils::UnsafeCellExt};
 
 pub(crate) enum Stage<F: Future> {
     Running(F),

@@ -16,3 +16,7 @@ rust-version = "1.90"
 edition = "2024"
 
 [dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.6"

@@ -16,6 +16,7 @@ target
 # IDE Folders
 .idea/
 .vscode/
+.zed/
 
 # ENV Files
 .env

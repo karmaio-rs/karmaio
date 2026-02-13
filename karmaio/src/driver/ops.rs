@@ -1,4 +1,7 @@
-use std::task::Waker;
+use std::{
+    pin::Pin,
+    task::{Context, Poll, Waker},
+};
 
 pub(crate) enum State {
     // The operation has been submitted to the driver and is currently in-flight
@@ -38,7 +41,7 @@ impl<T> Op<T> {
     pub(crate) fn new(index: usize, data: T) -> Self {
         Self {
             index,
-            data,
+            data: Option::Some(data),
             state: State::Submitted,
         }
     }
@@ -52,7 +55,7 @@ impl<T> Op<T> {
     }
 }
 
-impl Future<T: Completable> for Op<T> {
+impl<T: Completable> Future for Op<T> {
     type Output = T::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -60,7 +63,7 @@ impl Future<T: Completable> for Op<T> {
     }
 }
 
-impl Drop<T> for Op<T> {
+impl<T> Drop for Op<T> {
     fn drop(&mut self) {
         //TODO: Implement drop cleanup logic here
     }

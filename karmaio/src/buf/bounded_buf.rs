@@ -9,7 +9,7 @@ use crate::buf::{IoBuf, Slice};
 // The method takes ownership of the buffer and returns a [`Slice`] value that tracks the requested range.
 //
 // This trait provides a generic way to use buffers and `Slice` views into such buffers with `io-uring` operations.
-pub trait SlicedBuf: Unpin + 'static {
+pub trait BoundedIoBuf: Unpin + 'static {
     // The type of the underlying buffer.
     type Buf: IoBuf;
 
@@ -54,20 +54,20 @@ pub trait SlicedBuf: Unpin + 'static {
     fn bytes_total(&self) -> usize;
 }
 
-impl<T: IoBuf> SlicedBuf for T {
+impl<T: IoBuf> BoundedIoBuf for T {
     type Buf = Self;
     type Bounds = ops::RangeFull;
 
     fn slice(self, range: impl ops::RangeBounds<usize>) -> Slice<Self> {
         use ops::Bound;
 
-        let begin = match range.start_bound() {
+        let start = match range.start_bound() {
             Bound::Included(&n) => n,
             Bound::Excluded(&n) => n.checked_add(1).expect("out of range"),
             Bound::Unbounded => 0,
         };
 
-        assert!(begin < self.bytes_total());
+        assert!(start < self.bytes_total());
 
         let end = match range.end_bound() {
             Bound::Included(&n) => n.checked_add(1).expect("out of range"),
@@ -76,36 +76,42 @@ impl<T: IoBuf> SlicedBuf for T {
         };
 
         assert!(end <= self.bytes_total());
-        assert!(begin <= self.bytes_init());
+        assert!(start <= self.bytes_init());
 
-        Slice::new(self, begin, end)
+        Slice::new(self, start, end)
     }
 
+    #[inline]
     fn slice_full(self) -> Slice<Self> {
-        let end = self.bytes_total();
-        Slice::new(self, 0, end)
+        self.slice(..)
     }
 
+    #[inline]
     fn get_buf(&self) -> &Self {
         self
     }
 
+    #[inline]
     fn bounds(&self) -> Self::Bounds {
         ..
     }
 
+    #[inline]
     fn from_buf_bounds(buf: Self, _: ops::RangeFull) -> Self {
         buf
     }
 
+    #[inline]
     fn stable_read_ptr(&self) -> *const u8 {
         IoBuf::stable_read_ptr(self)
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         IoBuf::bytes_init(self)
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         IoBuf::bytes_total(self)
     }

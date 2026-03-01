@@ -1,8 +1,7 @@
 // An `io_uring` compatible buffer.
 //
 // The `IoBuf` trait is implemented by buffer types that can be passed to
-// io_uring operations. Users will not need to use this trait directly, except
-// for the [`slice`] method.
+// io_uring operations. Users will not need to use this trait directly.
 //
 // # Safety
 //
@@ -36,70 +35,100 @@ pub unsafe trait IoBuf: Unpin + 'static {
 }
 
 unsafe impl IoBuf for Vec<u8> {
+    #[inline]
     fn stable_read_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.capacity()
     }
 }
 
 unsafe impl IoBuf for &'static [u8] {
+    #[inline]
     fn stable_read_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.bytes_init()
     }
 }
 
 unsafe impl IoBuf for Box<[u8]> {
+    #[inline]
     fn stable_read_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.bytes_init()
     }
 }
 
+unsafe impl<const N: usize> IoBuf for [u8; N] {
+    #[inline]
+    fn stable_read_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+    #[inline]
+    fn bytes_init(&self) -> usize {
+        N
+    }
+    #[inline]
+    fn bytes_total(&self) -> usize {
+        N
+    }
+}
+
 unsafe impl IoBuf for &'static str {
+    #[inline]
     fn stable_read_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.bytes_init()
     }
 }
 
 unsafe impl IoBuf for String {
+    #[inline]
     fn stable_read_ptr(&self) -> *const u8 {
         self.as_ptr()
     }
 
+    #[inline]
     fn bytes_init(&self) -> usize {
         self.len()
     }
 
+    #[inline]
     fn bytes_total(&self) -> usize {
         self.bytes_init()
     }

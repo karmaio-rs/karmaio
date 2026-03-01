@@ -2,9 +2,8 @@ use crate::buf::IoBuf;
 
 // An `io_uring` compatible buffer.
 //
-// The `IoBuf` trait is implemented by buffer types that can be passed to
-// io_uring operations. Users will not need to use this trait directly, except
-// for the [`slice`] method.
+// The `IoBuf` trait is implemented by buffer types that can be passed to io_uring operations.
+// Users will not need to use this trait directly.
 //
 // Buffers passed to `io-uring` operations must reference a stable memory region.
 // While the runtime holds ownership to a buffer, the pointer returned
@@ -26,19 +25,45 @@ pub unsafe trait IoBufMut: IoBuf {
     //
     // # Safety
     //
-    // The caller must ensure that all bytes starting at `stable_write_ptr()` up
-    // to `pos` are initialized and owned by the buffer.
+    // The caller must ensure that all bytes starting at `stable_write_ptr()`
+    // up to `pos` are initialized and owned by the buffer.
     fn set_init(&mut self, pos: usize);
 }
 
 unsafe impl IoBufMut for Vec<u8> {
+    #[inline]
     fn stable_write_ptr(&mut self) -> *mut u8 {
         self.as_mut_ptr()
     }
 
+    #[inline]
     fn set_init(&mut self, init_len: usize) {
         if self.len() < init_len {
             unsafe { self.set_len(init_len) };
         }
+    }
+}
+
+unsafe impl IoBufMut for Box<[u8]> {
+    #[inline]
+    fn stable_write_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    #[inline]
+    fn set_init(&mut self, _pos: usize) {
+        // Box<[u8]> is always fully initialized – no-op
+    }
+}
+
+unsafe impl<const N: usize> IoBufMut for [u8; N] {
+    #[inline]
+    fn stable_write_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    #[inline]
+    fn set_init(&mut self, _pos: usize) {
+        // Fixed-size array is always fully initialized
     }
 }

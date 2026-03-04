@@ -28,15 +28,15 @@ pub trait AsyncReadAt {
 
 impl<T: ?Sized + AsyncRead> AsyncRead for &mut T {
     #[inline]
-    fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
-        (**self).read(buf)
+    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        (**self).read(buf).await
     }
 }
 
 impl<T: ?Sized + AsyncReadAt> AsyncReadAt for &mut T {
     #[inline]
-    fn read_at<B: BoundedIoBufMut>(&mut self, buf: B, pos: usize) -> impl Future<Output = BufResult<usize, B>> {
-        (**self).read_at(buf, pos)
+    async fn read_at<B: BoundedIoBufMut>(&mut self, buf: B, pos: usize) -> BufResult<usize, B> {
+        (**self).read_at(buf, pos).await
     }
 }
 

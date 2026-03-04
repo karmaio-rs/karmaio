@@ -100,6 +100,21 @@ unsafe impl<const N: usize> IoBuf for [u8; N] {
     }
 }
 
+unsafe impl<const N: usize> IoBuf for Box<[u8; N]> {
+    #[inline]
+    fn stable_read_ptr(&self) -> *const u8 {
+        self.as_ptr()
+    }
+    #[inline]
+    fn bytes_init(&self) -> usize {
+        N
+    }
+    #[inline]
+    fn bytes_total(&self) -> usize {
+        N
+    }
+}
+
 unsafe impl IoBuf for &'static str {
     #[inline]
     fn stable_read_ptr(&self) -> *const u8 {

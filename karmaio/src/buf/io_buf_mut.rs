@@ -56,6 +56,18 @@ unsafe impl IoBufMut for Box<[u8]> {
     }
 }
 
+unsafe impl<const N: usize> IoBufMut for Box<[u8; N]> {
+    #[inline]
+    fn stable_write_ptr(&mut self) -> *mut u8 {
+        self.as_mut_ptr()
+    }
+
+    #[inline]
+    fn set_init(&mut self, _pos: usize) {
+        // Fixed-size array is always fully initialized
+    }
+}
+
 unsafe impl<const N: usize> IoBufMut for [u8; N] {
     #[inline]
     fn stable_write_ptr(&mut self) -> *mut u8 {

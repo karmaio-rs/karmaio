@@ -15,8 +15,19 @@ keywords = ["io", "thread-per-core", "iouring", "async", "futures"]
 rust-version = "1.90"
 edition = "2024"
 
+# Core dependencies. Cross Platform
 [dependencies]
+socket2 = "0.6"
+slab = "0.4"
+
+# Unix platform dependencies
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Linux platform dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.6"
+io-uring = "0.7"
+
+# Windows platform dependencies
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Storage_FileSystem", "Win32_System_IO"] }

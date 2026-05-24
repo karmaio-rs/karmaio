@@ -82,6 +82,12 @@ impl SharedIoHandle {
         }
     }
 
+    // Returns the raw OS handle enum for Windows (file handle or socket).
+    #[cfg(windows)]
+    pub(crate) fn raw_os_handle(&self) -> OsRawHandle {
+        self.inner.handle
+    }
+
     // A handle cannot be closed until all in-flight operations have completed.
     // This prevents bugs where in-flight reads/writes could operate on the incorrect
     // handle (or a reused one).
@@ -152,7 +158,22 @@ struct InnerFd {
 
 impl InnerFd {
     async fn close_op(&mut self) -> io::Result<()> {
-        todo!("Implement this later")
+        // &mut self implies there are no outstanding operations.
+        // If state already closed, the user closed multiple times; simply return Ok.
+        // Otherwise, set state to closed and then submit and await the close operation.
+        {
+            // Release state guard before await.
+            let state = RefCell::get_mut(&mut self.state);
+
+            if let State::Closed = *state {
+                return Ok(());
+            }
+
+            *state = State::Closed;
+        }
+
+        // Send the close op to the kernel.
+        Op::close(self.handle)?.await
     }
 }
 

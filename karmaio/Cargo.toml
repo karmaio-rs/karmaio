@@ -17,7 +17,7 @@ edition = "2024"
 
 # Core dependencies. Cross Platform
 [dependencies]
-socket2 = "0.6"
+socket2 = { version = "0.6", features = ["all"] }
 slab = "0.4"
 
 # Unix platform dependencies

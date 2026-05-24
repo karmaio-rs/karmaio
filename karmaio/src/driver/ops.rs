@@ -5,6 +5,20 @@ use std::{
 
 use crate::driver::{Handle, Submission};
 
+pub(crate) mod accept;
+pub(crate) mod close;
+pub(crate) mod connect;
+pub(crate) mod read;
+pub(crate) mod readv;
+pub(crate) mod recv;
+pub(crate) mod recv_from;
+pub(crate) mod recvmsg;
+pub(crate) mod send;
+pub(crate) mod send_to;
+pub(crate) mod sendmsg;
+pub(crate) mod write;
+pub(crate) mod writev;
+
 pub(crate) enum State {
     // The operation has been submitted to the driver and is currently in-flight
     Submitted,
@@ -31,6 +45,7 @@ pub(crate) struct Op<T> {
 
 pub(crate) struct Completion {
     pub(crate) result: std::io::Result<u32>,
+    // TODO: flags is reserved for future use (e.g. io_uring CQE flags).
     pub(crate) flags: u32,
 }
 

@@ -59,17 +59,13 @@ impl<B: BoundedIoBufMut> Submittable for Read<B> {
             let ptr = self.buf.stable_write_ptr();
             let len = self.buf.bytes_total();
 
-            let res = if self.offset == 0 {
-                unsafe { libc::read(self.io_handle.raw_fd(), ptr as *mut libc::c_void, len) }
-            } else {
-                unsafe {
-                    libc::pread(
-                        self.io_handle.raw_fd(),
-                        ptr as *mut libc::c_void,
-                        len,
-                        self.offset as i64,
-                    )
-                }
+            let res = unsafe {
+                libc::pread(
+                    self.io_handle.raw_fd(),
+                    ptr as *mut libc::c_void,
+                    len,
+                    self.offset as i64,
+                )
             };
 
             if res >= 0 {

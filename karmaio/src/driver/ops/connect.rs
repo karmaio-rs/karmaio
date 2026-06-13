@@ -38,8 +38,8 @@ impl Submittable for Connect {
 
         opcode::Connect::new(
             types::Fd(self.io_handle.raw_fd()),
-            self.socket_addr.as_ptr(),
-            self.socket_addr.len(),
+            self.socket_addr.as_ptr() as *const _,
+            self.socket_addr.len() as u32,
         )
         .build()
     }

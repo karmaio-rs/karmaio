@@ -60,17 +60,13 @@ impl<B: BoundedIoBuf> Submittable for Write<B> {
             let ptr = self.buf.stable_read_ptr();
             let len = self.buf.bytes_init();
 
-            let ret = if self.offset == 0 {
-                unsafe { libc::write(self.io_handle.raw_fd(), ptr as *const libc::c_void, len) }
-            } else {
-                unsafe {
-                    libc::pwrite(
-                        self.io_handle.raw_fd(),
-                        ptr as *const libc::c_void,
-                        len,
-                        self.offset as i64,
-                    )
-                }
+            let ret = unsafe {
+                libc::pwrite(
+                    self.io_handle.raw_fd(),
+                    ptr as *const libc::c_void,
+                    len,
+                    self.offset as i64,
+                )
             };
 
             if ret >= 0 {

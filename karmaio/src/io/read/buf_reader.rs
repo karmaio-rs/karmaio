@@ -113,6 +113,13 @@ impl<R: AsyncRead> AsyncRead for BufReader<R> {
 
         (Ok(amt), buf)
     }
+
+    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        // For vectored reads, bypass the internal buffer to keep the implementation simple and correct.
+        // The buffer is a performance hint for small reads; scattering a large vectored request goes direct.
+        self.discard_buffer();
+        self.reader.read_vectored(bufs).await
+    }
 }
 
 impl<R: AsyncRead> AsyncBufRead for BufReader<R> {
@@ -151,6 +158,11 @@ impl<R: AsyncRead + AsyncWrite> AsyncWrite for BufReader<R> {
     #[inline]
     async fn write<T: BoundedIoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         self.reader.write(buf).await
+    }
+
+    #[inline]
+    async fn write_vectored<T: BoundedIoBuf>(&mut self, bufs: Vec<T>) -> BufResult<usize, Vec<T>> {
+        self.reader.write_vectored(bufs).await
     }
 
     #[inline]

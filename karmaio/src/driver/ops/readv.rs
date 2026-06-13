@@ -93,23 +93,13 @@ impl<B: BoundedIoBufMut> Submittable for Readv<B> {
         use crate::driver::backends::kqueue::Interest;
 
         loop {
-            let res = if self.offset == 0 {
-                unsafe {
-                    libc::readv(
-                        self.io_handle.raw_fd(),
-                        self.iovs.as_ptr() as *const libc::iovec,
-                        self.iovs.len() as i32,
-                    )
-                }
-            } else {
-                unsafe {
-                    libc::preadv(
-                        self.io_handle.raw_fd(),
-                        self.iovs.as_ptr() as *const libc::iovec,
-                        self.iovs.len() as i32,
-                        self.offset as i64,
-                    )
-                }
+            let res = unsafe {
+                libc::preadv(
+                    self.io_handle.raw_fd(),
+                    self.iovs.as_ptr() as *const libc::iovec,
+                    self.iovs.len() as i32,
+                    self.offset as i64,
+                )
             };
 
             if res >= 0 {

@@ -21,6 +21,10 @@ pub trait AsyncWrite {
     // attempt to write to the underlying object.
     async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B>;
 
+    /// Writes the contents of multiple buffers into this writer (vectored / gather).
+    /// Ownership of the `bufs` vector and its buffers is transferred; the same vector is returned on completion.
+    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>>;
+
     // Flushes this output stream, ensuring that all buffered content is successfully written to its destination.
     async fn flush(&mut self) -> Result<()>;
 
@@ -40,13 +44,25 @@ pub trait AsyncWrite {
 // with other asynchronous tasks without blocking the executor.
 pub trait AsyncWriteAt {
     // Like [`AsyncWrite::write`], except that it writes at a specified position.
-    async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: usize) -> BufResult<usize, B>;
+    async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B>;
+
+    /// Like [`AsyncWrite::writev`], except that it writes at a specified position (vectored).
+    async fn write_vectored_at<B: BoundedIoBuf>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>>;
 }
 
 impl<T: ?Sized + AsyncWriteAt> AsyncWriteAt for &mut T {
     #[inline]
-    fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: usize) -> impl Future<Output = BufResult<usize, B>> {
+    fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> impl Future<Output = BufResult<usize, B>> {
         (**self).write_at(buf, pos)
+    }
+
+    #[inline]
+    fn write_vectored_at<B: BoundedIoBuf>(
+        &mut self,
+        bufs: Vec<B>,
+        pos: u64,
+    ) -> impl Future<Output = BufResult<usize, Vec<B>>> {
+        (**self).write_vectored_at(bufs, pos)
     }
 }
 
@@ -54,6 +70,11 @@ impl<T: ?Sized + AsyncWrite> AsyncWrite for &mut T {
     #[inline]
     fn write<B: BoundedIoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         (**self).write(buf)
+    }
+
+    #[inline]
+    fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> impl Future<Output = BufResult<usize, Vec<B>>> {
+        (**self).write_vectored(bufs)
     }
 
     #[inline]
@@ -71,6 +92,11 @@ impl<T: ?Sized + AsyncWrite + Unpin> AsyncWrite for Box<T> {
     #[inline]
     fn write<B: BoundedIoBuf>(&mut self, buf: B) -> impl Future<Output = BufResult<usize, B>> {
         (**self).write(buf)
+    }
+
+    #[inline]
+    fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> impl Future<Output = BufResult<usize, Vec<B>>> {
+        (**self).write_vectored(bufs)
     }
 
     #[inline]
@@ -98,6 +124,21 @@ impl AsyncWrite for Vec<u8> {
         (Ok(bytes_to_write), buf)
     }
 
+    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let mut total = 0usize;
+        for buf in bufs.iter() {
+            let n = buf.bytes_init();
+            if n > 0 {
+                unsafe {
+                    let slice = slice::from_raw_parts(buf.stable_read_ptr(), n);
+                    self.extend_from_slice(slice);
+                }
+            }
+            total += n;
+        }
+        (Ok(total), bufs)
+    }
+
     async fn flush(&mut self) -> Result<()> {
         Ok(())
     }
@@ -114,14 +155,36 @@ where
     async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         let bytes_to_write = buf.bytes_init();
 
-        if bytes_to_write > 0 {
-            unsafe {
-                let slice = slice::from_raw_parts(buf.stable_read_ptr(), bytes_to_write);
-                Write::write(self, slice);
-            }
+        if bytes_to_write == 0 {
+            return (Ok(0), buf);
         }
 
-        (Ok(bytes_to_write), buf)
+        let res = unsafe {
+            let slice = slice::from_raw_parts(buf.stable_read_ptr(), bytes_to_write);
+            Write::write(self, slice)
+        };
+        match res {
+            Ok(n) => (Ok(n), buf),
+            Err(e) => (Err(e), buf),
+        }
+    }
+
+    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let mut total = 0usize;
+        for b in bufs.iter() {
+            let n = b.bytes_init();
+            if n > 0 {
+                let res = unsafe {
+                    let slice = slice::from_raw_parts(b.stable_read_ptr(), n);
+                    Write::write(self, slice)
+                };
+                match res {
+                    Ok(w) => total += w,
+                    Err(e) => return (Err(e), bufs),
+                }
+            }
+        }
+        (Ok(total), bufs)
     }
 
     async fn flush(&mut self) -> Result<()> {

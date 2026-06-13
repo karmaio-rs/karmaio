@@ -132,6 +132,20 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
         }
     }
 
+    async fn write_vectored<B: crate::buf::BoundedIoBuf>(
+        &mut self,
+        bufs: Vec<B>,
+    ) -> crate::buf::BufResult<usize, Vec<B>> {
+        // To keep buffering logic simple for the gather case, flush any pending data first,
+        // then delegate the entire vectored write to the underlying writer.
+        if let Err(e) = self.flush_buf().await {
+            // On flush error we have to return the bufs; since we don't know which, return them as-is (empty write effectively failed before).
+            // A better approach would track, but for now surface the error with the original vec.
+            return (Err(e), bufs);
+        }
+        self.writer.write_vectored(bufs).await
+    }
+
     async fn flush(&mut self) -> std::io::Result<()> {
         self.flush_buf().await?;
         self.writer.flush().await
@@ -146,6 +160,10 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
 impl<W: AsyncRead + AsyncWrite> AsyncRead for BufWriter<W> {
     async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         self.writer.read(buf).await
+    }
+
+    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        self.writer.read_vectored(bufs).await
     }
 }
 

@@ -6,6 +6,7 @@ use socket2::SockAddr;
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
     driver::helpers::socket::Socket,
+    io::{AsyncRead, AsyncWrite},
 };
 
 pub struct UnixStream {
@@ -21,67 +22,6 @@ impl UnixStream {
         socket.connect(SockAddr::unix(path)?).await?;
         let unix_stream = UnixStream { inner: socket };
         Ok(unix_stream)
-    }
-
-    /// Read some data from the stream into the buffer, returning the original buffer and quantity of data read.
-    pub async fn read<B: BoundedIoBufMut>(&self, buf: B) -> BufResult<usize, B> {
-        self.inner.recv(buf).await
-    }
-
-    /// Reads data from multiple buffers into this socket using the scatter/gather IO style.
-    ///
-    /// This function will attempt to read the entire contents into `bufs`, but the entire read may not succeed,
-    /// or the read may also generate an error.
-    ///
-    /// # Return
-    ///
-    /// The method returns the operation result and the same array of buffers passed in as an argument.
-    /// A return value of `0` typically means that the underlying socket is no longer able to accept bytes
-    /// and will likely not be able to in the future as well, or that the buffer provided is empty.
-    ///
-    /// # Errors
-    ///
-    /// Each call to `read` may generate an I/O error indicating that the operation could not be completed.
-    /// If an error is returned then no bytes in the buffer were written to this reader.
-    ///
-    /// It is **not** considered an error if the entire buffer could not be read to this reader.
-    ///
-    /// [`Ok(n)`]: Ok
-    pub async fn readv<B: BoundedIoBufMut>(&self, buf: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let (result, bufs) = self.inner.recvmsg(buf).await;
-        (result.map(|(n, _)| n), bufs)
-    }
-
-    /// Write some data to the stream from the buffer, returning the original buffer and quantity of data written.
-    pub async fn write<B: BoundedIoBuf>(&self, buf: B) -> BufResult<usize, B> {
-        self.inner.send(buf).await
-    }
-
-    /// Writes data from multiple buffers into this socket using the scatter/gather IO style.
-    ///
-    /// This function will attempt to write the entire contents of `bufs`, but the entire write may not succeed,
-    /// or the write may also generate an error. The bytes will be written starting at the specified offset.
-    ///
-    /// # Return
-    ///
-    /// The method returns the operation result and the same array of buffers passed in as an argument.
-    /// A return value of `0` typically means that the underlying socket is no longer able to accept bytes
-    /// and will likely not be able to in the future as well, or that the buffer provided is empty.
-    ///
-    /// # Errors
-    ///
-    /// Each call to `write` may generate an I/O error indicating that the operation could not be completed.
-    /// If an error is returned then no bytes in the buffer were written to this writer.
-    ///
-    /// It is **not** considered an error if the entire buffer could not be written to this writer.
-    ///
-    /// [`Ok(n)`]: Ok
-    pub async fn writev<B: BoundedIoBuf, C: BoundedIoBuf>(
-        &self,
-        bufs: Vec<B>,
-        control: Option<C>,
-    ) -> BufResult<(usize, Option<C>), Vec<B>> {
-        self.inner.sendmsg(bufs, None, control).await
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -110,6 +50,36 @@ impl UnixStream {
         let addr = s.peer_addr();
         std::mem::forget(s);
         addr
+    }
+}
+
+impl AsyncRead for UnixStream {
+    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        self.inner.recv(buf).await
+    }
+
+    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let (result, bufs) = self.inner.recvmsg(bufs).await;
+        (result.map(|(n, _)| n), bufs)
+    }
+}
+
+impl AsyncWrite for UnixStream {
+    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        self.inner.send(buf).await
+    }
+
+    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let (res, bufs) = self.inner.sendmsg(bufs, None, None::<Vec<u8>>).await;
+        (res.map(|(n, _)| n), bufs)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown(std::net::Shutdown::Write)
     }
 }
 

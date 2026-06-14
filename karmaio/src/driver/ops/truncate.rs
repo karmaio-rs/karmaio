@@ -41,27 +41,9 @@ impl Submittable for Truncate {
 #[cfg(target_os = "macos")]
 impl Submittable for Truncate {
     fn submit(&mut self) -> Submission {
-        loop {
-            let ret = unsafe { libc::ftruncate(self.handle.raw_fd(), self.size as libc::off_t) };
-
-            if ret == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!({
+            macos_syscall!(libc::ftruncate(self.handle.raw_fd(), self.size as libc::off_t))
+        })
     }
 }
 
@@ -75,34 +57,18 @@ impl Submittable for Truncate {
                 let mut distance_to_move: i64 = self.size as i64;
                 let mut new_file_pointer: u64 = 0;
 
-                let result = unsafe {
-                    SetFilePointerEx(
-                        handle as _,
-                        distance_to_move,
-                        &mut new_file_pointer,
-                        windows_sys::Win32::Storage::FileSystem::FILE_BEGIN,
-                    )
-                };
-
-                if result == 0 {
-                    return Submission::Ready(Completion {
-                        result: Err(io::Error::last_os_error()),
-                        flags: 0,
-                    });
-                }
-
-                let result = unsafe { SetEndOfFile(handle as _) };
-
-                if result == 0 {
-                    return Submission::Ready(Completion {
-                        result: Err(io::Error::last_os_error()),
-                        flags: 0,
-                    });
-                }
-
-                Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
+                windows_syscall_submit!({
+                    match windows_syscall!(BOOL, {
+                        SetFilePointerEx(
+                            handle as _,
+                            distance_to_move,
+                            &mut new_file_pointer,
+                            windows_sys::Win32::Storage::FileSystem::FILE_BEGIN,
+                        )
+                    }) {
+                        Ok(val) => windows_syscall!(BOOL, SetEndOfFile(handle as _)),
+                        Err(err) => Err(err),
+                    }
                 })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {

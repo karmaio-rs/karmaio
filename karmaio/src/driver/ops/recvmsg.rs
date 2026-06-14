@@ -100,37 +100,13 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
     fn submit(&mut self) -> Submission {
-        use crate::driver::backends::kqueue::Interest;
-
-        loop {
-            let res = unsafe { libc::recvmsg(self.io_handle.raw_fd(), self.msghdr.as_mut() as *mut libc::msghdr, 0) };
-
-            if res >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(res as u32),
-                    flags: 0,
-                });
-            }
-
-            let err = std::io::Error::last_os_error();
-
-            if err.kind() == std::io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_READ,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
+            macos_syscall!(libc::recvmsg(
+                self.io_handle.raw_fd(),
+                self.msghdr.as_mut() as *mut libc::msghdr,
+                0,
+            ))
+        })
     }
 }
 
@@ -138,8 +114,7 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use std::io;
-        use windows_sys::Win32::Networking::WinSock::{WSA_IO_PENDING, WSAGetLastError, WSARecvFrom};
+        use windows_sys::Win32::Networking::WinSock::WSARecvFrom;
 
         let socket = self.io_handle.raw_socket();
 
@@ -149,7 +124,7 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 
         self.socket_addr_len = self.socket_addr.len() as i32;
 
-        let result = unsafe {
+        windows_syscall_submit_overlapped!(interest, socket, {
             WSARecvFrom(
                 socket as _,
                 self.wsa_bufs.as_ptr() as *const _,
@@ -161,20 +136,6 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
                 interest.as_mut_ptr(),
                 None,
             )
-        };
-
-        if result == 0 {
-            return Submission::Pending(interest);
-        }
-
-        let err = unsafe { WSAGetLastError() };
-        if err == WSA_IO_PENDING {
-            return Submission::Pending(interest);
-        }
-
-        Submission::Ready(Completion {
-            result: Err(io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }
 }

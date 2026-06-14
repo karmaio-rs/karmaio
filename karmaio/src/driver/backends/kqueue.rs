@@ -100,7 +100,7 @@ impl DriverBackend for KqueueBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T>(&mut self, op: &mut Op<T>) {
+    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>) {
         let index = op.index();
         let slot = match self.ops.get_mut(index) {
             Some(val) => val,

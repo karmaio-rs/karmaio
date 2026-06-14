@@ -127,37 +127,13 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
     fn submit(&mut self) -> Submission {
-        use crate::driver::backends::kqueue::Interest;
-
-        loop {
-            let res = unsafe { libc::sendmsg(self.io_handle.raw_fd(), self.msghdr.as_ref() as *const libc::msghdr, 0) };
-
-            if res >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(res as u32),
-                    flags: 0,
-                });
-            }
-
-            let err = std::io::Error::last_os_error();
-
-            if err.kind() == std::io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_WRITE,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
+            macos_syscall!(libc::sendmsg(
+                self.io_handle.raw_fd(),
+                self.msghdr.as_ref() as *const libc::msghdr,
+                0,
+            ))
+        })
     }
 }
 
@@ -165,8 +141,7 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
 impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use std::io;
-        use windows_sys::Win32::Networking::WinSock::{WSA_IO_PENDING, WSAGetLastError, WSASendTo};
+        use windows_sys::Win32::Networking::WinSock::WSASendTo;
 
         let socket = self.io_handle.raw_socket();
 
@@ -178,7 +153,7 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
             None => (std::ptr::null(), 0),
         };
 
-        let result = unsafe {
+        windows_syscall_submit_overlapped!(interest, socket, {
             WSASendTo(
                 socket as _,
                 self.wsa_bufs.as_mut_ptr(),
@@ -190,20 +165,6 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
                 interest.as_mut_ptr(),
                 None,
             )
-        };
-
-        if result == 0 {
-            return Submission::Pending(interest);
-        }
-
-        let err = unsafe { WSAGetLastError() };
-        if err == WSA_IO_PENDING {
-            return Submission::Pending(interest);
-        }
-
-        Submission::Ready(Completion {
-            result: Err(io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }
 }

@@ -43,27 +43,12 @@ impl Submittable for Hardlink {
 #[cfg(target_os = "macos")]
 impl Submittable for Hardlink {
     fn submit(&mut self) -> Submission {
-        loop {
-            let ret = unsafe { libc::link(self.original.as_c_str().as_ptr(), self.link.as_c_str().as_ptr()) };
-
-            if ret == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!({
+            macos_syscall!(libc::link(
+                self.original.as_c_str().as_ptr(),
+                self.link.as_c_str().as_ptr(),
+            ))
+        })
     }
 }
 
@@ -72,19 +57,12 @@ impl Submittable for Hardlink {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
 
-        let result = unsafe { CreateHardLinkW(self.link.as_ptr(), self.original.as_ptr(), std::ptr::null_mut()) };
-
-        if result != 0 {
-            Submission::Ready(Completion {
-                result: Ok(0),
-                flags: 0,
-            })
-        } else {
-            Submission::Ready(Completion {
-                result: Err(io::Error::last_os_error()),
-                flags: 0,
-            })
-        }
+        windows_syscall_submit!({
+            windows_syscall!(
+                BOOL,
+                CreateHardLinkW(self.link.as_ptr(), self.original.as_ptr(), std::ptr::null_mut())
+            )
+        })
     }
 }
 

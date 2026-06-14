@@ -3,6 +3,8 @@ use crate::driver::ops::{Op, Operable, Submittable};
 use std::ops::Deref;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
 use std::task::Poll;
 use std::{
     cell::RefCell,
@@ -45,7 +47,7 @@ impl Driver {
         self.backend.borrow_mut().submit_op(data, self.into())
     }
 
-    pub(crate) fn remove_op<T>(&self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: 'static>(&self, op: &mut Op<T>) {
         self.backend.borrow_mut().remove_op(op)
     }
 
@@ -67,6 +69,14 @@ impl Driver {
 
     pub(crate) fn dispatch_completions(&self) {
         self.backend.borrow_mut().dispatch_completions();
+    }
+
+    /// Associates a file or socket handle with the IOCP completion port.
+    ///
+    /// This must be called before issuing any overlapped I/O on the handle.
+    #[cfg(windows)]
+    pub(crate) fn attach(&self, handle: RawHandle) -> io::Result<()> {
+        self.backend.borrow().add_handle(handle, 0)
     }
 }
 

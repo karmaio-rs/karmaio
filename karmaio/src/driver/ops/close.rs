@@ -27,66 +27,35 @@ impl Operable for Close {}
 impl Submittable for Close {
     fn submit(&mut self) -> Submission {
         use io_uring::{opcode, types};
-        opcode::Close::new(types::Fd(self.io_handle.raw_fd())).build()
+        let fd = match self.io_handle {
+            OsRawHandle::Fd(fd) => fd,
+        };
+        opcode::Close::new(types::Fd(fd)).build()
     }
 }
 
 #[cfg(target_os = "macos")]
 impl Submittable for Close {
     fn submit(&mut self) -> Submission {
-        loop {
-            let result = match self.io_handle {
-                OsRawHandle::Fd(fd) => unsafe { libc::close(fd) },
-            };
-
-            // The fd has been closed. Return success completion
-            if result == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-            // The syscall was interrupted. Try again till we get success or error
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!({
+            macos_syscall!(match self.io_handle {
+                OsRawHandle::Fd(fd) => libc::close(fd),
+            })
+        })
     }
 }
 
 #[cfg(windows)]
 impl Submittable for Close {
     fn submit(&mut self) -> Submission {
-        use windows_sys::Win32::{
-            Foundation::CloseHandle,
-            Networking::WinSock::{WSAGetLastError, closesocket},
-        };
+        use windows_sys::Win32::{Foundation::CloseHandle, Networking::WinSock::closesocket};
 
-        let result = match self.io_handle {
-            OsRawHandle::Handle(handle) => {
-                if unsafe { CloseHandle(handle as _) } != 0 {
-                    Ok(0)
-                } else {
-                    Err(io::Error::last_os_error())
-                }
+        windows_syscall_submit!({
+            match self.io_handle {
+                OsRawHandle::Handle(handle) => windows_syscall!(BOOL, CloseHandle(handle as _)),
+                OsRawHandle::Socket(socket) => windows_syscall!(SOCKET, closesocket(socket as _)),
             }
-            OsRawHandle::Socket(socket) => {
-                if unsafe { closesocket(socket as _) } == 0 {
-                    Ok(0)
-                } else {
-                    Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
-                }
-            }
-        };
-
-        Submission::Ready(Completion { result, flags: 0 })
+        })
     }
 }
 

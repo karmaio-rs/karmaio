@@ -102,52 +102,21 @@ impl<B: BoundedIoBuf> Submittable for SendTo<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBuf> Submittable for SendTo<B> {
     fn submit(&mut self) -> Submission {
-        use crate::driver::backends::kqueue::Interest;
-
-        loop {
+        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             let ptr = self.buf.stable_read_ptr();
             let len = self.buf.bytes_init();
-
             let name = self.socket_addr.as_ptr() as *const libc::sockaddr;
             let namelen = self.socket_addr.len();
 
-            let res = unsafe {
-                libc::sendto(
-                    self.io_handle.raw_fd(),
-                    ptr as *const libc::c_void,
-                    len,
-                    0,
-                    name,
-                    namelen,
-                )
-            };
-
-            if res >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(res as u32),
-                    flags: 0,
-                });
-            }
-
-            let err = std::io::Error::last_os_error();
-
-            if err.kind() == std::io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_WRITE,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+            macos_syscall!(libc::sendto(
+                self.io_handle.raw_fd(),
+                ptr as *const libc::c_void,
+                len,
+                0,
+                name,
+                namelen,
+            ))
+        })
     }
 }
 
@@ -155,8 +124,7 @@ impl<B: BoundedIoBuf> Submittable for SendTo<B> {
 impl<B: BoundedIoBuf> Submittable for SendTo<B> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use std::io;
-        use windows_sys::Win32::Networking::WinSock::{WSA_IO_PENDING, WSAGetLastError, WSASendTo};
+        use windows_sys::Win32::Networking::WinSock::WSASendTo;
 
         let socket = self.io_handle.raw_socket();
 
@@ -166,7 +134,7 @@ impl<B: BoundedIoBuf> Submittable for SendTo<B> {
         let name = self.socket_addr.as_ptr() as *const _;
         let namelen = self.socket_addr.len() as i32;
 
-        let result = unsafe {
+        windows_syscall_submit_overlapped!(interest, socket, {
             WSASendTo(
                 socket as _,
                 &mut self.wsa_buf,
@@ -178,20 +146,6 @@ impl<B: BoundedIoBuf> Submittable for SendTo<B> {
                 interest.as_mut_ptr(),
                 None,
             )
-        };
-
-        if result == 0 {
-            return Submission::Pending(interest);
-        }
-
-        let err = unsafe { WSAGetLastError() };
-        if err == WSA_IO_PENDING {
-            return Submission::Pending(interest);
-        }
-
-        Submission::Ready(Completion {
-            result: Err(io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }
 }

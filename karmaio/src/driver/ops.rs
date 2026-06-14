@@ -47,7 +47,7 @@ pub(crate) enum State {
     Completed(Completion),
 }
 
-pub(crate) struct Op<T> {
+pub(crate) struct Op<T: 'static> {
     driver: Handle,
     index: usize,
     data: Option<T>,
@@ -73,7 +73,7 @@ pub(crate) trait Completable {
 
 pub(crate) trait Operable: Submittable + Completable {}
 
-impl<T> Op<T> {
+impl<T: 'static> Op<T> {
     pub(crate) fn new(index: usize, data: T, driver: Handle) -> Self {
         Self {
             driver,
@@ -88,6 +88,10 @@ impl<T> Op<T> {
 
     pub(super) fn take_data(&mut self) -> Option<T> {
         self.data.take()
+    }
+
+    pub(crate) fn data_ref(&self) -> Option<&T> {
+        self.data.as_ref()
     }
 
     pub(super) fn data_mut(&mut self) -> Option<&mut T> {
@@ -106,7 +110,7 @@ impl<T: Unpin + Operable> Future for Op<T> {
     }
 }
 
-impl<T> Drop for Op<T> {
+impl<T: 'static> Drop for Op<T> {
     fn drop(&mut self) {
         self.driver.upgrade().expect("Not in runtime context").remove_op(self);
     }

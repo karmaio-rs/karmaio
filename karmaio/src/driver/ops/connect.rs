@@ -48,49 +48,13 @@ impl Submittable for Connect {
 #[cfg(target_os = "macos")]
 impl Submittable for Connect {
     fn submit(&mut self) -> Submission {
-        loop {
-            let ret = unsafe {
-                libc::connect(
-                    self.io_handle.raw_fd(),
-                    self.socket_addr.as_ptr() as *const libc::sockaddr,
-                    self.socket_addr.len(),
-                )
-            };
-
-            if ret == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = std::io::Error::last_os_error();
-
-            if err.raw_os_error() == Some(libc::EISCONN) {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            if err.raw_os_error() == Some(libc::EINPROGRESS) || err.kind() == std::io::ErrorKind::WouldBlock {
-                use crate::driver::backends::kqueue::Interest;
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_WRITE,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!(connect self.io_handle.raw_fd(), {
+            macos_syscall!(libc::connect(
+                self.io_handle.raw_fd(),
+                self.socket_addr.as_ptr() as *const libc::sockaddr,
+                self.socket_addr.len(),
+            ))
+        })
     }
 }
 
@@ -100,8 +64,7 @@ impl Submittable for Connect {
         use crate::driver::backends::iocp::Interest;
         use std::{mem, ptr, sync::OnceLock};
         use windows_sys::Win32::Networking::WinSock::{
-            LPFN_CONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, WSA_IO_PENDING, WSAGetLastError,
-            WSAID_CONNECTEX, WSAIoctl,
+            LPFN_CONNECTEX, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKET, WSAID_CONNECTEX, WSAIoctl,
         };
 
         let socket = self.io_handle.raw_socket() as SOCKET;
@@ -141,7 +104,9 @@ impl Submittable for Connect {
         let connectex = connectex.expect("ConnectEx not loaded");
         let mut interest = Interest::new(socket as _);
 
-        let result = unsafe {
+        // Overlapped operations on IOCP still produce a completion packet for synchronous success,
+        // so the driver keeps this OVERLAPPED allocation alive and waits for that packet.
+        windows_syscall_submit_overlapped!(interest, winsock, {
             connectex(
                 socket,
                 self.socket_addr.as_ptr() as *const _,
@@ -151,22 +116,6 @@ impl Submittable for Connect {
                 ptr::null_mut(),
                 interest.as_mut_ptr(),
             )
-        };
-
-        if result != 0 {
-            // Overlapped operations on IOCP still produce a completion packet for synchronous success,
-            // so the driver keeps this OVERLAPPED allocation alive and waits for that packet.
-            return Submission::Pending(interest);
-        }
-
-        let err = unsafe { WSAGetLastError() };
-        if err == WSA_IO_PENDING {
-            return Submission::Pending(interest);
-        }
-
-        Submission::Ready(Completion {
-            result: Err(std::io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }
 }

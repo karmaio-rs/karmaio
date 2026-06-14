@@ -46,31 +46,13 @@ impl Submittable for Unlink {
 #[cfg(target_os = "macos")]
 impl Submittable for Unlink {
     fn submit(&mut self) -> Submission {
-        loop {
-            let ret = if self.remove_dir {
-                unsafe { libc::rmdir(self.path.as_c_str().as_ptr()) }
+        macos_syscall_submit!({
+            macos_syscall!(if self.remove_dir {
+                libc::rmdir(self.path.as_c_str().as_ptr())
             } else {
-                unsafe { libc::unlink(self.path.as_c_str().as_ptr()) }
-            };
-
-            if ret == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+                libc::unlink(self.path.as_c_str().as_ptr())
+            })
+        })
     }
 }
 
@@ -79,23 +61,13 @@ impl Submittable for Unlink {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::{DeleteFileW, RemoveDirectoryW};
 
-        let result = if self.remove_dir {
-            unsafe { RemoveDirectoryW(self.path.as_ptr()) }
-        } else {
-            unsafe { DeleteFileW(self.path.as_ptr()) }
-        };
-
-        if result != 0 {
-            Submission::Ready(Completion {
-                result: Ok(0),
-                flags: 0,
-            })
-        } else {
-            Submission::Ready(Completion {
-                result: Err(io::Error::last_os_error()),
-                flags: 0,
-            })
-        }
+        windows_syscall_submit!({
+            if self.remove_dir {
+                windows_syscall!(BOOL, RemoveDirectoryW(self.path.as_ptr()))
+            } else {
+                windows_syscall!(BOOL, DeleteFileW(self.path.as_ptr()))
+            }
+        })
     }
 }
 

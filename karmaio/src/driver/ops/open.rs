@@ -6,7 +6,10 @@ use std::os::windows::io::RawHandle;
 use crate::{
     driver::{
         Submission,
-        helpers::{cstr::{cstr, OsPath}, io_handle::SharedIoHandle},
+        helpers::{
+            cstr::{OsPath, cstr},
+            io_handle::SharedIoHandle,
+        },
         ops::{Completable, Completion, Op, Operable, Submittable},
     },
     fs::{File, OpenOptions},
@@ -45,7 +48,22 @@ impl Op<Open> {
             handle: None,
         };
 
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        let op = CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))?;
+
+        // On Windows, CreateFileW is synchronous but the handle must be
+        // associated with the IOCP before any overlapped I/O is performed on it.
+        #[cfg(target_os = "windows")]
+        if let Some(open) = op.data_ref() {
+            if let Some(handle) = open.handle {
+                CURRENT_DRIVER.with(|driver| {
+                    if let Some(driver) = driver.upgrade() {
+                        let _ = driver.attach(handle);
+                    }
+                });
+            }
+        }
+
+        Ok(op)
     }
 }
 
@@ -94,34 +112,19 @@ impl Submittable for Open {
 
         let flags = libc::O_CLOEXEC | access_mode | creation_mode | (self.options.custom_flags & !libc::O_ACCMODE);
 
-        loop {
-            let fd = unsafe { libc::open(self.path.as_c_str().as_ptr(), flags, self.options.mode as u32) };
-
-            if fd >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(fd as u32),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!({
+            macos_syscall!(libc::open(
+                self.path.as_c_str().as_ptr(),
+                flags,
+                self.options.mode as u32,
+            ))
+        })
     }
 }
 
 #[cfg(windows)]
 impl Submittable for Open {
     fn submit(&mut self) -> Submission {
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 
         let access_mode = match self.options.access_mode() {
@@ -143,7 +146,7 @@ impl Submittable for Open {
             }
         };
 
-        let handle = unsafe {
+        match windows_syscall!(HANDLE, {
             CreateFileW(
                 self.path.as_ptr(),
                 access_mode,
@@ -153,21 +156,19 @@ impl Submittable for Open {
                 self.options.get_flags_and_attributes(),
                 std::ptr::null_mut(),
             )
-        };
-
-        if handle == INVALID_HANDLE_VALUE {
-            return Submission::Ready(Completion {
-                result: Err(io::Error::last_os_error()),
+        }) {
+            Ok(handle) => {
+                self.handle = Some(handle as _);
+                Submission::Ready(Completion {
+                    result: Ok(0),
+                    flags: 0,
+                })
+            }
+            Err(err) => Submission::Ready(Completion {
+                result: Err(err),
                 flags: 0,
-            });
+            }),
         }
-
-        self.handle = Some(handle as _);
-
-        Submission::Ready(Completion {
-            result: Ok(0),
-            flags: 0,
-        })
     }
 }
 

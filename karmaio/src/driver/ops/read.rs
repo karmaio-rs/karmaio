@@ -1,5 +1,3 @@
-use std::io;
-
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
@@ -53,47 +51,17 @@ impl<B: BoundedIoBufMut> Submittable for Read<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBufMut> Submittable for Read<B> {
     fn submit(&mut self) -> Submission {
-        use crate::driver::backends::kqueue::Interest;
-
-        loop {
+        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr();
             let len = self.buf.bytes_total();
 
-            let res = unsafe {
-                libc::pread(
-                    self.io_handle.raw_fd(),
-                    ptr as *mut libc::c_void,
-                    len,
-                    self.offset as i64,
-                )
-            };
-
-            if res >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(res as u32),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_READ,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+            macos_syscall!(libc::pread(
+                self.io_handle.raw_fd(),
+                ptr as *mut libc::c_void,
+                len,
+                self.offset as i64,
+            ))
+        })
     }
 }
 
@@ -102,8 +70,6 @@ impl<B: BoundedIoBufMut> Submittable for Read<B> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
         use crate::driver::helpers::io_handle::OsRawHandle;
-        use std::io;
-        use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
         let ptr = self.buf.stable_write_ptr();
@@ -120,26 +86,13 @@ impl<B: BoundedIoBufMut> Submittable for Read<B> {
                 }
 
                 let mut bytes_read = 0u32;
-                let result =
-                    unsafe { ReadFile(handle as _, ptr as *mut u8, len, &mut bytes_read, interest.as_mut_ptr()) };
-
-                if result != 0 {
-                    return Submission::Pending(interest);
-                }
-
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
-                    return Submission::Pending(interest);
-                }
-
-                Submission::Ready(Completion {
-                    result: Err(err),
-                    flags: 0,
+                windows_syscall_submit_overlapped!(interest, file, {
+                    ReadFile(handle as _, ptr as *mut u8, len, &mut bytes_read, interest.as_mut_ptr())
                 })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
+                result: Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
                     "use recv for socket reads on Windows",
                 )),
                 flags: 0,

@@ -40,27 +40,9 @@ impl Operable for SetPermissions {}
 #[cfg(target_os = "macos")]
 impl Submittable for SetPermissions {
     fn submit(&mut self) -> Submission {
-        loop {
-            let ret = unsafe { libc::fchmod(self.handle.raw_fd(), self.perm.mode() as libc::mode_t) };
-
-            if ret == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!({
+            macos_syscall!(libc::fchmod(self.handle.raw_fd(), self.perm.mode() as libc::mode_t))
+        })
     }
 }
 
@@ -120,25 +102,15 @@ impl Submittable for SetPermissions {
                     file_attributes: self.perm.attrs(),
                 };
 
-                let result = unsafe {
-                    SetFileInformationByHandle(
-                        handle as _,
-                        FileBasicInfo,
-                        &info as *const _ as *const _,
-                        std::mem::size_of::<FileBasicInformation>() as u32,
-                    )
-                };
-
-                if result == 0 {
-                    return Submission::Ready(Completion {
-                        result: Err(io::Error::last_os_error()),
-                        flags: 0,
-                    });
-                }
-
-                Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
+                windows_syscall_submit!({
+                    windows_syscall!(BOOL, {
+                        SetFileInformationByHandle(
+                            handle as _,
+                            FileBasicInfo,
+                            &info as *const _ as *const _,
+                            std::mem::size_of::<FileBasicInformation>() as u32,
+                        )
+                    })
                 })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {

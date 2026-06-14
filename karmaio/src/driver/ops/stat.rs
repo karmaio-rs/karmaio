@@ -70,29 +70,16 @@ impl Submittable for Stat {
 #[cfg(target_os = "macos")]
 impl Submittable for Stat {
     fn submit(&mut self) -> Submission {
-        loop {
+        macos_syscall_submit!({
             let mut stat = unsafe { std::mem::zeroed() };
-            let ret = unsafe { libc::fstat(self.handle.raw_fd(), &mut stat) };
+            let result = macos_syscall!(libc::fstat(self.handle.raw_fd(), &mut stat));
 
-            if ret == 0 {
+            if result.is_ok() {
                 self.stat_buf = Some(stat);
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
             }
 
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+            result
+        })
     }
 }
 

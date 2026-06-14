@@ -69,49 +69,13 @@ impl Submittable for Accept {
 #[cfg(target_os = "macos")]
 impl Submittable for Accept {
     fn submit(&mut self) -> Submission {
-        loop {
-            let raw_fd = unsafe {
-                libc::accept(
-                    self.io_handle.raw_fd(),
-                    &mut self.socketaddr.0 as *mut _ as *mut libc::sockaddr,
-                    &mut self.socketaddr.1,
-                )
-            };
-
-            // The syscall succeded and an FD has been assigned
-            // Return completion with the success result
-            if raw_fd >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(raw_fd as u32),
-                    flags: 0,
-                });
-            };
-
-            // Fd was not assigned, this means an error
-            let err = std::io::Error::last_os_error();
-
-            // This means we have nothing to accept yet. Register with the driver and wait
-            if err.kind() == std::io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
-                use crate::driver::backends::kqueue::Interest;
-
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_READ,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            // The syscall was interrupted. Try again till we get success or error
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            // An actual error happened. Fire a completion with the error
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
+            macos_syscall!(libc::accept(
+                self.io_handle.raw_fd(),
+                &mut self.socketaddr.0 as *mut _ as *mut libc::sockaddr,
+                &mut self.socketaddr.1,
+            ))
+        })
     }
 }
 
@@ -119,7 +83,7 @@ impl Submittable for Accept {
 impl Submittable for Accept {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use windows_sys::Win32::Networking::WinSock::{AcceptEx, SOCKET, WSA_IO_PENDING, WSAGetLastError};
+        use windows_sys::Win32::Networking::WinSock::{AcceptEx, SOCKET};
 
         let listen_socket = self.io_handle.raw_socket() as SOCKET;
         let accept_socket = match self.accepted_socket {
@@ -142,7 +106,10 @@ impl Submittable for Accept {
 
         let mut interest = Interest::new(listen_socket as _);
         let mut bytes_received = 0;
-        let result = unsafe {
+
+        // Overlapped operations on IOCP still produce a completion packet for synchronous success,
+        // so the driver keeps this OVERLAPPED allocation alive and waits for that packet.
+        windows_syscall_submit_overlapped!(interest, winsock, {
             AcceptEx(
                 listen_socket,
                 accept_socket,
@@ -153,22 +120,6 @@ impl Submittable for Accept {
                 &mut bytes_received,
                 interest.as_mut_ptr(),
             )
-        };
-
-        if result != 0 {
-            // Overlapped operations on IOCP still produce a completion packet for synchronous success,
-            // so the driver keeps this OVERLAPPED allocation alive and waits for that packet.
-            return Submission::Pending(interest);
-        }
-
-        let err = unsafe { WSAGetLastError() };
-        if err == WSA_IO_PENDING {
-            return Submission::Pending(interest);
-        }
-
-        Submission::Ready(Completion {
-            result: Err(io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }
 }

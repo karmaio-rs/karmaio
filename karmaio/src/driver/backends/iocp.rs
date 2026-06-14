@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     io::{Error, Result},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
     task::{Context, Poll},
@@ -206,6 +207,9 @@ pub(crate) struct IocpBackend {
     //    a. Reading completions from kernel
     //    b. Processing completions
     entries: Vec<OVERLAPPED_ENTRY>,
+    // Tracks handles already associated with the IOCP port to avoid redundant
+    // CreateIoCompletionPort calls.
+    attached_handles: HashSet<HANDLE>,
 }
 
 impl IocpBackend {
@@ -215,6 +219,7 @@ impl IocpBackend {
             port: CompletionPort::new()?,
             ops: Slab::with_capacity(1024),
             entries: vec![unsafe { std::mem::zeroed() }; 1024],
+            attached_handles: HashSet::new(),
         })
     }
 
@@ -243,6 +248,12 @@ impl DriverBackend for IocpBackend {
                 self.ops[index].state = State::Completed(completion);
             }
             Submission::Pending(mut interest) => {
+                // Ensure the handle is associated with the IOCP before the
+                // kernel completes the overlapped operation.
+                if self.attached_handles.insert(interest.handle()) {
+                    self.add_handle(interest.handle() as RawHandle, 0)?;
+                }
+
                 // The kernel owns this OVERLAPPED until completion. Stamp the
                 // slab index into the stable allocation before storing it.
                 interest.set_index(index);
@@ -253,7 +264,7 @@ impl DriverBackend for IocpBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T>(&mut self, op: &mut Op<T>) {
+    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>) {
         let index = op.index();
         let Some(slot) = self.ops.get_mut(index) else {
             // Op already dropped or removed.

@@ -1,5 +1,5 @@
-use std::os::fd::AsRawFd;
-use std::{io::Result, task::Context, time::Duration};
+use std::os::fd::{AsRawFd, RawFd};
+use std::{io::Result, task::{Context, Poll}, time::Duration};
 
 use io_uring::opcode::AsyncCancel;
 use io_uring::{Builder, IoUring, cqueue, squeue};
@@ -33,7 +33,7 @@ impl IoUringBackend {
 }
 
 impl DriverBackend for IoUringBackend {
-    fn submit_op<T: Submittable>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+    fn submit_op<T: Submittable>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
         // Allocate a new entry in the driver
         let index = self.ops.insert(State::Submitted);
 
@@ -49,7 +49,7 @@ impl DriverBackend for IoUringBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T>(&mut self, op: &mut Op<T>) {
+    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>) {
         // Get the op state from the driver
         let state = match self.ops.get_mut(op.index()) {
             Some(val) => val,
@@ -94,7 +94,7 @@ impl DriverBackend for IoUringBackend {
                 match self.ops.remove(op.index()) {
                     State::Completed(completion) => Poll::Ready(op.take_data().unwrap().complete(completion)),
                     _ => unreachable!("invalid operation"),
-                };
+                }
             }
             // The op has been ignored/cancelled by the caller. It should not be polled again
             State::Ignored(..) => {
@@ -166,7 +166,7 @@ impl DriverBackend for IoUringBackend {
             let result = if res >= 0 {
                 Ok(res as u32)
             } else {
-                Err(io::Error::from_raw_os_error(-res))
+                Err(std::io::Error::from_raw_os_error(-res))
             };
 
             if self.ops[index].complete(Completion { result, flags }) {

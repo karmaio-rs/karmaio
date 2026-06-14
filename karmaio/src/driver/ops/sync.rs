@@ -57,26 +57,9 @@ impl Submittable for Sync {
 #[cfg(target_os = "macos")]
 impl Submittable for Sync {
     fn submit(&mut self) -> Submission {
-        loop {
-            let ret = unsafe { libc::fsync(self.handle.raw_fd()) };
-
-            if ret == 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!({
+            macos_syscall!(libc::fsync(self.handle.raw_fd()))
+        })
     }
 }
 
@@ -86,20 +69,9 @@ impl Submittable for Sync {
         use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
 
         match self.handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => {
-                let result = unsafe { FlushFileBuffers(handle as _) };
-                if result != 0 {
-                    Submission::Ready(Completion {
-                        result: Ok(0),
-                        flags: 0,
-                    })
-                } else {
-                    Submission::Ready(Completion {
-                        result: Err(io::Error::last_os_error()),
-                        flags: 0,
-                    })
-                }
-            }
+            OsRawHandle::Handle(handle) => windows_syscall_submit!({
+                windows_syscall!(BOOL, FlushFileBuffers(handle as _))
+            }),
             OsRawHandle::Socket(_) => Submission::Ready(Completion {
                 result: Err(io::Error::new(io::ErrorKind::Unsupported, "cannot sync a socket")),
                 flags: 0,

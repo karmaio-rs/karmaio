@@ -90,44 +90,14 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBuf> Submittable for Writev<B> {
     fn submit(&mut self) -> Submission {
-        use crate::driver::backends::kqueue::Interest;
-
-        loop {
-            let res = unsafe {
-                libc::pwritev(
-                    self.io_handle.raw_fd(),
-                    self.iovs.as_ptr() as *const libc::iovec,
-                    self.iovs.len() as i32,
-                    self.offset as i64,
-                )
-            };
-
-            if res >= 0 {
-                return Submission::Ready(Completion {
-                    result: Ok(res as u32),
-                    flags: 0,
-                });
-            }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::WouldBlock || err.raw_os_error() == Some(libc::EAGAIN) {
-                return Submission::Register(Interest::new(
-                    self.io_handle.raw_fd(),
-                    libc::EVFILT_WRITE,
-                    libc::EV_ADD | libc::EV_ONESHOT,
-                ));
-            }
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            return Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            });
-        }
+        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
+            macos_syscall!(libc::pwritev(
+                self.io_handle.raw_fd(),
+                self.iovs.as_ptr() as *const libc::iovec,
+                self.iovs.len() as i32,
+                self.offset as i64,
+            ))
+        })
     }
 }
 
@@ -136,7 +106,6 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
         use crate::driver::helpers::io_handle::OsRawHandle;
-        use windows_sys::Win32::Foundation::ERROR_IO_PENDING;
         use windows_sys::Win32::Storage::FileSystem::WriteFileGather;
 
         let total_bytes: u32 = self.bufs.iter().map(|b| b.bytes_init() as u32).sum();
@@ -151,7 +120,7 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
                     overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
                 }
 
-                let result = unsafe {
+                windows_syscall_submit_overlapped!(interest, file, {
                     WriteFileGather(
                         handle as _,
                         self.segments.as_ptr(),
@@ -159,20 +128,6 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
                         std::ptr::null(),
                         interest.as_mut_ptr(),
                     )
-                };
-
-                if result != 0 {
-                    return Submission::Pending(interest);
-                }
-
-                let err = io::Error::last_os_error();
-                if err.raw_os_error() == Some(ERROR_IO_PENDING as i32) {
-                    return Submission::Pending(interest);
-                }
-
-                Submission::Ready(Completion {
-                    result: Err(err),
-                    flags: 0,
                 })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {

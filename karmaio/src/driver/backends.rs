@@ -34,7 +34,7 @@ pub(crate) trait DriverBackend {
     fn submit_op<T: Submittable>(&mut self, data: T, handle: Handle) -> Result<Op<T>>;
 
     /// Removes an operation from the driver's tracking (version 2).
-    fn remove_op<T>(&mut self, op: &mut Op<T>);
+    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>);
 
     // Checks if an operation is still pending/valid.
     fn poll_op<T: Operable>(&mut self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result>;

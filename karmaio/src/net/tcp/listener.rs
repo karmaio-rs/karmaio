@@ -13,7 +13,7 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 ///
 /// You can accept a new connection by using the [`accept`](`TcpListener::accept`) method.
 pub struct TcpListener {
-    inner: Socket,
+    pub(super) inner: Socket,
 }
 
 impl TcpListener {

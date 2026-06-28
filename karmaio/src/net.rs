@@ -1,3 +1,4 @@
+pub mod split;
 pub mod tcp;
 pub mod udp;
 #[cfg(unix)]

@@ -8,6 +8,7 @@ use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
     driver::helpers::socket::Socket,
     io::{AsyncRead, AsyncWrite},
+    net::split::{ReadHalf, WriteHalf, split},
 };
 
 #[cfg(windows)]
@@ -65,6 +66,27 @@ impl TcpStream {
         std::mem::forget(s);
         addr
     }
+
+    /// Splits a [`TcpStream`] into a read half and a write half, which can be
+    /// used to read and write the stream concurrently.
+    ///
+    /// This method is more efficient than
+    /// [`into_split`](TcpStream::into_split), but the halves cannot
+    /// be moved into independently spawned tasks.
+    pub fn split(&self) -> (ReadHalf<'_, Self>, WriteHalf<'_, Self>) {
+        split(self)
+    }
+}
+
+impl AsyncRead for &TcpStream {
+    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+        self.inner.recv(buf).await
+    }
+
+    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let (result, bufs) = self.inner.recvmsg(bufs).await;
+        (result.map(|(n, _)| n), bufs)
+    }
 }
 
 impl AsyncRead for TcpStream {
@@ -75,6 +97,25 @@ impl AsyncRead for TcpStream {
     async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
         let (result, bufs) = self.inner.recvmsg(bufs).await;
         (result.map(|(n, _)| n), bufs)
+    }
+}
+
+impl AsyncWrite for &TcpStream {
+    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        self.inner.send(buf).await
+    }
+
+    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let (res, bufs) = self.inner.sendmsg(bufs, None, None::<Vec<u8>>).await;
+        (res.map(|(n, _)| n), bufs)
+    }
+
+    async fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+        self.inner.shutdown(std::net::Shutdown::Write)
     }
 }
 

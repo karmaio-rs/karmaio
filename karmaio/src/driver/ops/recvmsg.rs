@@ -62,7 +62,7 @@ impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
 
         #[cfg(windows)]
         let wsa_bufs: Vec<windows_sys::Win32::Networking::WinSock::WSABUF> = bufs
-            .iter()
+            .iter_mut()
             .map(|buf| windows_sys::Win32::Networking::WinSock::WSABUF {
                 len: buf.bytes_total() as u32,
                 buf: buf.stable_write_ptr() as *mut u8,
@@ -143,7 +143,7 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 impl<B: BoundedIoBufMut> Completable for RecvMsg<B> {
     type Result = BufResult<(usize, SocketAddr), Vec<B>>;
 
-    fn complete(self, completion_result: Completion) -> Self::Result {
+    fn complete(mut self, completion_result: Completion) -> Self::Result {
         let res = completion_result.result.map(|v| v as usize);
         let mut bufs = self.bufs;
 

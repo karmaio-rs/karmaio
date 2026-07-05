@@ -1,6 +1,8 @@
 use std::net::SocketAddr;
-use std::os::fd::{AsFd, IntoRawFd};
 use std::{io::Result, os::raw::c_int};
+
+#[cfg(unix)]
+use std::os::fd::{AsFd, IntoRawFd};
 
 use crate::buf::{BoundedIoBuf, BoundedIoBufMut, BufResult};
 use crate::driver::helpers::io_handle::SharedIoHandle;
@@ -23,8 +25,8 @@ pub(crate) struct Socket {
 
 impl Socket {
     /// Creates a new network socket (TCP/UDP)
-    pub(crate) fn new(socket_addr: SocketAddr, socket_type: c_int) -> Result<Self> {
-        let socket = socket2::Socket::new(socket2::Domain::for_address(socket_addr), socket_type.into(), None)?;
+    pub(crate) fn new(socket_addr: SocketAddr, socket_type: socket2::Type) -> Result<Self> {
+        let socket = socket2::Socket::new(socket2::Domain::for_address(socket_addr), socket_type, None)?;
 
         socket.set_nonblocking(true)?;
 
@@ -54,11 +56,11 @@ impl Socket {
     }
 
     /// Binds a socket to the specified address.
-    pub(crate) fn bind(socket_addr: SocketAddr, socket_type: c_int) -> Result<Self> {
+    pub(crate) fn bind(socket_addr: SocketAddr, socket_type: socket2::Type) -> Result<Self> {
         Self::bind_internal(
             socket_addr.into(),
             socket2::Domain::for_address(socket_addr),
-            socket_type.into(),
+            socket_type,
         )
     }
 
@@ -77,6 +79,7 @@ impl Socket {
         let socket = socket2::Socket::new(domain, socket_type, None)?;
 
         socket.set_reuse_address(true)?;
+        #[cfg(unix)]
         socket.set_reuse_port(true)?;
         socket.set_nonblocking(true)?;
 

@@ -22,7 +22,7 @@ pub(crate) struct Recv<B: BoundedIoBufMut> {
 }
 
 impl<B: BoundedIoBufMut> Op<Recv<B>> {
-    pub(crate) fn recv(io_handle: &SharedIoHandle, buf: B) -> std::io::Result<Op<Recv<B>>> {
+    pub(crate) fn recv(io_handle: &SharedIoHandle, mut buf: B) -> std::io::Result<Op<Recv<B>>> {
         #[cfg(windows)]
         let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
             len: buf.bytes_total() as u32,

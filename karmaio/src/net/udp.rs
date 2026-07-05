@@ -1,7 +1,7 @@
-use std::{
-    net::SocketAddr,
-    os::fd::{AsRawFd, FromRawFd, RawFd},
-};
+use std::net::SocketAddr;
+
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use socket2::SockAddr;
 
@@ -33,7 +33,7 @@ impl UdpSocket {
     /// Returns a new instance of [`UdpSock  et`] on success,
     /// or an [`io::Error`](std::io::Error) on failure.
     pub async fn bind(socket_addr: SocketAddr) -> std::io::Result<UdpSocket> {
-        let socket = Socket::bind(socket_addr, libc::SOCK_DGRAM)?;
+        let socket = Socket::bind(socket_addr, socket2::Type::DGRAM)?;
         Ok(UdpSocket { inner: socket })
     }
 

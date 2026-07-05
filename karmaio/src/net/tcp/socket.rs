@@ -6,7 +6,6 @@ use socket2::SockRef;
 use crate::driver::helpers::socket::Socket;
 use crate::net::tcp::{TcpListener, TcpStream};
 
-#[cfg(unix)]
 use crate::driver::helpers::io_handle::SharedIoHandle;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
@@ -117,12 +116,14 @@ impl TcpSocket {
     }
 
     /// Sets the value of `SO_REUSEPORT` on this socket.
+    #[cfg(unix)]
     pub fn set_reuseport(&self, reuseport: bool) -> std::io::Result<()> {
         let sock_ref = SockRef::from(&self.inner);
         sock_ref.set_reuse_port(reuseport)
     }
 
     /// Gets the value of the `SO_REUSEPORT` option on this socket.
+    #[cfg(unix)]
     pub fn reuseport(&self) -> std::io::Result<bool> {
         let sock_ref = SockRef::from(&self.inner);
         sock_ref.reuse_port()

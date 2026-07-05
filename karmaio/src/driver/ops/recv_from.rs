@@ -164,7 +164,7 @@ impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
 impl<B: BoundedIoBufMut> Completable for RecvFrom<B> {
     type Result = BufResult<(usize, SocketAddr), B>;
 
-    fn complete(self, completion_result: Completion) -> Self::Result {
+    fn complete(mut self, completion_result: Completion) -> Self::Result {
         let res = completion_result.result.map(|v| v as usize);
         let mut buf = self.buf;
 

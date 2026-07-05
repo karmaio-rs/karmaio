@@ -86,41 +86,52 @@ impl Metadata {
     }
 }
 
+// `std::os::windows::fs::MetadataExt` includes unstable methods on stable Rust,
+// so karmaio exposes the Windows-specific fields as inherent methods instead.
 #[cfg(windows)]
-impl std::os::windows::fs::MetadataExt for Metadata {
-    fn file_attributes(&self) -> u32 {
+impl Metadata {
+    /// Returns the value of the `dwFileAttributes` field of this metadata.
+    pub fn file_attributes(&self) -> u32 {
         self.0.file_attributes()
     }
 
-    fn creation_time(&self) -> u64 {
+    /// Returns the value of the `ftCreationTime` field of this metadata.
+    pub fn creation_time(&self) -> u64 {
         self.0.creation_time()
     }
 
-    fn last_access_time(&self) -> u64 {
+    /// Returns the value of the `ftLastAccessTime` field of this metadata.
+    pub fn last_access_time(&self) -> u64 {
         self.0.last_access_time()
     }
 
-    fn last_write_time(&self) -> u64 {
+    /// Returns the value of the `ftLastWriteTime` field of this metadata.
+    pub fn last_write_time(&self) -> u64 {
         self.0.last_write_time()
     }
 
-    fn file_size(&self) -> u64 {
+    /// Returns the value of the `nFileSize` field of this metadata.
+    pub fn file_size(&self) -> u64 {
         self.0.len()
     }
 
-    fn volume_serial_number(&self) -> Option<u32> {
+    /// Returns the volume serial number of the file, if available.
+    pub fn volume_serial_number(&self) -> Option<u32> {
         self.0.volume_serial_number()
     }
 
-    fn number_of_links(&self) -> Option<u32> {
+    /// Returns the number of hard links to the file, if available.
+    pub fn number_of_links(&self) -> Option<u32> {
         self.0.number_of_links()
     }
 
-    fn file_index(&self) -> Option<u64> {
+    /// Returns the file index, if available.
+    pub fn file_index(&self) -> Option<u64> {
         self.0.file_index()
     }
 
-    fn change_time(&self) -> Option<u64> {
+    /// Returns the change time of the file, if available.
+    pub fn change_time(&self) -> Option<u64> {
         self.0.change_time()
     }
 }

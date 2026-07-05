@@ -94,7 +94,7 @@ impl Submittable for Connect {
                     std::io::Error::last_os_error()
                 );
             }
-            ptr.expect("WSAIoctl returned success but ConnectEx pointer is null")
+            Some(ptr.expect("WSAIoctl returned success but ConnectEx pointer is null"))
         });
 
         // TODO: ConnectEx may require the socket to be explicitly bound first.

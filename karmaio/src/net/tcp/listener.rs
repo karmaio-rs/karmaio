@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-#[cfg(unix)]
 use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::{driver::helpers::socket::Socket, net::tcp::TcpStream};
 
@@ -23,7 +22,7 @@ impl TcpListener {
     ///
     /// Binding with a port number of 0 will request that the OS to assign a port to this listener.
     pub fn bind(addr: SocketAddr) -> std::io::Result<Self> {
-        let socket = Socket::bind(addr, libc::SOCK_STREAM)?;
+        let socket = Socket::bind(addr, socket2::Type::STREAM)?;
         // TODO: Make this configurable?
         socket.listen(1024)?;
         Ok(TcpListener { inner: socket })

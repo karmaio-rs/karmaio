@@ -54,8 +54,8 @@ impl Submittable for Truncate {
 
         match self.handle.raw_os_handle() {
             OsRawHandle::Handle(handle) => {
-                let mut distance_to_move: i64 = self.size as i64;
-                let mut new_file_pointer: u64 = 0;
+                let distance_to_move: i64 = self.size as i64;
+                let mut new_file_pointer: i64 = 0;
 
                 windows_syscall_submit!({
                     match windows_syscall!(BOOL, {

@@ -156,7 +156,7 @@ impl CompletionPort {
             unsafe { CreateIoCompletionPort(handle as HANDLE, self.port.as_raw_handle() as HANDLE, completion_key, 0) };
 
         if result.is_null() {
-            Err(io::Error::last_os_error())
+            Err(Error::last_os_error())
         } else {
             Ok(())
         }
@@ -177,7 +177,7 @@ impl CompletionPort {
         };
 
         if result == 0 {
-            let err = io::Error::last_os_error();
+            let err = Error::last_os_error();
 
             if err.raw_os_error() == Some(WAIT_TIMEOUT as i32) {
                 return Ok(0);
@@ -280,7 +280,7 @@ impl DriverBackend for IocpBackend {
                     let result = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
 
                     if result == 0 {
-                        let err = io::Error::last_os_error();
+                        let err = Error::last_os_error();
                         debug_assert_eq!(
                             err.raw_os_error(),
                             Some(ERROR_NOT_FOUND as i32),
@@ -367,7 +367,7 @@ impl DriverBackend for IocpBackend {
                 Ok(entry.dwNumberOfBytesTransferred)
             } else {
                 let err = unsafe { RtlNtStatusToDosError(status) };
-                Err(io::Error::from_raw_os_error(err as i32))
+                Err(Error::from_raw_os_error(err as i32))
             };
 
             if let Some(slot) = self.ops.get_mut(index) {

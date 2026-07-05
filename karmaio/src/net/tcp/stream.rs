@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-#[cfg(unix)]
 use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
@@ -25,7 +24,7 @@ pub struct TcpStream {
 impl TcpStream {
     /// Opens a TCP connection to a remote host at the given `SocketAddr`
     pub async fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
-        let socket = Socket::new(addr, libc::SOCK_STREAM)?;
+        let socket = Socket::new(addr, socket2::Type::STREAM)?;
         socket.connect(socket2::SockAddr::from(addr)).await?;
         let tcp_stream = TcpStream { inner: socket };
         Ok(tcp_stream)
@@ -50,7 +49,10 @@ impl TcpStream {
     }
 
     /// Returns the socket address of the local half of this TCP connection.
+    #[cfg(unix)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
         let fd = self.inner.as_raw_fd();
         let s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
         let addr = s.local_addr();
@@ -58,10 +60,37 @@ impl TcpStream {
         addr
     }
 
+    /// Returns the socket address of the local half of this TCP connection.
+    #[cfg(windows)]
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+
+        let handle = self.inner.as_raw_socket();
+        let s = unsafe { std::net::TcpStream::from_raw_socket(handle) };
+        let addr = s.local_addr();
+        std::mem::forget(s);
+        addr
+    }
+
     /// Returns the socket address of the remote half of this TCP connection.
+    #[cfg(unix)]
     pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
         let fd = self.inner.as_raw_fd();
         let s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
+        let addr = s.peer_addr();
+        std::mem::forget(s);
+        addr
+    }
+
+    /// Returns the socket address of the remote half of this TCP connection.
+    #[cfg(windows)]
+    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
+        use std::os::windows::io::{AsRawSocket, FromRawSocket};
+
+        let handle = self.inner.as_raw_socket();
+        let s = unsafe { std::net::TcpStream::from_raw_socket(handle) };
         let addr = s.peer_addr();
         std::mem::forget(s);
         addr

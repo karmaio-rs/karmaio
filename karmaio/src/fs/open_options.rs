@@ -1,11 +1,10 @@
-use std::path::Path;
+use std::{io, path::Path};
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
 #[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{ERROR_INVALID_PARAMETER, GENERIC_READ, GENERIC_WRITE},
-    Security::SECURITY_ATTRIBUTES,
     Storage::FileSystem::{
         CREATE_ALWAYS, CREATE_NEW, FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_OVERLAPPED, FILE_GENERIC_WRITE,
         FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_WRITE_DATA, OPEN_ALWAYS, OPEN_EXISTING,

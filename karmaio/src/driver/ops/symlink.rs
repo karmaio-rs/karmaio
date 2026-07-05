@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 
 use crate::driver::Submission;
-use crate::driver::helpers::cstr::{cstr, OsPath};
+use crate::driver::helpers::cstr::{OsPath, cstr};
 use crate::driver::ops::{Completable, Completion, Op, Operable, Submittable};
 use crate::runtime::local::CURRENT_DRIVER;
 
@@ -95,7 +95,10 @@ impl Submittable for Symlink {
         };
 
         windows_syscall_submit!({
-            windows_syscall!(BOOLEAN, CreateSymbolicLinkW(self.link.as_ptr(), self.original.as_ptr(), flags))
+            windows_syscall!(
+                BOOLEAN,
+                CreateSymbolicLinkW(self.link.as_ptr(), self.original.as_ptr(), flags)
+            )
         })
     }
 }

@@ -1,5 +1,9 @@
 use std::os::fd::{AsRawFd, RawFd};
-use std::{io::Result, task::{Context, Poll}, time::Duration};
+use std::{
+    io::Result,
+    task::{Context, Poll},
+    time::Duration,
+};
 
 use io_uring::opcode::AsyncCancel;
 use io_uring::{Builder, IoUring, cqueue, squeue};
@@ -90,12 +94,10 @@ impl DriverBackend for IoUringBackend {
                 Poll::Pending
             }
             // The kernel has completed the op. Resolve the future with the result
-            State::Completed(_) => {
-                match self.ops.remove(op.index()) {
-                    State::Completed(completion) => Poll::Ready(op.take_data().unwrap().complete(completion)),
-                    _ => unreachable!("invalid operation"),
-                }
-            }
+            State::Completed(_) => match self.ops.remove(op.index()) {
+                State::Completed(completion) => Poll::Ready(op.take_data().unwrap().complete(completion)),
+                _ => unreachable!("invalid operation"),
+            },
             // The op has been ignored/cancelled by the caller. It should not be polled again
             State::Ignored(..) => {
                 unreachable!("invalid operation")

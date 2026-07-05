@@ -40,9 +40,7 @@ impl Operable for SetPermissions {}
 #[cfg(target_os = "macos")]
 impl Submittable for SetPermissions {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(libc::fchmod(self.handle.raw_fd(), self.perm.mode() as libc::mode_t))
-        })
+        macos_syscall_submit!({ macos_syscall!(libc::fchmod(self.handle.raw_fd(), self.perm.mode() as libc::mode_t)) })
     }
 }
 
@@ -129,7 +127,8 @@ impl Completable for SetPermissions {
     type Result = io::Result<()>;
 
     fn complete(self, _cqe: Completion) -> Self::Result {
-        self.result.unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::Other, "set_permissions result missing")))
+        self.result
+            .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::Other, "set_permissions result missing")))
     }
 }
 

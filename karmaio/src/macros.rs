@@ -1,5 +1,5 @@
 #[macro_use]
-pub(crate) mod scoped_thread_local;
+pub mod scoped_thread_local;
 
 #[macro_use]
 pub(crate) mod syscall;

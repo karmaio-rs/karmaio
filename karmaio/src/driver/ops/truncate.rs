@@ -41,9 +41,7 @@ impl Submittable for Truncate {
 #[cfg(target_os = "macos")]
 impl Submittable for Truncate {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(libc::ftruncate(self.handle.raw_fd(), self.size as libc::off_t))
-        })
+        macos_syscall_submit!({ macos_syscall!(libc::ftruncate(self.handle.raw_fd(), self.size as libc::off_t)) })
     }
 }
 

@@ -2,7 +2,7 @@ use std::io;
 use std::path::Path;
 
 use crate::driver::Submission;
-use crate::driver::helpers::cstr::{cstr, OsPath};
+use crate::driver::helpers::cstr::{OsPath, cstr};
 use crate::driver::ops::{Completable, Completion, Op, Operable, Submittable};
 use crate::runtime::local::CURRENT_DRIVER;
 
@@ -50,9 +50,7 @@ impl Submittable for CreateDir {
 #[cfg(target_os = "macos")]
 impl Submittable for CreateDir {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(libc::mkdir(self.path.as_c_str().as_ptr(), self.mode))
-        })
+        macos_syscall_submit!({ macos_syscall!(libc::mkdir(self.path.as_c_str().as_ptr(), self.mode)) })
     }
 }
 
@@ -61,9 +59,7 @@ impl Submittable for CreateDir {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
-        windows_syscall_submit!({
-            windows_syscall!(BOOL, CreateDirectoryW(self.path.as_ptr(), std::ptr::null_mut()))
-        })
+        windows_syscall_submit!({ windows_syscall!(BOOL, CreateDirectoryW(self.path.as_ptr(), std::ptr::null_mut())) })
     }
 }
 

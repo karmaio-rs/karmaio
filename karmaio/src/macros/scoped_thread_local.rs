@@ -24,6 +24,9 @@
 //! # Examples
 //!
 //! ```
+//! use karmaio::scoped_thread_local;
+//!
+//! scoped_thread_local!(static FOO: u32);
 //!
 //! # fn main() {
 //! // Initially each scoped slot is empty.
@@ -95,8 +98,7 @@ impl<T> ScopedKey<T> {
     /// # Examples
     ///
     /// ```
-    /// #[macro_use]
-    /// extern crate scoped_tls;
+    /// use karmaio::scoped_thread_local;
     ///
     /// scoped_thread_local!(static FOO: u32);
     ///
@@ -153,8 +155,7 @@ impl<T> ScopedKey<T> {
     /// # Examples
     ///
     /// ```no_run
-    /// #[macro_use]
-    /// extern crate scoped_tls;
+    /// use karmaio::scoped_thread_local;
     ///
     /// scoped_thread_local!(static FOO: u32);
     ///

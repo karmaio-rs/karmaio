@@ -35,36 +35,32 @@ impl<S: Schedule> LocalTaskQueue<S> {
 
     pub(crate) fn push_back(&self, item: Task<S>) {
         // SAFETY:
-        // Exclusive mutable access because:
-        // - The mutable reference is created and used immediately within this scope.
-        // - `LocalTaskQueue` is `!Sync`, so no other threads can access it concurrently.
+        // Exclusive mutable access because this local queue is only mutated by
+        // the owning runtime thread.
         let queue = unsafe { &mut *self.queue.get() };
         queue.push_back(item);
     }
 
     pub(crate) fn pop_front(&self) -> Option<Task<S>> {
         // SAFETY:
-        // Exclusive mutable access because:
-        // - The mutable reference is created and used immediately within this scope.
-        // - `LocalTaskQueue` is `!Sync`, so no other threads can access it concurrently.
+        // Exclusive mutable access because this local queue is only mutated by
+        // the owning runtime thread.
         let queue = unsafe { &mut *self.queue.get() };
         queue.pop_front()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
         // SAFETY:
-        // Exclusive mutable access because:
-        // - The mutable reference is created and used immediately within this scope.
-        // - `LocalTaskQueue` is `!Sync`, so no other threads can access it concurrently.
+        // Exclusive mutable access because this local queue is only read by
+        // the owning runtime thread.
         let queue = unsafe { &mut *self.queue.get() };
         queue.is_empty()
     }
 
     pub(crate) fn len(&self) -> usize {
         // SAFETY:
-        // Exclusive mutable access because:
-        // - The mutable reference is created and used immediately within this scope.
-        // - `LocalTaskQueue` is `!Sync`, so no other threads can access it concurrently.
+        // Exclusive mutable access because this local queue is only read by
+        // the owning runtime thread.
         let queue = unsafe { &mut *self.queue.get() };
         queue.len()
     }

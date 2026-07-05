@@ -22,10 +22,10 @@ pub(crate) mod send_to;
 pub(crate) mod sendmsg;
 pub(crate) mod set_permissions;
 pub(crate) mod stat;
-pub(crate) mod unlink;
 pub(crate) mod symlink;
 pub(crate) mod sync;
 pub(crate) mod truncate;
+pub(crate) mod unlink;
 pub(crate) mod write;
 pub(crate) mod writev;
 

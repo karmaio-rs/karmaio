@@ -23,6 +23,14 @@ pub(crate) struct Task<S: Schedule> {
     _p: PhantomData<S>,
 }
 
+// SAFETY: `Task` is a schedulable handle to an allocation guarded by the task
+// state machine. Sending it between threads only transfers the right to enqueue
+// or drop that handle; polling is still controlled by the owning scheduler.
+unsafe impl<S: Schedule> Send for Task<S> {}
+// SAFETY: Shared access to `Task` does not expose the inner future. All shared
+// coordination goes through atomics in the task header.
+unsafe impl<S: Schedule> Sync for Task<S> {}
+
 impl<S: Schedule> Task<S> {
     unsafe fn from_raw(task_ptr: NonNull<Header>) -> Task<S> {
         Task {

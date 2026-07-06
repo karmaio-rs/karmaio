@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::{
     io::Result,
     task::{Context, Poll},
@@ -24,15 +24,66 @@ pub(crate) struct IoUringBackend {
 
     // IoUring bindings
     uring: IoUring,
+
+    /// eventfd used for cross-thread wakeups. We keep a read armed on it
+    /// so that writes from other threads produce a CQE and wake submit_and_wait.
+    eventfd: std::os::fd::OwnedFd,
+
+    /// Persistent buffer for the armed wakeup read. The kernel writes the eventfd
+    /// counter here while the read is in flight. We reuse the same allocation.
+    wakeup_buf: *mut [u8; 8],
 }
 
 impl IoUringBackend {
     pub(crate) fn new() -> Result<Self> {
-        Ok(Self {
+        let eventfd = unsafe {
+            let fd = libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            OwnedFd::from_raw_fd(fd)
+        };
+
+        let wakeup_buf = Box::into_raw(Box::new([0u8; 8]));
+
+        let mut backend = Self {
             // TODO: Make this configurable later
             ops: Slab::with_capacity(1024),
             uring: IoUring::builder().build(1024)?,
-        })
+            eventfd,
+            wakeup_buf,
+        };
+
+        // Arm the initial read on the eventfd so that a write from another
+        // thread will complete and wake any blocked submit_and_wait.
+        backend.arm_wakeup_read();
+
+        Ok(backend)
+    }
+
+    /// Submit (or re-arm) an async read on the eventfd using a special user_data.
+    /// We bypass the normal Op machinery for the wakeup eventfd.
+    fn arm_wakeup_read(&mut self) {
+        use io_uring::opcode;
+
+        // Use a special user_data that we recognize in dispatch.
+        // u64::MAX-1 to avoid conflict with cancel (u64::MAX).
+        const WAKE_USERDATA: u64 = u64::MAX - 1;
+
+        let buf_ptr = self.wakeup_buf as *mut u8;
+
+        let read_e = opcode::Read::new(
+            io_uring::types::Fd(self.eventfd.as_raw_fd()),
+            buf_ptr,
+            8,
+        )
+        .build()
+        .user_data(WAKE_USERDATA);
+
+        // Best effort push; if full we submit first.
+        while unsafe { self.uring.submission().push(&read_e).is_err() } {
+            let _ = self.submit();
+        }
     }
 }
 
@@ -162,6 +213,14 @@ impl DriverBackend for IoUringBackend {
                 continue;
             }
 
+            const WAKE_USERDATA: u64 = u64::MAX - 1;
+            if completion.user_data() == WAKE_USERDATA {
+                // Wakeup from the eventfd. Re-arm another read so future wakes work.
+                // The written counter bytes in wakeup_buf can be ignored.
+                self.arm_wakeup_read();
+                continue;
+            }
+
             let index = completion.user_data() as usize;
             let res = completion.result();
             let flags = completion.flags();
@@ -175,6 +234,20 @@ impl DriverBackend for IoUringBackend {
                 self.ops.remove(index);
             }
         }
+    }
+
+    fn create_wakeup(&self) -> crate::driver::Wakeup {
+        let fd = self.eventfd.as_raw_fd();
+        crate::driver::Wakeup::new(move || {
+            let val: u64 = 1;
+            let _ = unsafe {
+                libc::write(
+                    fd,
+                    &val as *const u64 as *const libc::c_void,
+                    std::mem::size_of::<u64>(),
+                )
+            };
+        })
     }
 }
 
@@ -263,6 +336,11 @@ impl Drop for IoUringBackend {
         }
 
         // Final sanity check, any ops must be in complete state
-        assert!(self.ops.iter().all(|(_, state)| matches!(state, State::Completed(..))))
+        assert!(self.ops.iter().all(|(_, state)| matches!(state, State::Completed(..))));
+
+        // Free the wakeup buffer (one persistent allocation for the lifetime of the backend).
+        if !self.wakeup_buf.is_null() {
+            unsafe { drop(Box::from_raw(self.wakeup_buf)); }
+        }
     }
 }

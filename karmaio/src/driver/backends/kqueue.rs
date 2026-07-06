@@ -66,6 +66,11 @@ pub(crate) struct KqueueBackend {
     events: Vec<libc::kevent>,
 }
 
+/// Special ident/udata used for cross-thread wakeups via EVFILT_USER.
+/// Chosen to not collide with slab indices (which start small).
+const WAKEUP_IDENT: libc::uintptr_t = libc::uintptr_t::MAX;
+const WAKEUP_UDATA: *mut libc::c_void = libc::uintptr_t::MAX as *mut libc::c_void;
+
 impl KqueueBackend {
     pub(crate) fn new() -> Result<Self> {
         let raw_kqueue = unsafe { libc::kqueue() };
@@ -73,12 +78,36 @@ impl KqueueBackend {
             return Err(Error::last_os_error());
         }
 
-        Ok(Self {
+        let backend = Self {
             kqueue: unsafe { OwnedFd::from_raw_fd(raw_kqueue) },
             // TODO: Make this configurable later
             ops: Slab::with_capacity(1024),
             events: vec![unsafe { std::mem::zeroed() }; 1024],
-        })
+        };
+
+        // Register a user event (EVFILT_USER) that can be triggered from any
+        // thread to wake a blocking kevent() call. This enables the remote task
+        // queue to promptly wake the runtime without a fixed timeout.
+        let ev = libc::kevent {
+            ident: WAKEUP_IDENT,
+            filter: libc::EVFILT_USER,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: 0,
+            data: 0,
+            udata: WAKEUP_UDATA,
+        };
+        let _ = unsafe {
+            libc::kevent(
+                raw_kqueue,
+                &ev,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        };
+
+        Ok(backend)
     }
 
     fn delete_interest(kqueue: RawFd, mut interest: Interest) {
@@ -275,6 +304,11 @@ impl DriverBackend for KqueueBackend {
         for event in &self.events {
             let index = event.udata as usize;
 
+            // This is our cross-thread wakeup event (EVFILT_USER), not an I/O op.
+            if index == WAKEUP_UDATA as usize {
+                continue;
+            }
+
             if let Some(slot) = self.ops.get_mut(index) {
                 // EV_ONESHOT fired. It is no longer registered in the kernel,
                 // so the slot should not remember it as a cancellable interest.
@@ -291,6 +325,21 @@ impl DriverBackend for KqueueBackend {
         // All completions have been processed, so we clear the vec for the next round
         // Note: This does not deallocate the vec, so we still have the existing capacity
         self.events.clear();
+    }
+
+    fn create_wakeup(&self) -> crate::driver::Wakeup {
+        let kq = self.kqueue.as_raw_fd();
+        crate::driver::Wakeup::new(move || {
+            // Perform the EVFILT_USER trigger using the captured raw fd.
+            // This is safe to call from any thread.
+            let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+            ev.ident = WAKEUP_IDENT;
+            ev.filter = libc::EVFILT_USER;
+            ev.fflags = libc::NOTE_TRIGGER;
+            let _ = unsafe {
+                libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
+            };
+        })
     }
 }
 

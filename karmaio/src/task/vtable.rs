@@ -9,6 +9,7 @@ use crate::{
     runtime::Schedule,
     task::{
         Task,
+        join::JoinError,
         state::{Snapshot, TransitionToIdle, TransitionToRunning},
         trailer::Trailer,
         utils::UnsafeCellExt,
@@ -84,10 +85,10 @@ fn poll<F: Future, S: Schedule>(ptr: NonNull<Header>) {
                     internal_task.scheduler.yield_now(task);
                 }
                 TransitionToIdle::OkDealloc => dealloc::<F, S>(ptr),
-                TransitionToIdle::Cancelled => complete(internal_task_ptr),
+                TransitionToIdle::Cancelled => cancel_task(internal_task_ptr),
             }
         }
-        TransitionToRunning::Cancelled => complete(internal_task_ptr),
+        TransitionToRunning::Cancelled => cancel_task(internal_task_ptr),
         TransitionToRunning::Failed => return,
         TransitionToRunning::Dealloc => dealloc::<F, S>(ptr),
     }
@@ -100,7 +101,7 @@ fn poll<F: Future, S: Schedule>(ptr: NonNull<Header>) {
 /// The caller must ensure that the task is complete and that `dst` is a valid
 /// pointer to a memory location that can hold the future's output.
 fn try_read_output<F: Future, S: Schedule>(raw_task_ptr: NonNull<Header>, dst: *mut (), waker: &Waker) {
-    let out = unsafe { &mut *(dst as *mut Poll<F::Output>) };
+    let out = unsafe { &mut *(dst as *mut Poll<crate::task::join::Result<F::Output>>) };
 
     let internal_task_ptr: NonNull<InternalTask<F, S>> = raw_task_ptr.cast();
     let internal_task = unsafe { internal_task_ptr.as_ref() };
@@ -227,15 +228,15 @@ fn poll_future<F: Future, S: Schedule>(internal_task: &InternalTask<F, S>, cx: C
     let output = match output {
         Ok(Poll::Pending) => return Poll::Pending,
         Ok(Poll::Ready(output)) => Ok(output),
-        Err(_panic) => {
+        Err(payload) => {
             internal_task.scheduler.unhandled_panic();
-            Err(())
+            Err(JoinError::panic(payload))
         }
     };
 
-    // Catch and ignore panics if the future panics on drop.
+    // Catch and ignore panics if the task output panics on drop while storing.
     let res = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        internal_task.store_output(output.unwrap());
+        internal_task.store_output(output);
     }));
 
     if res.is_err() {
@@ -243,6 +244,17 @@ fn poll_future<F: Future, S: Schedule>(internal_task: &InternalTask<F, S>, cx: C
     }
 
     Poll::Ready(())
+}
+
+fn cancel_task<F: Future, S: Schedule>(internal_task_ptr: NonNull<InternalTask<F, S>>) {
+    let internal_task = unsafe { internal_task_ptr.as_ref() };
+
+    let _ = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+        internal_task.drop_future_or_output();
+        internal_task.store_output(Err(JoinError::cancelled()));
+    }));
+
+    complete(internal_task_ptr);
 }
 
 /// Complete the task. This method assumes that the state is RUNNING.

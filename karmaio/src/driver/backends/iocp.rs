@@ -9,7 +9,7 @@ use std::{
 use slab::Slab;
 use windows_sys::Win32::{
     Foundation::{ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, WAIT_TIMEOUT},
-    System::IO::{CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY},
+    System::IO::{CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY, PostQueuedCompletionStatus},
 };
 
 use crate::driver::{
@@ -358,6 +358,9 @@ impl DriverBackend for IocpBackend {
             let overlapped = entry.lpOverlapped;
 
             if overlapped.is_null() {
+                // This can be a wakeup packet posted via PostQueuedCompletionStatus
+                // from another thread (remote task scheduling), or other injected packets.
+                // Nothing to do; the wait has woken up.
                 continue;
             }
 
@@ -388,6 +391,15 @@ impl DriverBackend for IocpBackend {
         // All entires have been processed, so we clear the vec for the next round
         // Note: This does not deallocate the vec, so we still have the existing capacity
         self.entries.clear();
+    }
+
+    fn create_wakeup(&self) -> crate::driver::Wakeup {
+        let port_handle = self.port.as_raw_handle() as HANDLE;
+        crate::driver::Wakeup::new(move || {
+            unsafe {
+                PostQueuedCompletionStatus(port_handle, 0, 0, std::ptr::null_mut());
+            }
+        })
     }
 }
 

@@ -2,7 +2,11 @@ use std::{ptr::NonNull, task::Waker};
 
 use crate::{
     runtime::Schedule,
-    task::{header::Header, internal::InternalTask, state::TransitionToNotified},
+    task::{
+        header::Header,
+        internal::InternalTask,
+        state::{TransitionToCancelled, TransitionToNotified},
+    },
 };
 
 pub(crate) struct RawTask {
@@ -16,6 +20,14 @@ impl Clone for RawTask {
 }
 
 impl Copy for RawTask {}
+
+// SAFETY: `RawTask` is an erased task handle. The pointed-to allocation is
+// kept alive by the packed reference count, and all cross-thread coordination
+// goes through the task state machine and scheduler vtable.
+unsafe impl Send for RawTask {}
+// SAFETY: Shared access to `RawTask` only permits atomic state transitions or
+// vtable calls that uphold the task's synchronization invariants.
+unsafe impl Sync for RawTask {}
 
 impl RawTask {
     pub(crate) fn new<F: Future, S: Schedule>(future: F, scheduler: S) -> RawTask {
@@ -46,7 +58,7 @@ impl RawTask {
         (vtable.dealloc)(self.task_ptr);
     }
 
-    /// Safety: `dst` must be a `*mut Poll<super::Result<F::Output>>`
+    /// Safety: `dst` must be a `*mut Poll<join::Result<F::Output>>`
     /// where `F` is the future stored by the task.
     pub(crate) fn try_read_output(self, dst: *mut (), waker: &Waker) {
         let vtable = self.header().vtable;
@@ -56,6 +68,13 @@ impl RawTask {
     pub(crate) fn drop_join_handle(self) {
         let vtable = self.header().vtable;
         (vtable.drop_join_handle)(self.task_ptr);
+    }
+
+    pub(crate) fn cancel(self) {
+        match self.header().state.transition_to_cancelled() {
+            TransitionToCancelled::Submit => self.schedule(),
+            TransitionToCancelled::DoNothing => {}
+        }
     }
 
     pub(super) fn schedule(self) {

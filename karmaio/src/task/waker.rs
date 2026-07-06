@@ -74,20 +74,3 @@ fn raw_waker(header: NonNull<Header>) -> RawWaker {
     let ptr = header.as_ptr() as *const ();
     RawWaker::new(ptr, &WAKER_VTABLE)
 }
-
-// Creates a waker that does nothing.
-//
-// This `Waker` is useful for polling a `Future` to check whether it is
-// `Ready`, without doing any additional work.
-pub(crate) fn dummy_waker() -> Waker {
-    fn dummy_raw_waker() -> RawWaker {
-        // the pointer is never dereferenced, so null is ok
-        RawWaker::new(std::ptr::null::<()>(), vtable())
-    }
-
-    fn vtable() -> &'static RawWakerVTable {
-        &RawWakerVTable::new(|_| dummy_raw_waker(), |_| {}, |_| {}, |_| {})
-    }
-
-    unsafe { Waker::from_raw(dummy_raw_waker()) }
-}

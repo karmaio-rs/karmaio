@@ -6,14 +6,14 @@ use std::{
 
 use crate::{
     runtime::Schedule,
-    task::{state::State, vtable::VTable},
+    task::{join, state::State, vtable::VTable},
 };
 
 use super::{header::Header, trailer::Trailer, utils::UnsafeCellExt};
 
 pub(crate) enum Stage<F: Future> {
     Running(F),
-    Finished(F::Output),
+    Finished(join::Result<F::Output>),
     Consumed,
 }
 
@@ -86,7 +86,7 @@ impl<F: Future, S: Schedule> InternalTask<F, S> {
     /// # Safety
     ///
     /// The caller must ensure it is safe to mutate the `stage` field.
-    pub(crate) fn store_output(&self, output: F::Output) {
+    pub(crate) fn store_output(&self, output: join::Result<F::Output>) {
         // Safety: the caller ensures mutual exclusion to the field.
         self.set_stage(Stage::Finished(output));
     }
@@ -96,7 +96,7 @@ impl<F: Future, S: Schedule> InternalTask<F, S> {
     /// # Safety
     ///
     /// The caller must ensure it is safe to mutate the `stage` field.
-    pub(crate) fn take_output(&self) -> F::Output {
+    pub(crate) fn take_output(&self) -> join::Result<F::Output> {
         use std::mem;
 
         self.stage_with_mut(|ptr| {

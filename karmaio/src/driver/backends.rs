@@ -50,4 +50,8 @@ pub(crate) trait DriverBackend {
 
     // Checks the completion queue for finished operations and dispatches them.
     fn dispatch_completions(&mut self);
+
+    /// Create a `Wakeup` token that can be used from other threads to wake
+    /// a currently blocked `wait*` call on this driver.
+    fn create_wakeup(&self) -> crate::driver::Wakeup;
 }

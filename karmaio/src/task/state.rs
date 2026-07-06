@@ -79,6 +79,12 @@ pub(super) enum TransitionToNotified {
 }
 
 #[must_use]
+pub(super) enum TransitionToCancelled {
+    DoNothing,
+    Submit,
+}
+
+#[must_use]
 pub(super) struct TransitionToJoinHandleDrop {
     pub(super) drop_waker: bool,
     pub(super) drop_output: bool,
@@ -242,6 +248,25 @@ impl State {
                 state.set_notified();
                 state.ref_inc();
                 (TransitionToNotified::Submit, Some(state))
+            }
+        })
+    }
+
+    /// Flags the task for cancellation and schedules it if it is idle.
+    pub(super) fn transition_to_cancelled(&self) -> TransitionToCancelled {
+        self.fetch_update(|mut state| {
+            if state.is_complete() || state.is_cancelled() {
+                return (TransitionToCancelled::DoNothing, None);
+            }
+
+            state.set_cancelled();
+
+            if state.is_idle() && !state.is_notified() {
+                state.set_notified();
+                state.ref_inc();
+                (TransitionToCancelled::Submit, Some(state))
+            } else {
+                (TransitionToCancelled::DoNothing, Some(state))
             }
         })
     }
@@ -463,6 +488,10 @@ impl Snapshot {
 
     pub(super) fn is_cancelled(self) -> bool {
         self.0 & CANCELLED == CANCELLED
+    }
+
+    fn set_cancelled(&mut self) {
+        self.0 |= CANCELLED;
     }
 
     /// Returns `true` if the task's future has completed execution.

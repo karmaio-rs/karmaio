@@ -6,6 +6,7 @@ pub mod fs;
 pub mod io;
 pub mod net;
 pub mod runtime;
+pub mod time;
 
 pub(crate) mod driver;
 pub(crate) mod task;

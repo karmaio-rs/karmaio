@@ -188,7 +188,9 @@ impl Completable for Open {
     type Result = std::io::Result<File>;
 
     fn complete(self, cqe: Completion) -> Self::Result {
-        Ok(File::from(SharedIoHandle::new(cqe.result? as _)))
+        Ok(File::from(unsafe {
+            SharedIoHandle::from_raw_fd(cqe.result? as _)
+        }))
     }
 }
 
@@ -199,6 +201,6 @@ impl Completable for Open {
     fn complete(mut self, cqe: Completion) -> Self::Result {
         let _ = cqe.result?;
         let handle = self.handle.take().expect("Open handle not set");
-        Ok(File::from(SharedIoHandle::new_file(handle)))
+        Ok(File::from(unsafe { SharedIoHandle::from_raw_handle(handle) }))
     }
 }

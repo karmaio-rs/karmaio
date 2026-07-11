@@ -1,9 +1,9 @@
 use std::path::Path;
 
 #[cfg(unix)]
-use std::os::fd::IntoRawFd;
+use std::os::fd::OwnedFd;
 #[cfg(windows)]
-use std::os::windows::io::IntoRawHandle;
+use std::os::windows::io::OwnedHandle;
 
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
@@ -19,12 +19,16 @@ use crate::{
 /// The file does not maintain an internal cursor.
 /// The caller is required to specify an offset when issuing an operation.
 ///
-/// While files are automatically closed when they go out of scope,
-/// the operation happens asynchronously in the background.
-/// It is recommended to call the `close()` function in order to guarantee
-/// that the file successfully closed before exiting the scope.
-/// Closing a file does not guarantee writes have persisted to disk. Use [`sync_all`]
-/// to ensure all writes have reached the filesystem.
+/// # Closing
+///
+/// Prefer [`File::close`] so close errors are reported and the OS handle is released
+/// after in-flight operations complete (asynchronously via the driver).
+///
+/// If the file is dropped without calling `close`, the handle is still closed
+/// **synchronously** when the last reference is dropped (compio / tokio-uring style).
+/// Explicit `close().await` is recommended when you need non-blocking close or to
+/// observe close errors. Closing a file does not guarantee writes have persisted
+/// to disk; use [`sync_all`] for that.
 pub struct File {
     /// Open file descriptor
     pub(crate) handle: SharedIoHandle,
@@ -76,13 +80,15 @@ impl File {
         OpenOptions::new().read(true).open(path).await
     }
 
-    /// Closes the file or returns an error
+    /// Closes the file and returns any close error.
     ///
-    /// The programmer has the choice of calling this asynchronous close and waiting for the result
-    /// or simply letting the file go out of scope and having the library close the file descriptor automatically and synchronously.
+    /// Waits for in-flight operations on this file to complete, then closes the
+    /// OS handle via the driver. Prefer this over dropping the file when you need
+    /// to observe close errors or keep drop paths non-blocking.
     ///
-    /// It's OK to drop the [`File`] directly without calling `close`, but the file may not be closed immediately.
-    pub async fn close(mut self) -> std::io::Result<()> {
+    /// Dropping a [`File`] without calling `close` still closes the handle
+    /// synchronously when the last reference is dropped.
+    pub async fn close(self) -> std::io::Result<()> {
         self.handle.close().await
     }
 
@@ -132,7 +138,7 @@ impl File {
 #[cfg(unix)]
 impl From<std::fs::File> for File {
     fn from(file: std::fs::File) -> Self {
-        File::from(SharedIoHandle::new(file.into_raw_fd()))
+        File::from(SharedIoHandle::new(OwnedFd::from(file)))
     }
 }
 
@@ -141,8 +147,7 @@ impl From<std::fs::File> for File {
     fn from(file: std::fs::File) -> Self {
         // Transfer ownership of the underlying handle out of the std File
         // so that SharedIoHandle becomes responsible for closing it.
-        let handle = file.into_raw_handle();
-        File::from(SharedIoHandle::new_file(handle))
+        File::from(SharedIoHandle::new_file(OwnedHandle::from(file)))
     }
 }
 

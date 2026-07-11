@@ -2,17 +2,14 @@ use std::net::SocketAddr;
 use std::{io::Result, os::raw::c_int};
 
 #[cfg(unix)]
-use std::os::fd::{AsFd, IntoRawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, OwnedSocket, RawSocket};
 
 use crate::buf::{BoundedIoBuf, BoundedIoBufMut, BufResult};
 use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::driver::ops::Op;
-
-#[cfg(unix)]
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-
-#[cfg(windows)]
-use std::os::windows::io::{AsRawHandle, AsRawSocket, AsSocket, BorrowedSocket, IntoRawSocket, RawSocket};
 
 // This is an internal wrapper around socket operations for the runtime.
 // This wrapper abstracts and handles all the driver operations and os compatiblity,
@@ -128,6 +125,14 @@ impl Socket {
         socket_ref.shutdown(how)
     }
 
+    /// Closes the socket, waiting for in-flight operations to complete.
+    ///
+    /// Prefer this over dropping when close errors must be observed. Drop still
+    /// closes the handle synchronously when the last reference is dropped.
+    pub(crate) async fn close(self) -> Result<()> {
+        self.handle.close().await
+    }
+
     /// Set the value of the `TCP_NODELAY` option on this socket.
     ///
     /// If set, this option disables the Nagle algorithm.
@@ -190,12 +195,12 @@ impl Socket {
 
     #[cfg(unix)]
     fn shared_handle_from_socket(socket: socket2::Socket) -> Result<SharedIoHandle> {
-        Ok(SharedIoHandle::new(socket.into_raw_fd()))
+        Ok(SharedIoHandle::new(OwnedFd::from(socket)))
     }
 
     #[cfg(windows)]
     fn shared_handle_from_socket(socket: socket2::Socket) -> Result<SharedIoHandle> {
-        Ok(SharedIoHandle::new_socket(socket.into_raw_socket()))
+        Ok(SharedIoHandle::new_socket(OwnedSocket::from(socket)))
     }
 }
 
@@ -209,9 +214,7 @@ impl AsRawFd for Socket {
 #[cfg(unix)]
 impl AsFd for Socket {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        // Safety: `self.handle.raw_fd()` returns a valid, open file descriptor
-        // that is owned by this `Socket` and will remain valid for the lifetime of `&self`.
-        unsafe { BorrowedFd::borrow_raw(self.handle.raw_fd()) }
+        self.handle.as_fd()
     }
 }
 
@@ -226,7 +229,6 @@ impl AsSocket for Socket {
 
 #[cfg(windows)]
 impl AsRawSocket for Socket {
-    // Required method
     fn as_raw_socket(&self) -> RawSocket {
         self.handle.raw_socket()
     }
@@ -239,17 +241,85 @@ impl From<SharedIoHandle> for Socket {
 }
 
 #[cfg(unix)]
-impl<T: IntoRawFd> From<T> for Socket {
-    fn from(socket: T) -> Self {
-        let fd = SharedIoHandle::new(socket.into_raw_fd());
-        Self::from(fd)
+impl From<OwnedFd> for Socket {
+    fn from(fd: OwnedFd) -> Self {
+        Self::from(SharedIoHandle::new(fd))
     }
 }
 
 #[cfg(windows)]
-impl<T: IntoRawSocket> From<T> for Socket {
-    fn from(socket: T) -> Self {
-        let socket = SharedIoHandle::new_socket(socket.into_raw_socket());
-        Self::from(socket)
+impl From<OwnedSocket> for Socket {
+    fn from(socket: OwnedSocket) -> Self {
+        Self::from(SharedIoHandle::new_socket(socket))
+    }
+}
+
+#[cfg(unix)]
+impl From<std::net::TcpStream> for Socket {
+    fn from(socket: std::net::TcpStream) -> Self {
+        Self::from(OwnedFd::from(socket))
+    }
+}
+
+#[cfg(windows)]
+impl From<std::net::TcpStream> for Socket {
+    fn from(socket: std::net::TcpStream) -> Self {
+        Self::from(OwnedSocket::from(socket))
+    }
+}
+
+#[cfg(unix)]
+impl From<std::net::TcpListener> for Socket {
+    fn from(socket: std::net::TcpListener) -> Self {
+        Self::from(OwnedFd::from(socket))
+    }
+}
+
+#[cfg(windows)]
+impl From<std::net::TcpListener> for Socket {
+    fn from(socket: std::net::TcpListener) -> Self {
+        Self::from(OwnedSocket::from(socket))
+    }
+}
+
+#[cfg(unix)]
+impl From<std::net::UdpSocket> for Socket {
+    fn from(socket: std::net::UdpSocket) -> Self {
+        Self::from(OwnedFd::from(socket))
+    }
+}
+
+#[cfg(windows)]
+impl From<std::net::UdpSocket> for Socket {
+    fn from(socket: std::net::UdpSocket) -> Self {
+        Self::from(OwnedSocket::from(socket))
+    }
+}
+
+#[cfg(unix)]
+impl From<std::os::unix::net::UnixStream> for Socket {
+    fn from(socket: std::os::unix::net::UnixStream) -> Self {
+        Self::from(OwnedFd::from(socket))
+    }
+}
+
+#[cfg(unix)]
+impl From<std::os::unix::net::UnixListener> for Socket {
+    fn from(socket: std::os::unix::net::UnixListener) -> Self {
+        Self::from(OwnedFd::from(socket))
+    }
+}
+
+#[cfg(unix)]
+impl From<socket2::Socket> for Socket {
+    fn from(socket: socket2::Socket) -> Self {
+        Self::from(OwnedFd::from(socket))
+    }
+}
+
+#[cfg(windows)]
+impl From<socket2::Socket> for Socket {
+    fn from(socket: socket2::Socket) -> Self {
+        Self::from(OwnedSocket::from(socket))
     }
 }

@@ -21,11 +21,22 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 /// Once configured, you can call [`bind`](TcpSocket::bind) to bind it to an address,
 /// and then [`listen`](TcpSocket::listen) to start listening,
 /// or [`connect`](TcpSocket::connect) to connect to a remote peer.
+/// A TCP socket that has not yet been converted into a listener or stream.
+///
+/// # Closing
+///
+/// Prefer [`TcpSocket::close`] so close errors are reported. Drop still closes
+/// the OS socket synchronously when the last reference is dropped.
 pub struct TcpSocket {
     pub(super) inner: Socket,
 }
 
 impl TcpSocket {
+    /// Closes the socket after in-flight operations complete.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
+    }
+
     /// Creates a new socket configured for IPv4 TCP.
     pub fn new_v4() -> std::io::Result<Self> {
         let socket = socket2::Socket::new(
@@ -205,7 +216,7 @@ impl TcpSocket {
 #[cfg(unix)]
 impl FromRawFd for TcpSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        TcpSocket::from(Socket::from(SharedIoHandle::new(fd)))
+        TcpSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
     }
 }
 
@@ -219,7 +230,7 @@ impl AsRawFd for TcpSocket {
 #[cfg(windows)]
 impl FromRawSocket for TcpSocket {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        TcpSocket::from(Socket::from(SharedIoHandle::new_socket(socket)))
+        TcpSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
     }
 }
 

@@ -2,6 +2,12 @@ use std::path::Path;
 
 use crate::{driver::helpers::socket::Socket, net::unix::UnixStream};
 
+/// A Unix domain socket server listening for connections.
+///
+/// # Closing
+///
+/// Prefer [`UnixListener::close`] so close errors are reported. Dropping the
+/// listener still closes the OS socket synchronously when the last reference is dropped.
 pub struct UnixListener {
     pub(super) inner: Socket,
 }
@@ -14,6 +20,13 @@ impl UnixListener {
         //TODO: Make this configurable later?
         socket.listen(1024)?;
         Ok(UnixListener { inner: socket })
+    }
+
+    /// Closes the listener after in-flight operations complete.
+    ///
+    /// Prefer this over dropping when close errors must be observed.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
     }
 
     /// Returns the local address that this listener is bound to.

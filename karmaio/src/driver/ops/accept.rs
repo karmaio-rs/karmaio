@@ -130,7 +130,7 @@ impl Completable for Accept {
 
     fn complete(self, completion: Completion) -> Self::Result {
         let raw_fd = completion.result?;
-        let io_handle = SharedIoHandle::new(raw_fd as i32);
+        let io_handle = unsafe { SharedIoHandle::from_raw_fd(raw_fd as i32) };
         let socket = Socket::from(io_handle);
 
         let (_, addr) = unsafe {
@@ -201,7 +201,7 @@ impl Completable for Accept {
         };
 
         let accepted_socket = self.accepted_socket.take().expect("missing accepted socket");
-        let io_handle = SharedIoHandle::new_socket(accepted_socket);
+        let io_handle = unsafe { SharedIoHandle::from_raw_socket(accepted_socket) };
         let socket = Socket::from(io_handle);
 
         Ok((socket, addr.as_socket()))

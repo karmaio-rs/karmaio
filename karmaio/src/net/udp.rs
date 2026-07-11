@@ -23,6 +23,11 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 ///   and [`recv_from`](`UdpSocket::recv_from`) to communicate with many different addresses
 /// - one to one: [`connect`](`UdpSocket::connect`) and associate with a single address, using [`write`](`UdpSocket::write`)
 ///   and [`read`](`UdpSocket::read`) to communicate only with that remote address
+///
+/// # Closing
+///
+/// Prefer [`UdpSocket::close`] so close errors are reported. Dropping the socket
+/// still closes the OS handle synchronously when the last reference is dropped.
 pub struct UdpSocket {
     pub(super) inner: Socket,
 }
@@ -35,6 +40,13 @@ impl UdpSocket {
     pub async fn bind(socket_addr: SocketAddr) -> std::io::Result<UdpSocket> {
         let socket = Socket::bind(socket_addr, socket2::Type::DGRAM)?;
         Ok(UdpSocket { inner: socket })
+    }
+
+    /// Closes the socket after in-flight operations complete.
+    ///
+    /// Prefer this over dropping when close errors must be observed.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
     }
 
     /// Returns the local address to which this UDP socket is bound.
@@ -146,7 +158,7 @@ impl UdpSocket {
 #[cfg(unix)]
 impl FromRawFd for UdpSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        UdpSocket::from(Socket::from(SharedIoHandle::new(fd)))
+        UdpSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
     }
 }
 
@@ -160,7 +172,7 @@ impl AsRawFd for UdpSocket {
 #[cfg(windows)]
 impl FromRawSocket for UdpSocket {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        UdpSocket::from(Socket::from(SharedIoHandle::new_socket(socket)))
+        UdpSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
     }
 }
 

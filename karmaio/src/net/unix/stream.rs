@@ -10,6 +10,12 @@ use crate::{
     net::split::{ReadHalf, WriteHalf, split},
 };
 
+/// A Unix stream connected to a remote Unix domain socket endpoint.
+///
+/// # Closing
+///
+/// Prefer [`UnixStream::close`] so close errors are reported. Dropping the stream
+/// still closes the OS socket synchronously when the last reference is dropped.
 pub struct UnixStream {
     pub(super) inner: Socket,
 }
@@ -23,6 +29,13 @@ impl UnixStream {
         socket.connect(SockAddr::unix(path)?).await?;
         let unix_stream = UnixStream { inner: socket };
         Ok(unix_stream)
+    }
+
+    /// Closes the stream after in-flight operations complete.
+    ///
+    /// Prefer this over dropping when close errors must be observed.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
     }
 
     /// Shuts down the read, write, or both halves of this connection.

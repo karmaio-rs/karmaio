@@ -16,11 +16,21 @@ use crate::net::unix::{UnixListener, UnixStream};
 /// Once configured, you can call [`bind`](UnixSocket::bind) to bind it to a path,
 /// and then [`listen`](UnixSocket::listen) to start listening,
 /// or [`connect`](UnixSocket::connect) to connect to a remote peer.
+///
+/// # Closing
+///
+/// Prefer [`UnixSocket::close`] so close errors are reported. Drop still closes
+/// the OS socket synchronously when the last reference is dropped.
 pub struct UnixSocket {
     pub(super) inner: Socket,
 }
 
 impl UnixSocket {
+    /// Closes the socket after in-flight operations complete.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
+    }
+
     /// Creates a new Unix domain stream socket.
     pub fn new() -> std::io::Result<Self> {
         let inner = Socket::new_unix(libc::SOCK_STREAM)?;
@@ -128,7 +138,7 @@ impl UnixSocket {
 
 impl FromRawFd for UnixSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        UnixSocket::from(Socket::from(SharedIoHandle::new(fd)))
+        UnixSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
     }
 }
 

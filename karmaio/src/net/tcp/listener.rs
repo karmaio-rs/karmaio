@@ -11,6 +11,11 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 /// A TCP socket server listening for connections.
 ///
 /// You can accept a new connection by using the [`accept`](`TcpListener::accept`) method.
+///
+/// # Closing
+///
+/// Prefer [`TcpListener::close`] so close errors are reported. Dropping the listener
+/// still closes the OS socket synchronously when the last reference is dropped.
 pub struct TcpListener {
     pub(super) inner: Socket,
 }
@@ -26,6 +31,13 @@ impl TcpListener {
         // TODO: Make this configurable?
         socket.listen(1024)?;
         Ok(TcpListener { inner: socket })
+    }
+
+    /// Closes the listener after in-flight operations complete.
+    ///
+    /// Prefer this over dropping when close errors must be observed.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
     }
 
     /// Returns the local address that this listener is bound to.
@@ -77,7 +89,7 @@ impl TcpListener {
 #[cfg(unix)]
 impl FromRawFd for TcpListener {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        TcpListener::from(Socket::from(SharedIoHandle::new(fd)))
+        TcpListener::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
     }
 }
 
@@ -91,7 +103,7 @@ impl AsRawFd for TcpListener {
 #[cfg(windows)]
 impl FromRawSocket for TcpListener {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        TcpListener::from(Socket::from(SharedIoHandle::new_socket(socket)))
+        TcpListener::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
     }
 }
 

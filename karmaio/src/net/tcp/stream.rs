@@ -17,6 +17,11 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 ///
 /// A TCP stream can either be created by connecting to an endpoint
 /// via the [`connect`] method, or by [`accepting`] a connection from a [`listener`].
+///
+/// # Closing
+///
+/// Prefer [`TcpStream::close`] so close errors are reported. Dropping the stream
+/// still closes the OS socket synchronously when the last reference is dropped.
 pub struct TcpStream {
     pub(super) inner: Socket,
 }
@@ -28,6 +33,13 @@ impl TcpStream {
         socket.connect(socket2::SockAddr::from(addr)).await?;
         let tcp_stream = TcpStream { inner: socket };
         Ok(tcp_stream)
+    }
+
+    /// Closes the stream after in-flight operations complete.
+    ///
+    /// Prefer this over dropping when close errors must be observed.
+    pub async fn close(self) -> std::io::Result<()> {
+        self.inner.close().await
     }
 
     /// Shuts down the read, write, or both halves of this connection.
@@ -170,7 +182,7 @@ impl AsyncWrite for TcpStream {
 #[cfg(unix)]
 impl FromRawFd for TcpStream {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        TcpStream::from(Socket::from(SharedIoHandle::new(fd)))
+        TcpStream::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
     }
 }
 
@@ -184,7 +196,7 @@ impl AsRawFd for TcpStream {
 #[cfg(windows)]
 impl FromRawSocket for TcpStream {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        TcpStream::from(Socket::from(SharedIoHandle::new_socket(socket)))
+        TcpStream::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
     }
 }
 

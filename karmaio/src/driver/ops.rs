@@ -12,7 +12,7 @@ pub(crate) mod create_dir;
 pub(crate) mod hardlink;
 pub(crate) mod open;
 pub(crate) mod read;
-pub(crate) mod read_stream;
+pub(crate) mod read_at;
 pub(crate) mod readv;
 pub(crate) mod recv;
 pub(crate) mod recv_from;
@@ -30,7 +30,7 @@ pub(crate) mod unlink;
 #[cfg(target_os = "macos")]
 pub(crate) mod wait_process;
 pub(crate) mod write;
-pub(crate) mod write_stream;
+pub(crate) mod write_at;
 pub(crate) mod writev;
 
 pub(crate) enum State {

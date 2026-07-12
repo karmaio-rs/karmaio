@@ -1,93 +1,74 @@
+//! Offset-less read operations for stream-like file descriptors (pipes, sockets,
+//! char devices). Unlike [`crate::driver::ops::read_at`], these never touch the
+//! offset, which matters on macOS/BSD where the kqueue `Submittable`
+//! implementations of the offset-based ops use `pread`/`pwrite` and those
+//! syscalls fail (`ESPIPE`) on non-seekable descriptors.
+
+use std::io;
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
         Submission,
-        helpers::io_handle::SharedIoHandle,
+        helpers::io_handle::{OsRawHandle, SharedIoHandle},
         ops::{Completable, Completion, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };
 
-pub(crate) struct Read<B: BoundedIoBufMut> {
-    // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
+pub(crate) struct Read<B> {
+    // Holds a strong ref to the fd, preventing the pipe from being closed while
+    // an operation is in-flight.
     #[allow(dead_code)]
     io_handle: SharedIoHandle,
 
-    // Reference to the in-flight buffer.
     pub(crate) buf: B,
-
-    // Read offset
-    offset: u64,
 }
 
 impl<B: BoundedIoBufMut> Op<Read<B>> {
-    pub(crate) fn read_at(io_handle: &SharedIoHandle, buf: B, offset: u64) -> std::io::Result<Op<Read<B>>> {
+    pub(crate) fn read(io_handle: &SharedIoHandle, buf: B) -> io::Result<Op<Read<B>>> {
         let data = Read {
             io_handle: io_handle.clone(),
             buf,
-            offset,
         };
-
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("not in a runtime context").submit_op(data))
     }
 }
 
 impl<B: BoundedIoBufMut> Operable for Read<B> {}
 
-#[cfg(target_os = "linux")]
 impl<B: BoundedIoBufMut> Submittable for Read<B> {
+    #[cfg(target_os = "linux")]
     fn submit(&mut self) -> Submission {
         use io_uring::{opcode, types};
 
-        // Get raw buffer info
         let ptr = self.buf.stable_write_ptr();
         let len = self.buf.bytes_total();
-        opcode::Read::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _)
-            .offset(self.offset as _)
-            .build()
+        opcode::Read::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
-}
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> Submittable for Read<B> {
+    #[cfg(target_os = "macos")]
     fn submit(&mut self) -> Submission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            let ptr = self.buf.stable_write_ptr();
+            let ptr = self.buf.stable_write_ptr() as *mut libc::c_void;
             let len = self.buf.bytes_total();
-
-            macos_syscall!(libc::pread(
-                self.io_handle.raw_fd(),
-                ptr as *mut libc::c_void,
-                len,
-                self.offset as i64,
-            ))
+            macos_syscall!(libc::read(self.io_handle.raw_fd(), ptr, len))
         })
     }
-}
 
-#[cfg(windows)]
-impl<B: BoundedIoBufMut> Submittable for Read<B> {
+    #[cfg(windows)]
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use crate::driver::helpers::io_handle::OsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
-        let ptr = self.buf.stable_write_ptr();
+        let ptr = self.buf.stable_write_ptr() as *mut u8;
         let len = self.buf.bytes_total() as u32;
 
         match self.io_handle.raw_os_handle() {
             OsRawHandle::Handle(handle) => {
                 let mut interest = Interest::new(handle as _);
-
-                unsafe {
-                    let overlapped = &mut *interest.as_mut_ptr();
-                    overlapped.Anonymous.Anonymous.Offset = (self.offset & 0xFFFF_FFFF) as u32;
-                    overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
-                }
-
-                let mut bytes_read = 0u32;
                 windows_syscall_submit_overlapped!(interest, file, {
-                    ReadFile(handle as _, ptr as *mut u8, len, &mut bytes_read, interest.as_mut_ptr())
+                    ReadFile(handle as _, ptr, len, std::ptr::null_mut(), interest.as_mut_ptr())
                 })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {
@@ -104,20 +85,51 @@ impl<B: BoundedIoBufMut> Submittable for Read<B> {
 impl<B: BoundedIoBufMut> Completable for Read<B> {
     type Result = BufResult<usize, B>;
 
-    fn complete(self, completion_entry: super::Completion) -> Self::Result {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut buf = self.buf;
-
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            // Safety: the kernel wrote `n` bytes to the buffer.
-            unsafe {
-                buf.set_init(n);
+    fn complete(mut self, completion: Completion) -> Self::Result {
+        match completion.result {
+            Ok(res) => {
+                let res = res as usize;
+                // Safety: the kernel wrote `res` bytes into the buffer.
+                unsafe {
+                    self.buf.set_init(res);
+                }
+                (Ok(res), self.buf)
             }
+            Err(err) => (Err(err), self.buf),
         }
+    }
+}
 
-        (res, buf)
+/// Reads from a raw [`OsRawHandle`] synchronously. Used to drain a child's piped
+/// output on the blocking pool, where the `Rc`-backed [`SharedIoHandle`] cannot
+/// cross thread boundaries.
+pub(crate) fn read_sync_raw(fd: usize, buf: &mut [u8]) -> io::Result<usize> {
+    let len = buf.len();
+    #[cfg(unix)]
+    {
+        macos_syscall!(libc::read(
+            fd as libc::c_int,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            len
+        ))
+        .map(|n| n as usize)
+    }
+    #[cfg(windows)]
+    {
+        let mut n = 0u32;
+        let ok = unsafe {
+            windows_sys::Win32::Storage::FileSystem::ReadFile(
+                fd as windows_sys::Win32::Foundation::HANDLE,
+                buf.as_mut_ptr(),
+                len as _,
+                &mut n,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            Ok(n as usize)
+        } else {
+            Err(io::Error::last_os_error())
+        }
     }
 }

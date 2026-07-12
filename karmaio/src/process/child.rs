@@ -13,7 +13,7 @@ use std::{
 };
 
 use crate::{
-    driver::ops::read_stream,
+    driver::ops::read,
     process::stdio::{ChildStderr, ChildStdin, ChildStdout},
     runtime::local::spawn_blocking,
 };
@@ -221,7 +221,7 @@ fn drain_raw_fd(fd: Option<usize>) -> io::Result<Vec<u8>> {
     if let Some(fd) = fd {
         let mut buf = [0u8; 8192];
         loop {
-            let n = read_stream::read_stream_sync_raw(fd, &mut buf)?;
+            let n = read::read_sync_raw(fd, &mut buf)?;
             if n == 0 {
                 break;
             }

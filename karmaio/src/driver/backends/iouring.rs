@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{
     io::Result,
     task::{Context, Poll},
@@ -209,6 +209,11 @@ impl DriverBackend for IoUringBackend {
 
         completion_queue.sync();
 
+        // Re-arm the eventfd read after the completion queue borrow is released,
+        // since `arm_wakeup_read` needs a mutable borrow of `self`.
+        // TODD: Come back to see if there is a better approach for this
+        let mut rearm_wakeup = false;
+
         for completion in completion_queue {
             if completion.user_data() == u64::MAX {
                 // Result of the cancellation action.
@@ -221,7 +226,7 @@ impl DriverBackend for IoUringBackend {
             if completion.user_data() == WAKE_USERDATA {
                 // Wakeup from the eventfd. Re-arm another read so future wakes work.
                 // The written counter bytes in wakeup_buf can be ignored.
-                self.arm_wakeup_read();
+                rearm_wakeup = true;
                 continue;
             }
 
@@ -237,6 +242,10 @@ impl DriverBackend for IoUringBackend {
             if self.ops[index].complete(Completion { result, flags }) {
                 self.ops.remove(index);
             }
+        }
+
+        if rearm_wakeup {
+            self.arm_wakeup_read();
         }
     }
 

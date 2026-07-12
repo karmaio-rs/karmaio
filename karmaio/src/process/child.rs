@@ -17,6 +17,11 @@ use crate::{
     runtime::local::{spawn_blocking, spawn_local},
 };
 
+#[cfg(target_os = "linux")]
+use crate::driver::ops::Op;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd, OwnedFd};
+
 /// A handle to a spawned child process.
 ///
 /// The handle can be awaited (via [`Child::wait`]) to completion, polled
@@ -97,6 +102,15 @@ impl Child {
             return Ok(status);
         }
         let mut child = self.child.take().expect("wait already in progress");
+
+        // On Linux, prefer an async pidfd wait; fall back to
+        // the blocking pool if a pidfd cannot be obtained.
+        #[cfg(target_os = "linux")]
+        if let Ok(pidfd) = pidfd_for_child(child.id()) {
+            let status = Op::wait_process(child, pidfd)?.await?;
+            self.status = Some(status);
+            return Ok(status);
+        }
 
         let status = spawn_blocking(move || child.wait())
             .await
@@ -220,4 +234,21 @@ async fn read_to_end<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>
         data.extend_from_slice(&buf[..n]);
     }
     Ok(data)
+}
+
+/// Opens a pidfd for a live child via the `pidfd_open(2)` syscall.
+///
+/// Used on Linux to drive an async wait through the completion driver. Returns
+/// an error on kernels older than 5.3 (or if the pid is no longer waitable), in
+/// which case the caller falls back to the blocking pool.
+#[cfg(target_os = "linux")]
+fn pidfd_for_child(pid: u32) -> io::Result<OwnedFd> {
+    // SAFETY: `pidfd_open` is a Linux syscall; `pid` is a live child we own and
+    // have not yet reaped, so the pidfd it returns is valid.
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fd` is a freshly opened pidfd owned by this process.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
 }

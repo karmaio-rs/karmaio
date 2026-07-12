@@ -27,6 +27,8 @@ pub(crate) mod symlink;
 pub(crate) mod sync;
 pub(crate) mod truncate;
 pub(crate) mod unlink;
+#[cfg(target_os = "linux")]
+pub(crate) mod wait_process;
 pub(crate) mod write;
 pub(crate) mod write_at;
 pub(crate) mod writev;

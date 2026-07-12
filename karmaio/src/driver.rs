@@ -1,5 +1,6 @@
 use crate::driver::backends::{DriverBackend, PlatformBackend};
 use crate::driver::ops::{Op, Operable, Submittable};
+use crate::runtime::blocking::BlockingPoolHandle;
 use std::ops::Deref;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -31,16 +32,21 @@ pub(crate) struct Driver {
     pub(super) backend: Rc<RefCell<PlatformBackend>>,
     /// Wakeup token for cross thread notifications. Cloned into scheduler handles.
     wakeup: Wakeup,
+    /// Handle to the runtime's blocking thread pool for offloading sync work.
+    blocking: BlockingPoolHandle,
 }
 
-// A weak handle to the driver
+// A weak handle to the driver, plus cloneable tokens that outlive individual
+// upgrades (wakeup + blocking pool).
 #[derive(Clone)]
 pub(crate) struct Handle {
     backend: Weak<RefCell<PlatformBackend>>,
+    wakeup: Wakeup,
+    blocking: BlockingPoolHandle,
 }
 
 impl Driver {
-    pub(crate) fn new() -> io::Result<Self> {
+    pub(crate) fn new(blocking: BlockingPoolHandle) -> io::Result<Self> {
         let backend = Rc::new(RefCell::new(PlatformBackend::new()?));
         // Create the wakeup token while we have access to the (non-Send) backend.
         // The token itself is Send+Sync+Clone and captures only thread-safe poke data.
@@ -48,7 +54,11 @@ impl Driver {
             let b = backend.borrow();
             b.create_wakeup()
         };
-        Ok(Self { backend, wakeup })
+        Ok(Self {
+            backend,
+            wakeup,
+            blocking,
+        })
     }
 
     pub(crate) fn submit_op<T: Submittable>(&self, data: T) -> io::Result<Op<T>> {
@@ -84,6 +94,11 @@ impl Driver {
         self.wakeup.clone()
     }
 
+    /// Returns a handle to the blocking thread pool associated with this driver.
+    pub(crate) fn blocking_pool(&self) -> &BlockingPoolHandle {
+        &self.blocking
+    }
+
     /// Associates a file or socket handle with the IOCP completion port.
     ///
     /// This must be called before issuing any overlapped I/O on the handle.
@@ -100,24 +115,29 @@ impl AsRawFd for Driver {
     }
 }
 
-impl From<PlatformBackend> for Driver {
-    fn from(driver: PlatformBackend) -> Self {
+impl From<(PlatformBackend, BlockingPoolHandle)> for Driver {
+    fn from((driver, blocking): (PlatformBackend, BlockingPoolHandle)) -> Self {
         let backend = Rc::new(RefCell::new(driver));
         // No real wakeup available in this path; use a no-op. This path is
         // primarily for tests or special construction and cross-thread wake
         // may not be required.
         let wakeup = Wakeup::new(|| {});
-        Self { backend, wakeup }
+        Self {
+            backend,
+            wakeup,
+            blocking,
+        }
     }
 }
 
 impl Handle {
     pub(crate) fn upgrade(&self) -> Option<Driver> {
         let backend = self.backend.upgrade()?;
-        // Use a no-op wakeup for upgraded handles. Scheduling from remote via
-        // upgraded handles is not the primary path.
-        let wakeup = Wakeup::new(|| {});
-        Some(Driver { backend, wakeup })
+        Some(Driver {
+            backend,
+            wakeup: self.wakeup.clone(),
+            blocking: self.blocking.clone(),
+        })
     }
 }
 
@@ -128,6 +148,8 @@ where
     fn from(driver: T) -> Self {
         Self {
             backend: Rc::downgrade(&driver.backend),
+            wakeup: driver.wakeup.clone(),
+            blocking: driver.blocking.clone(),
         }
     }
 }

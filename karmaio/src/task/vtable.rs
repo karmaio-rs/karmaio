@@ -312,17 +312,21 @@ fn can_read_output(header: &Header, trailer: &Trailer, waker: &Waker) -> bool {
             }
 
             // Unset the `JOIN_WAKER` to gain mutable access to the `waker`
-            // field then update the field with the new join worker.
+            // field then update the field with the new join waker.
             //
             // This requires two atomic operations, unsetting the bit and
             // then resetting it. If the task transitions to complete
             // concurrently to either one of those operations, then setting
             // the join waker fails and we proceed to reading the task
             // output.
-            header
-                .state
-                .unset_waker()
-                .and_then(|snapshot| set_join_waker(header, trailer, waker.clone(), snapshot))
+            //
+            // `AtomicUsize::fetch_update` returns the *previous* value on
+            // success, so rebuild a post-unset snapshot for `set_join_waker`.
+            header.state.unset_waker().and_then(|prev| {
+                debug_assert!(prev.is_join_waker_set());
+                let snapshot = header.state.get_snapshot();
+                set_join_waker(header, trailer, waker.clone(), snapshot)
+            })
         } else {
             set_join_waker(header, trailer, waker.clone(), state)
         };

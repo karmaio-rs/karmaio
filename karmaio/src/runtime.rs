@@ -1,6 +1,10 @@
 use crate::task::Task;
 
+pub mod blocking;
 pub mod local;
+
+pub use blocking::{BlockingPool, BlockingPoolHandle, DEFAULT_KEEP_ALIVE, DEFAULT_THREAD_POOL_LIMIT};
+pub use local::{Runtime, spawn_blocking};
 
 pub(crate) trait Schedule: Sized + 'static {
     /// Schedule the task

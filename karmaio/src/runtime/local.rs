@@ -10,6 +10,7 @@ use std::rc::Rc;
 
 use crate::{
     driver::{Driver, Handle},
+    runtime::blocking::{BlockingPool, run_blocking},
     runtime::local::scheduler::Scheduler,
     task::{join::JoinHandle, new_task},
     time::Timer,
@@ -27,17 +28,28 @@ pub struct Runtime {
     pub(crate) driver: Driver,
     pub(crate) scheduler: Scheduler,
     pub(crate) timer: Rc<RefCell<Timer>>,
+    /// Owns the blocking pool. Dropped before `driver` (fields drop in reverse
+    /// declaration order) so workers finishing during shutdown can still wake
+    /// a live driver.
+    _blocking: BlockingPool,
 }
 
 impl Runtime {
+    /// Create a runtime with default settings.
     pub fn new() -> io::Result<Self> {
-        let driver = Driver::new()?;
+        // TODO: RuntimeBuilder — expose pool limits, keep-alive, shared pool reuse,driver capacity, and other runtime knobs.
+        // Hardcoded defaults for now (256 threads, 60s idle keep-alive).
+        let blocking = BlockingPool::with_defaults();
+        let driver = Driver::new(blocking.handle())?;
         let mut scheduler = Scheduler::default();
         scheduler.set_wakeup(driver.wakeup());
+
         Ok(Self {
             driver,
             scheduler,
             timer: Rc::new(RefCell::new(Timer::new())),
+            // Declared last so it drops first (Rust drops fields in reverse order).
+            _blocking: blocking,
         })
     }
 
@@ -87,7 +99,8 @@ impl Runtime {
 
                         // Wait for I/O events and dispatch completions.
                         // The wait is woken promptly by the remote queue's wakeup token
-                        // when a task is scheduled from another thread.
+                        // when a task is scheduled from another thread (or a blocking
+                        // pool worker completes).
                         let timeout = self.timer.borrow().min_timeout();
                         let _completed = match timeout {
                             Some(duration) => self
@@ -111,8 +124,69 @@ impl Runtime {
 
         self.scheduler.tasks.push_back(task);
 
-        return join_handle;
+        join_handle
     }
+
+    /// Runs the provided closure on a thread dedicated to blocking operations.
+    ///
+    /// Returns a [`JoinHandle`] for the result. The work is not cancelled if the
+    /// handle is dropped; the pool continues the job to completion.
+    ///
+    /// # Panics
+    ///
+    /// If the blocking closure panics, the join handle resolves with a panic error.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use karmaio::runtime::Runtime;
+    ///
+    /// let mut rt = Runtime::new().unwrap();
+    /// let handle = rt.spawn_blocking(|| {
+    ///     // blocking work
+    ///     42
+    /// });
+    /// let value = rt.block_on(async { handle.await.unwrap() });
+    /// assert_eq!(value, 42);
+    /// ```
+    pub fn spawn_blocking<F, R>(&self, f: F) -> JoinHandle<R>
+    where
+        F: FnOnce() -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let future = run_blocking(self.driver.blocking_pool(), self.driver.wakeup(), f);
+        self.spawn(future)
+    }
+}
+
+/// Runs the provided closure on a thread dedicated to blocking operations.
+///
+/// Must be called from within a running runtime (inside [`Runtime::block_on`] or a
+/// spawned task). Prefer [`Runtime::spawn_blocking`] when you have a runtime handle.
+///
+/// # Panics
+///
+/// Panics if called outside a runtime context.
+pub fn spawn_blocking<F, R>(f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    assert!(
+        CURRENT_DRIVER.is_set() && CURRENT_SCHEDULER.is_set(),
+        "spawn_blocking called outside of a runtime context"
+    );
+
+    CURRENT_DRIVER.with(|handle| {
+        let driver = handle.upgrade().expect("spawn_blocking: driver has been dropped");
+        let future = run_blocking(driver.blocking_pool(), driver.wakeup(), f);
+
+        CURRENT_SCHEDULER.with(|scheduler| {
+            let (task, join_handle) = new_task(future, scheduler.handle());
+            scheduler.tasks.push_back(task);
+            join_handle
+        })
+    })
 }
 
 #[cfg(test)]
@@ -129,7 +203,7 @@ mod tests {
         thread,
     };
 
-    use super::Runtime;
+    use super::{Runtime, spawn_blocking};
     use crate::task::join::JoinHandle;
 
     #[test]
@@ -312,9 +386,7 @@ mod tests {
         assert_eq!(result, Ok(7));
 
         // A pending future with a past deadline should return Err(Elapsed).
-        let result = runtime.block_on(async move {
-            timeout_at(past, std::future::pending::<usize>()).await
-        });
+        let result = runtime.block_on(async move { timeout_at(past, std::future::pending::<usize>()).await });
         assert!(result.is_err());
     }
 
@@ -340,5 +412,90 @@ mod tests {
 
         let output = runtime.block_on(async { task.await });
         assert_eq!(output.expect("task should succeed"), 42);
+    }
+
+    #[test]
+    fn spawn_blocking_returns_value() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let handle = runtime.spawn_blocking(|| 42usize);
+        let output = runtime.block_on(async { handle.await });
+        assert_eq!(output.expect("blocking task should succeed"), 42);
+    }
+
+    #[test]
+    fn spawn_blocking_free_function_works_inside_runtime() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let output = runtime.block_on(async { spawn_blocking(|| 7usize).await.expect("blocking task should succeed") });
+        assert_eq!(output, 7);
+    }
+
+    #[test]
+    fn spawn_blocking_reports_panics() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let handle = runtime.spawn_blocking(|| panic!("blocking boom"));
+        let err = runtime
+            .block_on(async { handle.await })
+            .expect_err("blocking panic should surface");
+        assert!(err.is_panic());
+    }
+
+    #[test]
+    fn spawn_blocking_does_not_starve_runtime() {
+        use crate::time::{Duration, Instant, sleep};
+
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let start = Instant::now();
+
+        runtime.block_on(async move {
+            let blocking = spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                1usize
+            });
+            // Timer should fire while the blocking job holds a pool thread.
+            sleep(Duration::from_millis(20)).await;
+            assert!(start.elapsed() < Duration::from_millis(60));
+            assert_eq!(blocking.await.expect("blocking ok"), 1);
+        });
+    }
+
+    #[test]
+    fn spawn_blocking_wakes_idle_runtime() {
+        use crate::time::{Duration, Instant};
+
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let start = Instant::now();
+
+        // Runtime has no timers and no ready tasks after spawning the blocking
+        // job; it must sleep in driver.wait() and be woken by the worker.
+        runtime.block_on(async {
+            let handle = spawn_blocking(|| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                99usize
+            });
+            assert_eq!(handle.await.expect("blocking ok"), 99);
+        });
+
+        assert!(start.elapsed() >= Duration::from_millis(25));
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn spawn_blocking_many_concurrent_jobs() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+
+        runtime.block_on(async {
+            let mut handles = Vec::new();
+            for i in 0..8usize {
+                handles.push(spawn_blocking(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    i
+                }));
+            }
+            let mut sum = 0usize;
+            for h in handles {
+                sum += h.await.expect("job ok");
+            }
+            assert_eq!(sum, (0..8).sum());
+        });
     }
 }

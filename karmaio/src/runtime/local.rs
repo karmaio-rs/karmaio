@@ -190,6 +190,36 @@ where
     })
 }
 
+/// Spawns a `!Send` future onto the current local runtime, returning a
+/// [`JoinHandle`] for its output.
+///
+/// Unlike [`spawn_blocking`], the future runs on the same thread as the caller
+/// (there is no `Send` bound), so it may hold `Rc`-backed or otherwise
+/// non-`Send` state. This is used, for example, to drain a child's piped
+/// stdout/stderr concurrently: the stream handles are not `Send`, so they are
+/// read through the completion driver on the local runtime rather than on the
+/// blocking pool.
+///
+/// # Panics
+///
+/// Panics if called outside a runtime context.
+pub fn spawn_local<F, R>(future: F) -> JoinHandle<R>
+where
+    F: Future<Output = R> + 'static,
+    R: 'static,
+{
+    assert!(
+        CURRENT_DRIVER.is_set() && CURRENT_SCHEDULER.is_set(),
+        "spawn_local called outside of a runtime context"
+    );
+
+    CURRENT_SCHEDULER.with(|scheduler| {
+        let (task, join_handle) = new_task(future, scheduler.handle());
+        scheduler.tasks.push_back(task);
+        join_handle
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

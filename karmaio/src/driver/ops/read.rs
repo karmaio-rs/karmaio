@@ -99,37 +99,3 @@ impl<B: BoundedIoBufMut> Completable for Read<B> {
         }
     }
 }
-
-/// Reads from a raw [`OsRawHandle`] synchronously. Used to drain a child's piped
-/// output on the blocking pool, where the `Rc`-backed [`SharedIoHandle`] cannot
-/// cross thread boundaries.
-pub(crate) fn read_sync_raw(fd: usize, buf: &mut [u8]) -> io::Result<usize> {
-    let len = buf.len();
-    #[cfg(unix)]
-    {
-        macos_syscall!(libc::read(
-            fd as libc::c_int,
-            buf.as_mut_ptr() as *mut libc::c_void,
-            len
-        ))
-        .map(|n| n as usize)
-    }
-    #[cfg(windows)]
-    {
-        let mut n = 0u32;
-        let ok = unsafe {
-            windows_sys::Win32::Storage::FileSystem::ReadFile(
-                fd as windows_sys::Win32::Foundation::HANDLE,
-                buf.as_mut_ptr(),
-                len as _,
-                &mut n,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok != 0 {
-            Ok(n as usize)
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-}

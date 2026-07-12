@@ -13,9 +13,9 @@ use std::{
 };
 
 use crate::{
-    driver::ops::read,
+    io::AsyncRead,
     process::stdio::{ChildStderr, ChildStdin, ChildStdout},
-    runtime::local::spawn_blocking,
+    runtime::local::spawn_local,
 };
 
 #[cfg(not(target_os = "macos"))]
@@ -173,26 +173,43 @@ impl Child {
     /// The child's `stdin` (if any) is closed first so the child
     /// observes EOF, then both `stdout` and `stderr` are drained concurrently
     /// (avoiding the classic pipe-full deadlock) before reaping.
+    /// Simultaneously waits for the child to exit and collects all of its output.
+    /// The child's `stdin` (if any) is closed first so the child observes EOF,
+    /// then both `stdout` and `stderr` are drained concurrently
+    /// (avoiding the classic pipe-full deadlock) before reaping.
+    ///
+    /// The streams are drained through the completion driver on the local runtime
+    /// (via [`crate::runtime::local::spawn_local`]) rather than on the
+    /// blocking pool: the stream handles are `Rc`-backed and therefore not `Send`.
     pub async fn wait_with_output(mut self) -> io::Result<Output> {
         // Drop stdin so the child sees EOF and flushes any buffered output.
         self.stdin.take();
 
-        // Extract raw fds to drain concurrently on the blocking pool.
-        // Each fd is closed by the draining task once it hits EOF.
-        let stdout_fd = self.stdout.take().and_then(ChildStdout::into_raw_fd);
-        let stderr_fd = self.stderr.take().and_then(ChildStderr::into_raw_fd);
+        // Take the pipe handles and drain them concurrently on the local runtime.
+        // They are `Rc`-backed (non-`Send`), so they travel via
+        // `spawn_local` tasks rather than the blocking pool.
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
 
-        let out_handle = spawn_blocking(move || drain_raw_fd(stdout_fd));
-        let err_handle = spawn_blocking(move || drain_raw_fd(stderr_fd));
+        let out_handle = spawn_local(async move {
+            match stdout {
+                Some(mut s) => read_to_end(&mut s).await,
+                None => Ok(Vec::new()),
+            }
+        });
+        let err_handle = spawn_local(async move {
+            match stderr {
+                Some(mut s) => read_to_end(&mut s).await,
+                None => Ok(Vec::new()),
+            }
+        });
 
-        let stdout_data = match out_handle.await {
-            Ok(res) => res?,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "failed to read child stdout")),
-        };
-        let stderr_data = match err_handle.await {
-            Ok(res) => res?,
-            Err(_) => return Err(io::Error::new(io::ErrorKind::Other, "failed to read child stderr")),
-        };
+        let stdout_data = out_handle
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to read child stdout"))??;
+        let stderr_data = err_handle
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to read child stderr"))??;
 
         let status = self.wait().await?;
         Ok(Output {
@@ -213,28 +230,22 @@ impl Drop for Child {
     }
 }
 
-/// Drains a raw fd/handle (passed as `usize` so it is `Send`) to end-of-file on
-/// the blocking pool, returning the accumulated bytes. A missing fd (stream not
-/// piped) yields empty output. The fd/handle is closed once the stream ends.
-fn drain_raw_fd(fd: Option<usize>) -> io::Result<Vec<u8>> {
+/// Drains an async reader to end-of-file, accumulating the bytes.
+///
+/// A missing stream (not piped) yields empty output. Used by
+/// [`Child::wait_with_output`] to drain the child's stdout/stderr concurrently
+/// on the local runtime.
+async fn read_to_end<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut data = Vec::new();
-    if let Some(fd) = fd {
-        let mut buf = [0u8; 8192];
-        loop {
-            let n = read::read_sync_raw(fd, &mut buf)?;
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&buf[..n]);
+    loop {
+        // A fresh buffer each iteration: the read op advances the buffer's init
+        // cursor, so reusing it would skip already-read bytes.
+        let (res, buf) = reader.read([0u8; 8192]).await;
+        let n = res?;
+        if n == 0 {
+            break;
         }
-        #[cfg(unix)]
-        unsafe {
-            libc::close(fd as libc::c_int);
-        }
-        #[cfg(windows)]
-        unsafe {
-            windows_sys::Win32::Foundation::CloseHandle(fd as windows_sys::Win32::Foundation::HANDLE);
-        }
+        data.extend_from_slice(&buf[..n]);
     }
     Ok(data)
 }

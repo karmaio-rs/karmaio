@@ -3,9 +3,8 @@
 //! The child's pipes (when configured with [`std::process::Stdio::piped`]) are
 //! exposed as [`ChildStdin`], [`ChildStdout`] and [`ChildStderr`], which
 //! implement [`AsyncRead`]/[`AsyncWrite`] and are driven by the completion
-//! driver. Waiting is asynchronous: on macOS the runtime uses kqueue
-//! `EVFILT_PROC`/`NOTE_EXIT` so the executor is never blocked; on other
-//! platforms the blocking `wait` is offloaded to the runtime's blocking pool.
+//! driver. Waiting is asynchronous: the blocking `wait` is offloaded to the
+//! runtime's blocking pool so the executor is never blocked on the child.
 
 use std::{
     io,
@@ -15,17 +14,8 @@ use std::{
 use crate::{
     io::AsyncRead,
     process::stdio::{ChildStderr, ChildStdin, ChildStdout},
-    runtime::local::spawn_local,
+    runtime::local::{spawn_blocking, spawn_local},
 };
-
-#[cfg(not(target_os = "macos"))]
-use crate::driver::Wakeup;
-#[cfg(target_os = "macos")]
-use crate::driver::ops::Op;
-#[cfg(not(target_os = "macos"))]
-use crate::runtime::blocking::{BlockingPoolHandle, run_blocking};
-#[cfg(not(target_os = "macos"))]
-use crate::runtime::local::CURRENT_DRIVER;
 
 /// A handle to a spawned child process.
 ///
@@ -97,9 +87,8 @@ impl Child {
 
     /// Waits for the child to exit completely, returning its exit status.
     ///
-    /// Reaping is performed asynchronously: on macOS the runtime is notified by
-    /// the kernel via kqueue when the process exits; elsewhere the blocking
-    /// `wait` runs on the runtime's blocking pool.
+    /// Reaping is performed asynchronously: the blocking `wait` runs on the
+    /// runtime's blocking pool, so the executor is never blocked on the child.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
         if let Some(status) = self.status.clone() {
             return Ok(status);
@@ -107,26 +96,13 @@ impl Child {
         if let Some(status) = self.try_wait()? {
             return Ok(status);
         }
-        let child = self.child.take().expect("wait already in progress");
+        let mut child = self.child.take().expect("wait already in progress");
 
-        #[cfg(target_os = "macos")]
-        {
-            let status = Op::wait_process(child).unwrap().await?;
-            self.status = Some(status);
-            Ok(status)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let mut child = child;
-            let driver = CURRENT_DRIVER
-                .with(|handle| handle.upgrade())
-                .expect("not in a runtime");
-            let pool: BlockingPoolHandle = driver.blocking_pool().clone();
-            let wakeup: Wakeup = driver.wakeup();
-            let status = run_blocking(&pool, wakeup, move || child.wait()).await?;
-            self.status = Some(status);
-            Ok(status)
-        }
+        let status = spawn_blocking(move || child.wait())
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to wait for child"))??;
+        self.status = Some(status);
+        Ok(status)
     }
 
     /// Forces the child to exit.
@@ -172,10 +148,6 @@ impl Child {
     /// Simultaneously waits for the child to exit and collects all of its output.
     /// The child's `stdin` (if any) is closed first so the child
     /// observes EOF, then both `stdout` and `stderr` are drained concurrently
-    /// (avoiding the classic pipe-full deadlock) before reaping.
-    /// Simultaneously waits for the child to exit and collects all of its output.
-    /// The child's `stdin` (if any) is closed first so the child observes EOF,
-    /// then both `stdout` and `stderr` are drained concurrently
     /// (avoiding the classic pipe-full deadlock) before reaping.
     ///
     /// The streams are drained through the completion driver on the local runtime

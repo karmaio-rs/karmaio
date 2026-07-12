@@ -5,6 +5,7 @@ pub mod buf;
 pub mod fs;
 pub mod io;
 pub mod net;
+pub mod process;
 pub mod runtime;
 pub mod time;
 

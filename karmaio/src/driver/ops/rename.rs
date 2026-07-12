@@ -43,9 +43,9 @@ impl Submittable for Rename {
 #[cfg(target_os = "macos")]
 impl Submittable for Rename {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(libc::rename(self.from.as_c_str().as_ptr(), self.to.as_c_str().as_ptr(),))
-        })
+        let from = self.from.clone();
+        let to = self.to.clone();
+        macos_syscall_blocking!({ macos_syscall!(libc::rename(from.as_c_str().as_ptr(), to.as_c_str().as_ptr())) })
     }
 }
 
@@ -54,11 +54,13 @@ impl Submittable for Rename {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
-        windows_syscall_submit!({
+        let from = self.from.clone();
+        let to = self.to.clone();
+        windows_syscall_blocking!({
             windows_syscall!(BOOL, {
                 MoveFileExW(
-                    self.from.as_ptr(),
-                    self.to.as_ptr(),
+                    from.as_ptr(),
+                    to.as_ptr(),
                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
                 )
             })

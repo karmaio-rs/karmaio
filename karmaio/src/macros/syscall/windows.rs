@@ -49,7 +49,27 @@ macro_rules! windows_syscall {
     }};
 }
 
+/// Package a synchronous Windows call as [`Submission::Blocking`] for the thread pool.
+///
+/// Prefer this for path-based FS APIs (`CreateDirectoryW`, `DeleteFileW`, …).
+macro_rules! windows_syscall_blocking {
+    ($block:block) => {{
+        $crate::driver::Submission::Blocking($crate::driver::ops::BlockingJob::new(move || match { $block } {
+            Ok(val) => $crate::driver::ops::Completion {
+                result: Ok(val),
+                flags: 0,
+            },
+            Err(err) => $crate::driver::ops::Completion {
+                result: Err(err),
+                flags: 0,
+            },
+        }))
+    }};
+}
+
 /// Map a synchronous syscall `Result` to `Submission::Ready`.
+///
+/// Runs on the runtime thread. Prefer [`windows_syscall_blocking`] for true-blocking FS.
 macro_rules! windows_syscall_submit {
     ($block:block) => {{
         match { $block } {

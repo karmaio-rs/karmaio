@@ -50,7 +50,9 @@ impl Submittable for CreateDir {
 #[cfg(target_os = "macos")]
 impl Submittable for CreateDir {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({ macos_syscall!(libc::mkdir(self.path.as_c_str().as_ptr(), self.mode)) })
+        let path = self.path.clone();
+        let mode = self.mode;
+        macos_syscall_blocking!({ macos_syscall!(libc::mkdir(path.as_c_str().as_ptr(), mode)) })
     }
 }
 
@@ -59,7 +61,8 @@ impl Submittable for CreateDir {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
-        windows_syscall_submit!({ windows_syscall!(BOOL, CreateDirectoryW(self.path.as_ptr(), std::ptr::null_mut())) })
+        let path = self.path.clone();
+        windows_syscall_blocking!({ windows_syscall!(BOOL, CreateDirectoryW(path.as_ptr(), std::ptr::null_mut())) })
     }
 }
 

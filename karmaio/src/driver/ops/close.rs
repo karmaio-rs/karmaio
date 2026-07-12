@@ -37,11 +37,11 @@ impl Submittable for Close {
 #[cfg(target_os = "macos")]
 impl Submittable for Close {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(match self.io_handle {
-                OsRawHandle::Fd(fd) => libc::close(fd),
-            })
-        })
+        // Own the raw fd for the pool job (Close owns the handle exclusively).
+        let fd = match self.io_handle {
+            OsRawHandle::Fd(fd) => fd,
+        };
+        macos_syscall_blocking!({ macos_syscall!(libc::close(fd)) })
     }
 }
 
@@ -50,10 +50,12 @@ impl Submittable for Close {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::{Foundation::CloseHandle, Networking::WinSock::closesocket};
 
-        windows_syscall_submit!({
-            match self.io_handle {
-                OsRawHandle::Handle(handle) => windows_syscall!(BOOL, CloseHandle(handle as _)),
-                OsRawHandle::Socket(socket) => windows_syscall!(SOCKET, closesocket(socket as _)),
+        // Copy discriminant values for the Send job.
+        let handle = self.io_handle;
+        windows_syscall_blocking!({
+            match handle {
+                OsRawHandle::Handle(h) => windows_syscall!(BOOL, CloseHandle(h as _)),
+                OsRawHandle::Socket(s) => windows_syscall!(SOCKET, closesocket(s as _)),
             }
         })
     }

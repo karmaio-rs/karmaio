@@ -43,12 +43,9 @@ impl Submittable for Hardlink {
 #[cfg(target_os = "macos")]
 impl Submittable for Hardlink {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(libc::link(
-                self.original.as_c_str().as_ptr(),
-                self.link.as_c_str().as_ptr(),
-            ))
-        })
+        let original = self.original.clone();
+        let link = self.link.clone();
+        macos_syscall_blocking!({ macos_syscall!(libc::link(original.as_c_str().as_ptr(), link.as_c_str().as_ptr(),)) })
     }
 }
 
@@ -57,10 +54,12 @@ impl Submittable for Hardlink {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
 
-        windows_syscall_submit!({
+        let original = self.original.clone();
+        let link = self.link.clone();
+        windows_syscall_blocking!({
             windows_syscall!(
                 BOOL,
-                CreateHardLinkW(self.link.as_ptr(), self.original.as_ptr(), std::ptr::null_mut())
+                CreateHardLinkW(link.as_ptr(), original.as_ptr(), std::ptr::null_mut())
             )
         })
     }

@@ -41,7 +41,9 @@ impl Submittable for Truncate {
 #[cfg(target_os = "macos")]
 impl Submittable for Truncate {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({ macos_syscall!(libc::ftruncate(self.handle.raw_fd(), self.size as libc::off_t)) })
+        let fd = self.handle.raw_fd();
+        let size = self.size as libc::off_t;
+        macos_syscall_blocking!({ macos_syscall!(libc::ftruncate(fd, size)) })
     }
 }
 
@@ -52,10 +54,11 @@ impl Submittable for Truncate {
 
         match self.handle.raw_os_handle() {
             OsRawHandle::Handle(handle) => {
+                let handle = handle as isize;
                 let distance_to_move: i64 = self.size as i64;
-                let mut new_file_pointer: i64 = 0;
 
-                windows_syscall_submit!({
+                windows_syscall_blocking!({
+                    let mut new_file_pointer: i64 = 0;
                     match windows_syscall!(BOOL, {
                         SetFilePointerEx(
                             handle as _,
@@ -64,7 +67,7 @@ impl Submittable for Truncate {
                             windows_sys::Win32::Storage::FileSystem::FILE_BEGIN,
                         )
                     }) {
-                        Ok(val) => windows_syscall!(BOOL, SetEndOfFile(handle as _)),
+                        Ok(_) => windows_syscall!(BOOL, SetEndOfFile(handle as _)),
                         Err(err) => Err(err),
                     }
                 })

@@ -1,6 +1,8 @@
 use std::{
+    collections::VecDeque,
     io::{Error, Result},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -8,10 +10,11 @@ use std::{
 use slab::Slab;
 
 use crate::driver::{
-    Handle,
+    Handle, Wakeup,
     backends::DriverBackend,
-    ops::{Completion, Op, Operable, State, Submittable},
+    ops::{BlockingJob, Completion, Op, Operable, State, Submittable},
 };
+use crate::runtime::blocking::BlockingPoolHandle;
 
 // Newtype around `libc::kevent` for type safety and zero-cost conversion.
 //
@@ -50,9 +53,12 @@ impl Interest {
 // You make the syscall in a non blocking mode, and it will return to you two possiblities -
 // 1. The syscall completed and returned you the `Completion` result.
 // 2. The syscall will block, in which case you registed a notification and wait
+// 3. The work must run on the blocking pool (`Blocking`).
 pub(crate) enum Submission {
     Ready(Completion),
     Register(Interest),
+    /// Offload a Send closure to the runtime blocking pool.
+    Blocking(BlockingJob),
 }
 
 struct Slot {
@@ -64,6 +70,8 @@ pub(crate) struct KqueueBackend {
     kqueue: OwnedFd,
     ops: Slab<Slot>,
     events: Vec<libc::kevent>,
+    /// Completions produced by blocking-pool workers (index, result).
+    blocking_done: Arc<Mutex<VecDeque<(usize, Completion)>>>,
 }
 
 /// Special ident/udata used for cross-thread wakeups via EVFILT_USER.
@@ -83,6 +91,7 @@ impl KqueueBackend {
             // TODO: Make this configurable later
             ops: Slab::with_capacity(1024),
             events: vec![unsafe { std::mem::zeroed() }; 1024],
+            blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         };
 
         // Register a user event (EVFILT_USER) that can be triggered from any
@@ -107,6 +116,18 @@ impl KqueueBackend {
         let kevent = [interest.0];
 
         let _ = unsafe { libc::kevent(kqueue, kevent.as_ptr(), 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    }
+
+    fn push_blocking(&self, index: usize, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) {
+        let done = Arc::clone(&self.blocking_done);
+        let wakeup = wakeup.clone();
+        pool.dispatch(move || {
+            let completion = job.run();
+            done.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((index, completion));
+            wakeup.wake();
+        });
     }
 }
 
@@ -135,6 +156,7 @@ impl DriverBackend for KqueueBackend {
                 // Cancel any registered interest (EV_DELETE is synchronous and safe)
                 // The future was dropped while the kernel may still complete the operation.
                 // Ask the kernel to cancel it, but keep the slot and data alive until the completion packet arrives.
+                // Blocking-pool jobs cannot be cancelled; the slot stays until the worker finishes.
                 if let Some(interest) = slot.interest.take() {
                     Self::delete_interest(self.kqueue.as_raw_fd(), interest);
                 }
@@ -149,7 +171,13 @@ impl DriverBackend for KqueueBackend {
         }
     }
 
-    fn poll_op<T: Operable>(&mut self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result> {
+    fn poll_op<T: Operable>(
+        &mut self,
+        op: &mut Op<T>,
+        cx: &mut Context<'_>,
+        blocking: &BlockingPoolHandle,
+        wakeup: &Wakeup,
+    ) -> Poll<T::Result> {
         let index = op.index();
 
         let Some(slot) = self.ops.get_mut(index) else {
@@ -162,8 +190,15 @@ impl DriverBackend for KqueueBackend {
         let current_state = std::mem::replace(&mut slot.state, State::Submitted);
 
         match current_state {
+            State::Completed(completion) => {
+                let data = op.take_data().expect("Op data consumed");
+                let result = data.complete(completion);
+                self.ops.remove(index);
+                Poll::Ready(result)
+            }
             State::Ready | State::Submitted => {
                 // Kernel says ready (or first poll) → run the non-blocking syscall
+                // or dispatch blocking work to the pool.
                 let data = op.data_mut().expect("Op data consumed");
 
                 match data.submit() {
@@ -208,6 +243,12 @@ impl DriverBackend for KqueueBackend {
                         slot.state = State::Waiting(cx.waker().clone());
                         Poll::Pending
                     }
+
+                    Submission::Blocking(job) => {
+                        slot.state = State::Waiting(cx.waker().clone());
+                        self.push_blocking(index, job, blocking, wakeup);
+                        Poll::Pending
+                    }
                 }
             }
             State::Waiting(mut waker) => {
@@ -221,7 +262,7 @@ impl DriverBackend for KqueueBackend {
                 Poll::Pending
             }
             // The op has been ignored/cancelled by the caller. It should not be polled again
-            State::Ignored(..) | State::Completed(..) => {
+            State::Ignored(..) => {
                 unreachable!("invalid operation")
             }
         }
@@ -291,19 +332,35 @@ impl DriverBackend for KqueueBackend {
         Ok(n)
     }
 
+    fn drain_blocking_completions(&mut self) {
+        // Called by the runtime after wait* (see Runtime::block_on).
+        let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some((index, completion)) = pending.pop_front() {
+            if let Some(slot) = self.ops.get_mut(index) {
+                let should_drop = slot.state.complete(completion);
+                if should_drop {
+                    self.ops.remove(index);
+                }
+            }
+        }
+    }
+
     fn dispatch_completions(&mut self) {
         for event in &self.events {
-            let index = event.udata as usize;
-
-            // This is our cross-thread wakeup event (EVFILT_USER), not an I/O op.
-            if index == WAKEUP_UDATA as usize {
+            // Cross-thread wakeup (EVFILT_USER) — not an I/O op.
+            if event.filter == libc::EVFILT_USER {
                 continue;
             }
 
+            let index = event.udata as usize;
+
             if let Some(slot) = self.ops.get_mut(index) {
-                // EV_ONESHOT fired. It is no longer registered in the kernel,
-                // so the slot should not remember it as a cancellable interest.
-                slot.interest = None;
+                // Only Register-path ops install interest. Blocking-pool ops leave
+                // interest as None; a wake packet must never call `ready()` on them
+                // (especially after they are already `Completed`).
+                let Some(_interest) = slot.interest.take() else {
+                    continue;
+                };
 
                 let should_drop = slot.state.ready();
                 if should_drop {

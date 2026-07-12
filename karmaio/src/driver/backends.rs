@@ -12,9 +12,10 @@ pub(crate) mod iouring;
 pub(crate) mod kqueue;
 
 use crate::driver::{
-    Handle,
+    Handle, Wakeup,
     ops::{Op, Operable, Submittable},
 };
+use crate::runtime::blocking::BlockingPoolHandle;
 
 #[cfg(target_os = "windows")]
 pub(crate) use self::iocp::IocpBackend as PlatformBackend;
@@ -37,7 +38,16 @@ pub(crate) trait DriverBackend {
     fn remove_op<T: 'static>(&mut self, op: &mut Op<T>);
 
     // Checks if an operation is still pending/valid.
-    fn poll_op<T: Operable>(&mut self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result>;
+    //
+    // `blocking` / `wakeup` are used when an op returns `Submission::Blocking`
+    // (macOS / Windows path and fd metadata syscalls). Linux io_uring ignores them.
+    fn poll_op<T: Operable>(
+        &mut self,
+        op: &mut Op<T>,
+        cx: &mut Context<'_>,
+        blocking: &BlockingPoolHandle,
+        wakeup: &Wakeup,
+    ) -> Poll<T::Result>;
 
     // Pushes any pending operations in the submission queue to the kernel.
     fn submit(&mut self) -> Result<()>;
@@ -48,7 +58,14 @@ pub(crate) trait DriverBackend {
     // Wait for specified timeout and process returned events.
     fn wait_with_duration(&mut self, duration: Duration) -> Result<usize>;
 
-    // Checks the completion queue for finished operations and dispatches them.
+    /// Apply completions produced by the blocking thread pool.
+    ///
+    /// The runtime owns the pool and calls this after `wait*` as its own phase,
+    /// before platform I/O completion dispatch. Default: no-op (e.g. io_uring).
+    fn drain_blocking_completions(&mut self) {}
+
+    // Apply platform I/O completions (CQEs / kevents / IOCP packets).
+    // Does not drain the blocking pool — see [`drain_blocking_completions`].
     fn dispatch_completions(&mut self);
 
     /// Create a `Wakeup` token that can be used from other threads to wake

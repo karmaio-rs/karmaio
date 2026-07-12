@@ -111,14 +111,10 @@ impl Submittable for Open {
         };
 
         let flags = libc::O_CLOEXEC | access_mode | creation_mode | (self.options.custom_flags & !libc::O_ACCMODE);
+        let path = self.path.clone();
+        let mode = self.options.mode as u32;
 
-        macos_syscall_submit!({
-            macos_syscall!(libc::open(
-                self.path.as_c_str().as_ptr(),
-                flags,
-                self.options.mode as u32,
-            ))
-        })
+        macos_syscall_blocking!({ macos_syscall!(libc::open(path.as_c_str().as_ptr(), flags, mode)) })
     }
 }
 

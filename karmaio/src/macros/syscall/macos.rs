@@ -37,11 +37,47 @@ macro_rules! __macos_syscall_register {
     };
 }
 
+/// Package a synchronous syscall as [`Submission::Blocking`] for the thread pool.
+///
+/// Captures outer locals with `move`. Prefer this for path-based FS ops and other
+/// syscalls that cannot use kqueue readiness (open, mkdir, rename, fstat, …).
+///
+/// ```ignore
+/// let path = self.path.clone();
+/// macos_syscall_blocking!({
+///     macos_syscall!(libc::mkdir(path.as_c_str().as_ptr(), mode))
+/// })
+/// ```
+macro_rules! macos_syscall_blocking {
+    ($block:block) => {{
+        $crate::driver::Submission::Blocking($crate::driver::ops::BlockingJob::new(move || {
+            loop {
+                match { $block } {
+                    Ok(val) => {
+                        return $crate::driver::ops::Completion {
+                            result: Ok(val),
+                            flags: 0,
+                        };
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(err) => {
+                        return $crate::driver::ops::Completion {
+                            result: Err(err),
+                            flags: 0,
+                        };
+                    }
+                }
+            }
+        }))
+    }};
+}
+
 /// Retry a syscall on `EINTR` and return a `Submission`.
 ///
 /// # Forms
 ///
-/// Synchronous syscall (no kqueue registration):
+/// Synchronous syscall (no kqueue registration) — **runs on the runtime thread**.
+/// Prefer [`macos_syscall_blocking`] for FS and other true-blocking calls:
 /// ```ignore
 /// macos_syscall_submit!({ macos_syscall!(...) })
 /// ```

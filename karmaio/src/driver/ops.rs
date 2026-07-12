@@ -59,6 +59,25 @@ pub(crate) struct Completion {
     pub(crate) flags: u32,
 }
 
+/// Send-able unit of work for the blocking thread pool.
+///
+/// Built inside `Submittable::submit` when an op returns [`Submission::Blocking`].
+/// Captures only `Send` state (paths, raw fds, flags) so the runtime thread can
+/// keep non-`Send` op data (e.g. `SharedIoHandle`) while the syscall runs off-thread.
+pub(crate) struct BlockingJob {
+    work: Box<dyn FnOnce() -> Completion + Send + 'static>,
+}
+
+impl BlockingJob {
+    pub(crate) fn new(work: impl FnOnce() -> Completion + Send + 'static) -> Self {
+        Self { work: Box::new(work) }
+    }
+
+    pub(crate) fn run(self) -> Completion {
+        (self.work)()
+    }
+}
+
 pub(crate) trait Submittable {
     // Build a backend-specific submission entry.
     fn submit(&mut self) -> Submission;
@@ -175,7 +194,9 @@ impl State {
             }
             State::Ignored(..) => true,
             State::Ready => false,
-            State::Completed(..) => unreachable!("invalid operation state"),
+            // A blocking-pool completion may land before a spurious/stale
+            // readiness notification is processed; treat as no-op.
+            State::Completed(..) => false,
         }
     }
 }

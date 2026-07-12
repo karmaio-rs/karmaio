@@ -40,7 +40,9 @@ impl Operable for SetPermissions {}
 #[cfg(target_os = "macos")]
 impl Submittable for SetPermissions {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({ macos_syscall!(libc::fchmod(self.handle.raw_fd(), self.perm.mode() as libc::mode_t)) })
+        let fd = self.handle.raw_fd();
+        let mode = self.perm.mode() as libc::mode_t;
+        macos_syscall_blocking!({ macos_syscall!(libc::fchmod(fd, mode)) })
     }
 }
 
@@ -92,15 +94,17 @@ impl Submittable for SetPermissions {
             OsRawHandle::Handle(handle) => {
                 // Setting only `file_attributes` (with the time fields zeroed) asks
                 // Windows to update the attributes and leave the timestamps alone.
-                let info = FileBasicInformation {
-                    creation_time: 0,
-                    last_access_time: 0,
-                    last_write_time: 0,
-                    change_time: 0,
-                    file_attributes: self.perm.attrs(),
-                };
+                let handle = handle as isize;
+                let attrs = self.perm.attrs();
 
-                windows_syscall_submit!({
+                windows_syscall_blocking!({
+                    let info = FileBasicInformation {
+                        creation_time: 0,
+                        last_access_time: 0,
+                        last_write_time: 0,
+                        change_time: 0,
+                        file_attributes: attrs,
+                    };
                     windows_syscall!(BOOL, {
                         SetFileInformationByHandle(
                             handle as _,

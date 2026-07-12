@@ -74,11 +74,10 @@ impl Submittable for Symlink {
 #[cfg(target_os = "macos")]
 impl Submittable for Symlink {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(libc::symlink(
-                self.original.as_c_str().as_ptr(),
-                self.link.as_c_str().as_ptr(),
-            ))
+        let original = self.original.clone();
+        let link = self.link.clone();
+        macos_syscall_blocking!({
+            macos_syscall!(libc::symlink(original.as_c_str().as_ptr(), link.as_c_str().as_ptr(),))
         })
     }
 }
@@ -94,11 +93,10 @@ impl Submittable for Symlink {
             0
         };
 
-        windows_syscall_submit!({
-            windows_syscall!(
-                BOOLEAN,
-                CreateSymbolicLinkW(self.link.as_ptr(), self.original.as_ptr(), flags)
-            )
+        let original = self.original.clone();
+        let link = self.link.clone();
+        windows_syscall_blocking!({
+            windows_syscall!(BOOLEAN, CreateSymbolicLinkW(link.as_ptr(), original.as_ptr(), flags))
         })
     }
 }

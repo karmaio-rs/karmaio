@@ -57,7 +57,9 @@ impl Submittable for Sync {
 #[cfg(target_os = "macos")]
 impl Submittable for Sync {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({ macos_syscall!(libc::fsync(self.handle.raw_fd())) })
+        // Capture a raw fd (Send); SharedIoHandle stays on the op for the lifetime of the future.
+        let fd = self.handle.raw_fd();
+        macos_syscall_blocking!({ macos_syscall!(libc::fsync(fd)) })
     }
 }
 
@@ -68,7 +70,8 @@ impl Submittable for Sync {
 
         match self.handle.raw_os_handle() {
             OsRawHandle::Handle(handle) => {
-                windows_syscall_submit!({ windows_syscall!(BOOL, FlushFileBuffers(handle as _)) })
+                let handle = handle as isize;
+                windows_syscall_blocking!({ windows_syscall!(BOOL, FlushFileBuffers(handle as _)) })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {
                 result: Err(io::Error::new(io::ErrorKind::Unsupported, "cannot sync a socket")),

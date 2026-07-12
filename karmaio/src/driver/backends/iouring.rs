@@ -122,7 +122,15 @@ impl DriverBackend for IoUringBackend {
         }
     }
 
-    fn poll_op<T: Operable>(&mut self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result> {
+    fn poll_op<T: Operable>(
+        &mut self,
+        op: &mut Op<T>,
+        cx: &mut Context<'_>,
+        // IoUring is pure async, so we don't need this.
+        // This is only here to match the overall driver interface signature
+        _blocking: &crate::runtime::blocking::BlockingPoolHandle,
+        _wakeup: &crate::driver::Wakeup,
+    ) -> Poll<T::Result> {
         // Get the op state from the driver
         let state = self.ops.get_mut(op.index()).expect("invalid internal state");
 

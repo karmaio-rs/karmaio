@@ -70,7 +70,7 @@ impl Driver {
     }
 
     pub(crate) fn poll_op<T: Operable>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result> {
-        self.backend.borrow_mut().poll_op(op, cx)
+        self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup)
     }
 
     pub(crate) fn submit(&self) -> io::Result<()> {
@@ -85,6 +85,15 @@ impl Driver {
         self.backend.borrow_mut().wait_with_duration(duration)
     }
 
+    /// Apply completions from the blocking thread pool.
+    ///
+    /// Called by the runtime after `wait*` so pool results are merged into op
+    /// state (and waiters woken) before the next scheduler tick.
+    pub(crate) fn drain_blocking_completions(&self) {
+        self.backend.borrow_mut().drain_blocking_completions();
+    }
+
+    /// Apply platform I/O completions (kevent / IOCP / io_uring CQEs).
     pub(crate) fn dispatch_completions(&self) {
         self.backend.borrow_mut().dispatch_completions();
     }

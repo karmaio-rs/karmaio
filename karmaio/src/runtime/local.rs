@@ -97,10 +97,8 @@ impl Runtime {
                             }
                         }
 
-                        // Wait for I/O events and dispatch completions.
-                        // The wait is woken promptly by the remote queue's wakeup token
-                        // when a task is scheduled from another thread (or a blocking
-                        // pool worker completes).
+                        // Wait for I/O (or a cross-thread wake from the remote
+                        // scheduler / blocking pool), then apply completions.
                         let timeout = self.timer.borrow().min_timeout();
                         let _completed = match timeout {
                             Some(duration) => self
@@ -109,10 +107,13 @@ impl Runtime {
                                 .expect("Failed to wait for I/O events"),
                             None => self.driver.wait().expect("Failed to wait for I/O events"),
                         };
+                        // Runtime owns the blocking pool: drain its completions
+                        // as an explicit phase, then platform I/O completions.
+                        self.driver.drain_blocking_completions();
                         self.driver.dispatch_completions();
                         self.timer.borrow_mut().wake();
-                        // Note: we do *not* drain here. The next iteration of the inner
-                        // loop will drain at the very beginning of the tick.
+                        // Note: we do *not* drain the remote task queue here. The
+                        // next iteration of the inner loop drains at tick start.
                     }
                 })
             })
@@ -496,6 +497,25 @@ mod tests {
                 sum += h.await.expect("job ok");
             }
             assert_eq!(sum, (0..8).sum());
+        });
+    }
+
+    /// Path FS ops use `Submission::Blocking` on macOS/Windows (pool offload).
+    #[test]
+    fn blocking_submission_create_and_remove_dir() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        use crate::fs::{create_dir, remove_dir};
+
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).expect("time").as_nanos();
+        let path = std::env::temp_dir().join(format!("karmaio-blocking-dir-{nanos}"));
+
+        runtime.block_on(async move {
+            create_dir(&path).await.expect("create_dir");
+            assert!(path.is_dir());
+            remove_dir(&path).await.expect("remove_dir");
+            assert!(!path.exists());
         });
     }
 }

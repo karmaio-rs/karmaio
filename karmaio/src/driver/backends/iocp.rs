@@ -1,7 +1,8 @@
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     io::{Error, Result},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
+    sync::{Arc, Mutex},
     task::{Context, Poll},
     time::Duration,
 };
@@ -16,10 +17,11 @@ use windows_sys::Win32::{
 };
 
 use crate::driver::{
-    Handle,
+    Handle, Wakeup,
     backends::DriverBackend,
-    ops::{Completion, Op, Operable, State, Submittable},
+    ops::{BlockingJob, Completion, Op, Operable, State, Submittable},
 };
+use crate::runtime::blocking::BlockingPoolHandle;
 
 // Stable allocation passed to Windows for one overlapped operation.
 //
@@ -87,6 +89,8 @@ impl Interest {
 pub(crate) enum Submission {
     Ready(Completion),
     Pending(Interest),
+    /// Offload a Send closure to the runtime blocking pool.
+    Blocking(BlockingJob),
 }
 
 // A tracked operation slot in the driver slab.
@@ -98,6 +102,8 @@ struct Slot {
     state: State,
     interest: Option<Interest>,
     data: Option<PendingData>,
+    /// Set when `submit()` returned `Blocking`; dispatched on first poll.
+    blocking_job: Option<BlockingJob>,
 }
 
 // Type-erased owner for op data after the future is dropped.
@@ -213,6 +219,8 @@ pub(crate) struct IocpBackend {
     // Tracks handles already associated with the IOCP port to avoid redundant
     // CreateIoCompletionPort calls.
     attached_handles: HashSet<HANDLE>,
+    /// Completions produced by blocking-pool workers (index, result).
+    blocking_done: Arc<Mutex<VecDeque<(usize, Completion)>>>,
 }
 
 impl IocpBackend {
@@ -223,6 +231,7 @@ impl IocpBackend {
             ops: Slab::with_capacity(1024),
             entries: vec![unsafe { std::mem::zeroed() }; 1024],
             attached_handles: HashSet::new(),
+            blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
@@ -234,6 +243,18 @@ impl IocpBackend {
     pub(crate) fn add_handle(&self, handle: RawHandle, completion_key: usize) -> Result<()> {
         self.port.add_handle(handle, completion_key)
     }
+
+    fn push_blocking(&self, index: usize, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) {
+        let done = Arc::clone(&self.blocking_done);
+        let wakeup = wakeup.clone();
+        pool.dispatch(move || {
+            let completion = job.run();
+            done.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_back((index, completion));
+            wakeup.wake();
+        });
+    }
 }
 
 impl DriverBackend for IocpBackend {
@@ -242,6 +263,7 @@ impl DriverBackend for IocpBackend {
             state: State::Submitted,
             interest: None,
             data: None,
+            blocking_job: None,
         });
 
         match data.submit() {
@@ -261,6 +283,10 @@ impl DriverBackend for IocpBackend {
                 // slab index into the stable allocation before storing it.
                 interest.set_index(index);
                 self.ops[index].interest = Some(interest);
+            }
+            Submission::Blocking(job) => {
+                // Dispatch on first poll when waker + pool/wakeup are available.
+                self.ops[index].blocking_job = Some(job);
             }
         }
 
@@ -306,8 +332,24 @@ impl DriverBackend for IocpBackend {
         }
     }
 
-    fn poll_op<T: Operable>(&mut self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result> {
-        let state = &mut self.ops.get_mut(op.index()).expect("invalid internal state").state;
+    fn poll_op<T: Operable>(
+        &mut self,
+        op: &mut Op<T>,
+        cx: &mut Context<'_>,
+        blocking: &BlockingPoolHandle,
+        wakeup: &Wakeup,
+    ) -> Poll<T::Result> {
+        let index = op.index();
+        let slot = self.ops.get_mut(index).expect("invalid internal state");
+
+        // First poll of a Blocking submission: hand off to the pool.
+        if let Some(job) = slot.blocking_job.take() {
+            slot.state = State::Waiting(cx.waker().clone());
+            self.push_blocking(index, job, blocking, wakeup);
+            return Poll::Pending;
+        }
+
+        let state = &mut self.ops.get_mut(index).expect("invalid internal state").state;
 
         match state {
             State::Submitted => {
@@ -354,6 +396,19 @@ impl DriverBackend for IocpBackend {
     fn wait_with_duration(&mut self, duration: Duration) -> Result<usize> {
         let num_entries = self.port.get_many(&mut self.entries, Some(duration))?;
         Ok(num_entries)
+    }
+
+    fn drain_blocking_completions(&mut self) {
+        // Called by the runtime after wait* (see Runtime::block_on).
+        let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some((index, completion)) = pending.pop_front() {
+            if let Some(slot) = self.ops.get_mut(index) {
+                let should_drop = slot.state.complete(completion);
+                if should_drop {
+                    self.ops.remove(index);
+                }
+            }
+        }
     }
 
     fn dispatch_completions(&mut self) {
@@ -437,6 +492,7 @@ impl Drop for IocpBackend {
                 continue;
             }
 
+            self.drain_blocking_completions();
             self.dispatch_completions();
         }
 

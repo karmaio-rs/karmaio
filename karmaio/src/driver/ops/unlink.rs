@@ -49,11 +49,13 @@ impl Submittable for Unlink {
 #[cfg(target_os = "macos")]
 impl Submittable for Unlink {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
-            macos_syscall!(if self.remove_dir {
-                libc::rmdir(self.path.as_c_str().as_ptr())
+        let path = self.path.clone();
+        let remove_dir = self.remove_dir;
+        macos_syscall_blocking!({
+            macos_syscall!(if remove_dir {
+                libc::rmdir(path.as_c_str().as_ptr())
             } else {
-                libc::unlink(self.path.as_c_str().as_ptr())
+                libc::unlink(path.as_c_str().as_ptr())
             })
         })
     }
@@ -64,11 +66,13 @@ impl Submittable for Unlink {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::{DeleteFileW, RemoveDirectoryW};
 
-        windows_syscall_submit!({
-            if self.remove_dir {
-                windows_syscall!(BOOL, RemoveDirectoryW(self.path.as_ptr()))
+        let path = self.path.clone();
+        let remove_dir = self.remove_dir;
+        windows_syscall_blocking!({
+            if remove_dir {
+                windows_syscall!(BOOL, RemoveDirectoryW(path.as_ptr()))
             } else {
-                windows_syscall!(BOOL, DeleteFileW(self.path.as_ptr()))
+                windows_syscall!(BOOL, DeleteFileW(path.as_ptr()))
             }
         })
     }

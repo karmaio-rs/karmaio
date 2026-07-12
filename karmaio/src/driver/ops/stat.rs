@@ -18,7 +18,8 @@ pub(crate) struct Stat {
     #[cfg(target_os = "linux")]
     statx_buf: Box<libc::statx>,
     #[cfg(target_os = "macos")]
-    stat_buf: Option<libc::stat>,
+    /// Filled by the blocking-pool job via shared storage.
+    stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<libc::stat>>>>,
     #[cfg(windows)]
     result: Option<Metadata>,
 }
@@ -34,7 +35,7 @@ impl Op<Stat> {
         #[cfg(target_os = "macos")]
         let data = Stat {
             handle: handle.clone(),
-            stat_buf: None,
+            stat_shared: None,
         };
 
         #[cfg(windows)]
@@ -70,14 +71,19 @@ impl Submittable for Stat {
 #[cfg(target_os = "macos")]
 impl Submittable for Stat {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!({
+        use std::sync::{Arc, Mutex};
+
+        // fstat fills a buffer we need after the pool job; share it with the worker.
+        let slot = Arc::new(Mutex::new(None::<libc::stat>));
+        self.stat_shared = Some(Arc::clone(&slot));
+        let fd = self.handle.raw_fd();
+
+        macos_syscall_blocking!({
             let mut stat = unsafe { std::mem::zeroed() };
-            let result = macos_syscall!(libc::fstat(self.handle.raw_fd(), &mut stat));
-
+            let result = macos_syscall!(libc::fstat(fd, &mut stat));
             if result.is_ok() {
-                self.stat_buf = Some(stat);
+                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(stat);
             }
-
             result
         })
     }
@@ -129,7 +135,14 @@ impl Completable for Stat {
 
     fn complete(self, completion: Completion) -> Self::Result {
         completion.result?;
-        let stat = self.stat_buf.expect("fstat result missing after successful submit");
+        let slot = self
+            .stat_shared
+            .expect("fstat shared slot missing after successful submit");
+        let stat = slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .expect("fstat result missing after successful submit");
         Ok(Metadata::from_stat(stat))
     }
 }

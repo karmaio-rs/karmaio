@@ -4,8 +4,8 @@ use std::{cell::RefCell, future::poll_fn, io, mem, rc::Rc, task::Waker};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{
-    AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, IntoRawHandle, IntoRawSocket,
-    OwnedHandle, OwnedSocket, RawHandle, RawSocket,
+    AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, IntoRawHandle, IntoRawSocket, OwnedHandle, OwnedSocket,
+    RawHandle, RawSocket,
 };
 
 use crate::driver::ops::Op;
@@ -313,13 +313,9 @@ impl OwnedOsHandle {
             #[cfg(unix)]
             OsRawHandle::Fd(fd) => OwnedOsHandle::Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
             #[cfg(windows)]
-            OsRawHandle::Handle(h) => {
-                OwnedOsHandle::Handle(unsafe { OwnedHandle::from_raw_handle(h) })
-            }
+            OsRawHandle::Handle(h) => OwnedOsHandle::Handle(unsafe { OwnedHandle::from_raw_handle(h) }),
             #[cfg(windows)]
-            OsRawHandle::Socket(s) => {
-                OwnedOsHandle::Socket(unsafe { OwnedSocket::from_raw_socket(s) })
-            }
+            OsRawHandle::Socket(s) => OwnedOsHandle::Socket(unsafe { OwnedSocket::from_raw_socket(s) }),
         }
     }
 }
@@ -475,9 +471,7 @@ mod tests {
         let handle = dev_null_handle();
         let inflight = handle.clone();
 
-        let take_jh = runtime.spawn(async move {
-            handle.take().await.expect("take should succeed after clone drops")
-        });
+        let take_jh = runtime.spawn(async move { handle.take().await.expect("take should succeed after clone drops") });
 
         let drop_jh = runtime.spawn(async move {
             let mut yielded = false;

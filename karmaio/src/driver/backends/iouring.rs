@@ -72,13 +72,9 @@ impl IoUringBackend {
 
         let buf_ptr = self.wakeup_buf as *mut u8;
 
-        let read_e = opcode::Read::new(
-            io_uring::types::Fd(self.eventfd.as_raw_fd()),
-            buf_ptr,
-            8,
-        )
-        .build()
-        .user_data(WAKE_USERDATA);
+        let read_e = opcode::Read::new(io_uring::types::Fd(self.eventfd.as_raw_fd()), buf_ptr, 8)
+            .build()
+            .user_data(WAKE_USERDATA);
 
         // Best effort push; if full we submit first.
         while unsafe { self.uring.submission().push(&read_e).is_err() } {
@@ -340,7 +336,9 @@ impl Drop for IoUringBackend {
 
         // Free the wakeup buffer (one persistent allocation for the lifetime of the backend).
         if !self.wakeup_buf.is_null() {
-            unsafe { drop(Box::from_raw(self.wakeup_buf)); }
+            unsafe {
+                drop(Box::from_raw(self.wakeup_buf));
+            }
         }
     }
 }

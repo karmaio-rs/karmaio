@@ -9,7 +9,10 @@ use std::{
 use slab::Slab;
 use windows_sys::Win32::{
     Foundation::{ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, WAIT_TIMEOUT},
-    System::IO::{CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY, PostQueuedCompletionStatus},
+    System::IO::{
+        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
+        PostQueuedCompletionStatus,
+    },
 };
 
 use crate::driver::{
@@ -395,10 +398,8 @@ impl DriverBackend for IocpBackend {
 
     fn create_wakeup(&self) -> crate::driver::Wakeup {
         let port_handle = self.port.as_raw_handle() as HANDLE;
-        crate::driver::Wakeup::new(move || {
-            unsafe {
-                PostQueuedCompletionStatus(port_handle, 0, 0, std::ptr::null_mut());
-            }
+        crate::driver::Wakeup::new(move || unsafe {
+            PostQueuedCompletionStatus(port_handle, 0, 0, std::ptr::null_mut());
         })
     }
 }

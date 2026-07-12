@@ -96,16 +96,7 @@ impl KqueueBackend {
             data: 0,
             udata: WAKEUP_UDATA,
         };
-        let _ = unsafe {
-            libc::kevent(
-                raw_kqueue,
-                &ev,
-                1,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null(),
-            )
-        };
+        let _ = unsafe { libc::kevent(raw_kqueue, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
 
         Ok(backend)
     }
@@ -336,9 +327,7 @@ impl DriverBackend for KqueueBackend {
             ev.ident = WAKEUP_IDENT;
             ev.filter = libc::EVFILT_USER;
             ev.fflags = libc::NOTE_TRIGGER;
-            let _ = unsafe {
-                libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null())
-            };
+            let _ = unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         })
     }
 }

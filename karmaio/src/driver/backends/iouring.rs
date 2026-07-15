@@ -35,7 +35,7 @@ pub(crate) struct IoUringBackend {
 }
 
 impl IoUringBackend {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
         let eventfd = unsafe {
             let fd = libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
             if fd < 0 {
@@ -47,9 +47,9 @@ impl IoUringBackend {
         let wakeup_buf = Box::into_raw(Box::new([0u8; 8]));
 
         let mut backend = Self {
-            // TODO: Make this configurable later
-            ops: Slab::with_capacity(1024),
-            uring: IoUring::builder().build(1024)?,
+            // `capacity` is configurable via the runtime builder's driver capacity.
+            ops: Slab::with_capacity(capacity),
+            uring: IoUring::builder().build(capacity as u32)?,
             eventfd,
             wakeup_buf,
         };

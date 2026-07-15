@@ -80,7 +80,7 @@ const WAKEUP_IDENT: libc::uintptr_t = libc::uintptr_t::MAX;
 const WAKEUP_UDATA: *mut libc::c_void = libc::uintptr_t::MAX as *mut libc::c_void;
 
 impl KqueueBackend {
-    pub(crate) fn new() -> Result<Self> {
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
         let raw_kqueue = unsafe { libc::kqueue() };
         if raw_kqueue < 0 {
             return Err(Error::last_os_error());
@@ -88,9 +88,9 @@ impl KqueueBackend {
 
         let backend = Self {
             kqueue: unsafe { OwnedFd::from_raw_fd(raw_kqueue) },
-            // TODO: Make this configurable later
-            ops: Slab::with_capacity(1024),
-            events: vec![unsafe { std::mem::zeroed() }; 1024],
+            // `capacity` is configurable via the runtime builder's driver capacity.
+            ops: Slab::with_capacity(capacity),
+            events: vec![unsafe { std::mem::zeroed() }; capacity],
             blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         };
 

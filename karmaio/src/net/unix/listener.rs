@@ -17,8 +17,7 @@ impl UnixListener {
     /// The file path cannnot yet exist, and will be cleaned up upon dropping `UnixListener`
     pub fn bind<P: AsRef<Path>>(path: P) -> std::io::Result<UnixListener> {
         let socket = Socket::bind_unix(path, libc::SOCK_STREAM)?;
-        //TODO: Make this configurable later?
-        socket.listen(1024)?;
+        socket.listen(128)?;
         Ok(UnixListener { inner: socket })
     }
 

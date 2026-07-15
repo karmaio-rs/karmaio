@@ -9,6 +9,7 @@ use std::{
 use std::rc::Rc;
 
 use crate::{
+    builder::{RuntimeBuilder, RuntimeConfig},
     driver::{Driver, Handle},
     runtime::blocking::{BlockingPool, run_blocking},
     runtime::local::scheduler::Scheduler,
@@ -28,6 +29,8 @@ pub struct Runtime {
     pub(crate) driver: Driver,
     pub(crate) scheduler: Scheduler,
     pub(crate) timer: Rc<RefCell<Timer>>,
+    /// Runtime tunables owned by this runtime (built from the `RuntimeBuilder`).
+    pub(crate) config: RuntimeConfig,
     /// Owns the blocking pool. Dropped before `driver` (fields drop in reverse
     /// declaration order) so workers finishing during shutdown can still wake
     /// a live driver.
@@ -36,11 +39,21 @@ pub struct Runtime {
 
 impl Runtime {
     /// Create a runtime with default settings.
+    ///
+    /// Equivalent to `RuntimeBuilder::new().build()`.
     pub fn new() -> io::Result<Self> {
-        // TODO: RuntimeBuilder — expose pool limits, keep-alive, shared pool reuse,driver capacity, and other runtime knobs.
-        // Hardcoded defaults for now (256 threads, 60s idle keep-alive).
-        let blocking = BlockingPool::with_defaults();
-        let driver = Driver::new(blocking.handle())?;
+        RuntimeBuilder::new().build()
+    }
+
+    /// Returns a [`RuntimeBuilder`] pre-populated with default settings.
+    pub fn builder() -> RuntimeBuilder {
+        RuntimeBuilder::new()
+    }
+
+    /// Build a runtime from an explicit [`RuntimeConfig`].
+    pub(crate) fn from_config(config: RuntimeConfig) -> io::Result<Self> {
+        let blocking = BlockingPool::new(config.blocking_threads, config.blocking_keep_alive);
+        let driver = Driver::new(blocking.handle(), config.driver_capacity)?;
         let mut scheduler = Scheduler::default();
         scheduler.set_wakeup(driver.wakeup());
 
@@ -48,6 +61,7 @@ impl Runtime {
             driver,
             scheduler,
             timer: Rc::new(RefCell::new(Timer::new())),
+            config,
             // Declared last so it drops first (Rust drops fields in reverse order).
             _blocking: blocking,
         })

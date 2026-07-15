@@ -28,8 +28,7 @@ impl TcpListener {
     /// Binding with a port number of 0 will request that the OS to assign a port to this listener.
     pub fn bind(addr: SocketAddr) -> std::io::Result<Self> {
         let socket = Socket::bind(addr, socket2::Type::STREAM)?;
-        // TODO: Make this configurable?
-        socket.listen(1024)?;
+        socket.listen(128)?;
         Ok(TcpListener { inner: socket })
     }
 

@@ -6,8 +6,8 @@
 //!
 //! # Design
 //!
-//! - Dynamic worker growth up to a configurable cap (default 256).
-//! - Workers exit after an idle keep-alive period (default 60s).
+//! - Dynamic worker growth up to a configurable cap.
+//! - Workers exit after an idle keep-alive period.
 //! - Zero extra dependencies: `Mutex` + `Condvar` + `VecDeque`.
 //! - Completions wake the runtime through the driver's [`Wakeup`] token.
 //!
@@ -30,12 +30,6 @@ use std::{
 };
 
 use crate::driver::Wakeup;
-
-/// Default maximum number of worker threads (Compio default).
-pub const DEFAULT_THREAD_POOL_LIMIT: usize = 256;
-
-/// Default idle keep-alive before a worker exits (Compio default).
-pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(60);
 
 type Job = Box<dyn FnOnce() + Send + 'static>;
 
@@ -79,8 +73,6 @@ struct Shared {
 
 impl BlockingPool {
     /// Create a pool with the given thread cap and idle keep-alive.
-    // TODO: RuntimeBuilder should plumb thread_cap / keep_alive from user config
-    // instead of only calling `with_defaults` from `Runtime::new`.
     pub fn new(thread_cap: usize, keep_alive: Duration) -> Self {
         Self {
             inner: Arc::new(PoolInner {
@@ -98,11 +90,6 @@ impl BlockingPool {
                 keep_alive,
             }),
         }
-    }
-
-    /// Create a pool with Compio-aligned defaults.
-    pub fn with_defaults() -> Self {
-        Self::new(DEFAULT_THREAD_POOL_LIMIT, DEFAULT_KEEP_ALIVE)
     }
 
     /// Cloneable handle for dispatching work without owning the pool.
@@ -126,12 +113,6 @@ impl BlockingPool {
     #[cfg(test)]
     pub(crate) fn num_threads(&self) -> usize {
         self.inner.shared.lock().unwrap_or_else(|e| e.into_inner()).num_threads
-    }
-}
-
-impl Default for BlockingPool {
-    fn default() -> Self {
-        Self::with_defaults()
     }
 }
 

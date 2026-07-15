@@ -46,8 +46,8 @@ pub(crate) struct Handle {
 }
 
 impl Driver {
-    pub(crate) fn new(blocking: BlockingPoolHandle) -> io::Result<Self> {
-        let backend = Rc::new(RefCell::new(PlatformBackend::new()?));
+    pub(crate) fn new(blocking: BlockingPoolHandle, capacity: usize) -> io::Result<Self> {
+        let backend = Rc::new(RefCell::new(PlatformBackend::new(capacity)?));
         // Create the wakeup token while we have access to the (non-Send) backend.
         // The token itself is Send+Sync+Clone and captures only thread-safe poke data.
         let wakeup = {

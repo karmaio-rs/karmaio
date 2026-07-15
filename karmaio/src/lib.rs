@@ -2,6 +2,7 @@
 pub mod macros;
 
 pub mod buf;
+pub mod builder;
 pub mod fs;
 pub mod io;
 pub mod net;

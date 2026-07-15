@@ -224,12 +224,11 @@ pub(crate) struct IocpBackend {
 }
 
 impl IocpBackend {
-    pub(crate) fn new() -> Result<Self> {
-        // TODO: Make this default configurable
+    pub(crate) fn new(capacity: usize) -> Result<Self> {
         Ok(Self {
             port: CompletionPort::new()?,
-            ops: Slab::with_capacity(1024),
-            entries: vec![unsafe { std::mem::zeroed() }; 1024],
+            ops: Slab::with_capacity(capacity),
+            entries: vec![unsafe { std::mem::zeroed() }; capacity],
             attached_handles: HashSet::new(),
             blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         })

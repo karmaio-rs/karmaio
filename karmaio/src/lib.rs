@@ -7,6 +7,7 @@ pub mod io;
 pub mod net;
 pub mod process;
 pub mod runtime;
+pub mod signal;
 pub mod time;
 
 pub(crate) mod driver;

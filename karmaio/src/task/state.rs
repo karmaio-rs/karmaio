@@ -67,6 +67,9 @@ pub(super) enum TransitionToRunning {
 pub(super) enum TransitionToIdle {
     Ok,
     OkNotified,
+    // Matched in the task vtable; not produced by `transition_to_idle` today
+    // (dealloc currently happens via other transition paths).
+    #[allow(dead_code)]
     OkDealloc,
     Cancelled,
 }

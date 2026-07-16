@@ -1,6 +1,4 @@
 //! Windows/IOCP syscall helpers for `Submittable` implementations.
-//!
-//! Inspired by the syscall macros in compio-driver.
 
 /// Execute a synchronous Windows API call and return `io::Result<u32>`.
 ///
@@ -64,24 +62,6 @@ macro_rules! windows_syscall_blocking {
                 flags: 0,
             },
         }))
-    }};
-}
-
-/// Map a synchronous syscall `Result` to `Submission::Ready`.
-///
-/// Runs on the runtime thread. Prefer [`windows_syscall_blocking`] for true-blocking FS.
-macro_rules! windows_syscall_submit {
-    ($block:block) => {{
-        match { $block } {
-            Ok(val) => $crate::driver::Submission::Ready($crate::driver::ops::Completion {
-                result: Ok(val),
-                flags: 0,
-            }),
-            Err(err) => $crate::driver::Submission::Ready($crate::driver::ops::Completion {
-                result: Err(err),
-                flags: 0,
-            }),
-        }
     }};
 }
 

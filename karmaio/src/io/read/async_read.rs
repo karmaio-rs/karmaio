@@ -8,6 +8,8 @@ use crate::buf::{BoundedIoBufMut, BufResult};
 //
 // Types that implement this trait are expected to manage asynchronous read operations,
 // allowing them to interact with other asynchronous tasks without blocking the executor.
+// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+#[allow(async_fn_in_trait)]
 pub trait AsyncRead {
     // Reads bytes into the rented mutable buffer.
     // Ownership of `buf` is transferred to the operation; the same buffer is returned on completion.
@@ -27,6 +29,8 @@ pub trait AsyncRead {
 //
 // Types that implement this trait are expected to manage asynchronous read operations,
 // allowing them to interact with other asynchronous tasks without blocking the executor.
+// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+#[allow(async_fn_in_trait)]
 pub trait AsyncReadAt {
     // Like [`AsyncRead::read`], except that it reads at a specified position.
     async fn read_at<B: BoundedIoBufMut>(&mut self, buf: B, pos: u64) -> BufResult<usize, B>;

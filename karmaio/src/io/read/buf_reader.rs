@@ -18,6 +18,7 @@ use crate::{
 // When the `BufReader` is dropped, the contents of its buffer will be
 // discarded. Creating multiple instances of a `BufReader` on the same
 // stream can cause data loss.
+//
 pub struct BufReader<R> {
     reader: R,
     buf: Box<[u8]>,
@@ -26,15 +27,15 @@ pub struct BufReader<R> {
 }
 
 impl<R: AsyncRead> BufReader<R> {
-    // Creates a new `BufReader` with a default buffer capacity. The default is currently 8 KB,
-    // but may change in the future.
+    /// Creates a new `BufReader` with a default buffer capacity.
+    /// The default is currently 8 KB, but may change in the future.
     #[inline]
     pub fn new(inner: R) -> Self {
         // TODO: Make this configurable later
         Self::with_capacity(8 * 1024, inner)
     }
 
-    // Creates a new `BufReader` with the specified buffer capacity.
+    /// Creates a new `BufReader` with the specified buffer capacity.
     #[inline]
     pub fn with_capacity(capacity: usize, reader: R) -> Self {
         Self {
@@ -45,37 +46,39 @@ impl<R: AsyncRead> BufReader<R> {
         }
     }
 
-    // Gets a reference to the underlying reader.
-    //
-    // It is inadvisable to directly read from the underlying reader.
+    /// Gets a reference to the underlying reader.
+    ///
+    /// It is inadvisable to directly read from the underlying reader.
     #[inline]
     pub const fn get_ref(&self) -> &R {
         &self.reader
     }
 
-    // Gets a mutable reference to the underlying reader.
+    /// Gets a mutable reference to the underlying reader.
+    ///
+    /// It is inadvisable to directly read from the underlying reader.
     #[inline]
     pub fn get_mut(&mut self) -> &mut R {
         &mut self.reader
     }
 
-    // Consumes this `BufReader`, returning the underlying reader.
-    //
-    // Note that any leftover data in the internal buffer is lost.
+    /// Consumes this `BufReader`, returning the underlying reader.
+    ///
+    /// Note that any leftover data in the internal buffer is lost.
     #[inline]
     pub fn into_inner(self) -> R {
         self.reader
     }
 
-    // Returns a reference to the internally buffered data.
-    //
-    // Unlike `fill_buf`, this will not attempt to fill the buffer if it is empty.
+    /// Returns a reference to the internally buffered data.
+    ///
+    /// Unlike [`AsyncBufRead::fill_buf`], this will not attempt to fill the buffer if it is empty.
     #[inline]
     pub fn buffer(&self) -> &[u8] {
         &self.buf[self.pos..self.cap]
     }
 
-    // Invalidates all data in the internal buffer.
+    /// Invalidates all data in the internal buffer.
     #[inline]
     fn discard_buffer(&mut self) {
         self.pos = 0;

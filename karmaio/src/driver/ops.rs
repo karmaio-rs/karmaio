@@ -40,11 +40,15 @@ pub(crate) enum State {
     // The submitter is waiting for the completion of the operation
     Waiting(Waker),
 
-    // Used in poll based systems, signifies that the op is ready and can resume the syscall
+    // Used in poll based systems (kqueue), signifies that the op is ready and can resume the syscall.
+    // Constructed by `State::ready`; unused on io_uring / IOCP paths.
+    #[allow(dead_code)]
     Ready,
 
     // The submitter no longer has interest in the operation result.
-    // The state must be passed to the driver and held until the operation completes.
+    // The boxed payload is held (not read) until the operation completes so
+    // resources the kernel still references stay alive.
+    #[allow(dead_code)]
     Ignored(Box<dyn std::any::Any>),
 
     // The operation has completed with a single cqe result
@@ -59,7 +63,8 @@ pub(crate) struct Op<T: 'static> {
 
 pub(crate) struct Completion {
     pub(crate) result: std::io::Result<u32>,
-    // TODO: flags is reserved for future use (e.g. io_uring CQE flags).
+    // Reserved for future use (e.g. io_uring CQE flags). Populated by backends today.
+    #[allow(dead_code)]
     pub(crate) flags: u32,
 }
 
@@ -68,10 +73,13 @@ pub(crate) struct Completion {
 /// Built inside `Submittable::submit` when an op returns [`Submission::Blocking`].
 /// Captures only `Send` state (paths, raw fds, flags) so the runtime thread can
 /// keep non-`Send` op data (e.g. `SharedIoHandle`) while the syscall runs off-thread.
+/// Used on macOS / Windows; io_uring handles equivalent work in-kernel.
+#[allow(dead_code)]
 pub(crate) struct BlockingJob {
     work: Box<dyn FnOnce() -> Completion + Send + 'static>,
 }
 
+#[allow(dead_code)] // Used on macOS / Windows; unused on pure io_uring Linux builds.
 impl BlockingJob {
     pub(crate) fn new(work: impl FnOnce() -> Completion + Send + 'static) -> Self {
         Self { work: Box::new(work) }
@@ -113,10 +121,13 @@ impl<T: 'static> Op<T> {
         self.data.take()
     }
 
+    // Used by the Windows open path to attach the handle to the IOCP after submit.
+    #[allow(dead_code)]
     pub(crate) fn data_ref(&self) -> Option<&T> {
         self.data.as_ref()
     }
 
+    #[allow(dead_code)] // Reserved for ops that need to mutate data between poll cycles.
     pub(super) fn data_mut(&mut self) -> Option<&mut T> {
         self.data.as_mut()
     }
@@ -180,6 +191,8 @@ impl State {
 
     // Processes a readiness notification for the state and its associated op.
     // Returns whether to keep the op or drop it.
+    // Called from the kqueue backend; unused on io_uring / IOCP.
+    #[allow(dead_code)]
     pub(crate) fn ready(&mut self) -> bool {
         match self {
             State::Submitted => {

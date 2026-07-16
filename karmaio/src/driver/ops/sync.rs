@@ -1,5 +1,3 @@
-use std::io;
-
 #[cfg(windows)]
 use crate::driver::helpers::io_handle::OsRawHandle;
 use crate::{
@@ -74,7 +72,10 @@ impl Submittable for Sync {
                 windows_syscall_blocking!({ windows_syscall!(BOOL, FlushFileBuffers(handle as _)) })
             }
             OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(io::Error::new(io::ErrorKind::Unsupported, "cannot sync a socket")),
+                result: Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "cannot sync a socket",
+                )),
                 flags: 0,
             }),
         }

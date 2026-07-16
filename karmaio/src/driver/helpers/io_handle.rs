@@ -14,8 +14,8 @@ use crate::driver::ops::Op;
 // operations complete before submitting the close.
 //
 // When the last reference is dropped without an explicit `close().await`, the
-// owned OS handle is closed synchronously (compio / tokio-uring style). Prefer
-// explicit `close().await` so close errors are observed and the release is
+// owned OS handle is closed synchronously.
+// Prefer explicit `close().await` so close errors are observed and the release is
 // asynchronous when backed by the driver.
 //
 // The closed state is tracked so close calls after the first are ignored.
@@ -101,7 +101,9 @@ impl SharedIoHandle {
     }
 
     // Returns the RawHandle (Windows file handle only).
+    // Kept as a counterpart to `raw_socket` / `raw_fd`; ops currently use `raw_os_handle`.
     #[cfg(windows)]
+    #[allow(dead_code)]
     pub(crate) fn raw_handle(&self) -> RawHandle {
         match self.as_raw_os_handle() {
             OsRawHandle::Handle(h) => h,
@@ -138,7 +140,8 @@ impl SharedIoHandle {
     }
 
     // Try to unwrap the owned handle if this is the unique strong reference.
-    // Does not close the handle.
+    // Does not close the handle. Currently exercised by unit tests; useful for ownership transfer.
+    #[allow(dead_code)]
     pub(crate) fn try_unwrap(self) -> Result<OwnedOsHandle, Self> {
         // Avoid running `Drop for SharedIoHandle` while we move out of `self`.
         let this = mem::ManuallyDrop::new(self);
@@ -162,7 +165,7 @@ impl SharedIoHandle {
     // Wait until this is the unique strong reference, then take the owned handle
     // without closing it. Returns `None` if the handle was already closed.
     //
-    // Useful for FFI handoff or custom close paths (compio-style API).
+    // Useful for FFI handoff or custom close paths).
     pub(crate) async fn take(mut self) -> Option<OwnedOsHandle> {
         loop {
             if let Some(inner) = Rc::get_mut(&mut self.inner) {
@@ -345,8 +348,8 @@ impl InnerFd {
 }
 
 // Drop of `InnerFd` closes any remaining owned handle synchronously via
-// OwnedFd / OwnedHandle / OwnedSocket (compio / tokio-uring style). After
-// explicit `close`/`take`, `handle` is `None` so Drop is a no-op.
+// OwnedFd / OwnedHandle / OwnedSocket. After explicit `close`/`take`,
+// `handle` is `None` so Drop is a no-op.
 
 enum State {
     // Initial state
@@ -498,7 +501,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drop_closes_synchronously_without_explicit_close() {
-        // Compio/tokio-uring policy: last ref Drop closes via OwnedFd.
+        // last ref Drop closes via OwnedFd.
         let handle = dev_null_handle();
         drop(handle);
     }

@@ -25,15 +25,15 @@ pub struct BufWriter<W> {
 }
 
 impl<W> BufWriter<W> {
-    // Creates a new `BufReader` with a default buffer capacity. The default is currently 8 KB,
-    // but may change in the future.
+    /// Creates a new `BufWriter` with a default buffer capacity.
+    /// The default is currently 8 KB, but may change in the future.
     #[inline]
     pub fn new(inner: W) -> Self {
         // TODO: Make this configurable later
         Self::with_capacity(8 * 1024, inner)
     }
 
-    // Create BufWriter with given buffer size
+    /// Creates a new `BufWriter` with the specified buffer capacity.
     #[inline]
     pub fn with_capacity(capacity: usize, writer: W) -> Self {
         let buffer = vec![0; capacity];
@@ -44,33 +44,33 @@ impl<W> BufWriter<W> {
         }
     }
 
-    // Gets a reference to the underlying writer.
+    /// Gets a reference to the underlying writer.
     #[inline]
     pub fn get_ref(&self) -> &W {
         &self.writer
     }
 
-    // Gets a mutable reference to the underlying writer.
+    /// Gets a mutable reference to the underlying writer.
     #[inline]
     pub fn get_mut(&mut self) -> &mut W {
         &mut self.writer
     }
 
-    // Consumes this `BufWriter`, returning the underlying writer.
-    //
-    // Note that any leftover data in the internal buffer is lost.
+    /// Consumes this `BufWriter`, returning the underlying writer.
+    ///
+    /// Note that any leftover data in the internal buffer is lost.
     #[inline]
     pub fn into_inner(self) -> W {
         self.writer
     }
 
-    // Returns a reference to the internally buffered data.
+    /// Returns a reference to the internally buffered data.
     #[inline]
     pub fn buffer(&self) -> &[u8] {
         &self.buf.as_ref()[..self.written]
     }
 
-    // Invalidates all data in the internal buffer.
+    /// Invalidates all data in the internal buffer.
     #[inline]
     fn discard_buffer(&mut self) {
         self.written = 0;

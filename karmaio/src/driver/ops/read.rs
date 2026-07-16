@@ -10,11 +10,14 @@ use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
         Submission,
-        helpers::io_handle::{OsRawHandle, SharedIoHandle},
+        helpers::io_handle::SharedIoHandle,
         ops::{Completable, Completion, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };
+
+#[cfg(windows)]
+use crate::driver::helpers::io_handle::OsRawHandle;
 
 pub(crate) struct Read<B> {
     // Holds a strong ref to the fd, preventing the pipe from being closed while

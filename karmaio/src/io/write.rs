@@ -4,3 +4,4 @@ mod buf_writer;
 
 pub use async_write::{AsyncWrite, AsyncWriteAt};
 pub use async_write_ext::AsyncWriteExt;
+pub use buf_writer::BufWriter;

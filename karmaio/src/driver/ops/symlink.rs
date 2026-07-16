@@ -1,4 +1,3 @@
-use std::io;
 use std::path::Path;
 
 use crate::driver::Submission;

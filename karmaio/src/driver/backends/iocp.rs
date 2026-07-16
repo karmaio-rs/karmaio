@@ -204,6 +204,12 @@ impl CompletionPort {
     }
 }
 
+impl AsRawHandle for CompletionPort {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.port.as_raw_handle()
+    }
+}
+
 pub(crate) struct IocpBackend {
     // Completion port shared by all handles registered with this backend.
     port: CompletionPort,
@@ -451,9 +457,10 @@ impl DriverBackend for IocpBackend {
     }
 
     fn create_wakeup(&self) -> crate::driver::Wakeup {
-        let port_handle = self.port.as_raw_handle() as HANDLE;
+        // Cast to isize so the captured handle is Send + Sync (RawHandle is *mut c_void).
+        let port_handle = self.port.as_raw_handle() as isize;
         crate::driver::Wakeup::new(move || unsafe {
-            PostQueuedCompletionStatus(port_handle, 0, 0, std::ptr::null_mut());
+            PostQueuedCompletionStatus(port_handle as HANDLE, 0, 0, std::ptr::null_mut());
         })
     }
 }

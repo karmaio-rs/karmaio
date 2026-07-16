@@ -19,9 +19,7 @@ use crate::{
 /// remote queue for tasks scheduled from other threads (via wakers or
 /// `Handle`-style APIs).
 ///
-/// The design follows patterns from Tokio's current_thread scheduler and
-/// compio's executor: remote work is drained at the start of each "tick"
-/// before running local tasks.
+/// Remote work is drained at the start of each "tick" before running local tasks.
 pub(crate) struct Scheduler {
     pub(crate) tasks: LocalTaskQueue<ScheduleHandle>,
     remote: RemoteTaskQueue,
@@ -55,7 +53,7 @@ impl Scheduler {
     /// This must be called at the very beginning of every scheduler tick,
     /// before running any local tasks. This ensures remote work is picked
     /// up promptly and matches patterns used in other single-threaded
-    /// completion-based runtimes (e.g. compio).
+    /// completion-based runtimes.
     pub(crate) fn tick(&self) {
         self.remote.drain_into(&self.tasks);
     }

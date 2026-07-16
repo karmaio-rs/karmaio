@@ -33,6 +33,8 @@ macro_rules! reader_trait_impl {
 
 // Implemented as an extension trait, adding utility methods to all [`AsyncRead`] types.
 // Callers will tend to import this trait instead of [`AsyncRead`].
+// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+#[allow(async_fn_in_trait)]
 pub trait AsyncReadExt: AsyncRead {
     // Read until buf capacity is fulfilled
     async fn read_exact<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B>;

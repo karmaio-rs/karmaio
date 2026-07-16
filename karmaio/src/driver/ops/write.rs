@@ -8,11 +8,14 @@ use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
         Submission,
-        helpers::io_handle::{OsRawHandle, SharedIoHandle},
+        helpers::io_handle::SharedIoHandle,
         ops::{Completable, Completion, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };
+
+#[cfg(windows)]
+use crate::driver::helpers::io_handle::OsRawHandle;
 
 pub(crate) struct Write<B> {
     // Holds a strong ref to the fd, preventing the pipe from being closed while

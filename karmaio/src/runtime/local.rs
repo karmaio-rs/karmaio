@@ -29,8 +29,6 @@ pub struct Runtime {
     pub(crate) driver: Driver,
     pub(crate) scheduler: Scheduler,
     pub(crate) timer: Rc<RefCell<Timer>>,
-    /// Runtime tunables owned by this runtime (built from the `RuntimeBuilder`).
-    pub(crate) config: RuntimeConfig,
     /// Owns the blocking pool. Dropped before `driver` (fields drop in reverse
     /// declaration order) so workers finishing during shutdown can still wake
     /// a live driver.
@@ -61,7 +59,6 @@ impl Runtime {
             driver,
             scheduler,
             timer: Rc::new(RefCell::new(Timer::new())),
-            config,
             // Declared last so it drops first (Rust drops fields in reverse order).
             _blocking: blocking,
         })
@@ -109,6 +106,11 @@ impl Runtime {
                                 // No task to execute, we should wait for io blockingly
                                 break;
                             }
+
+                            // Cold path: tasks remain after a batch, so flush
+                            // the submission queue without parking. Prevents io_uring SQEs from
+                            // sitting in userspace until the SQ fills or we wait.
+                            let _ = self.driver.submit();
                         }
 
                         // Wait for I/O (or a cross-thread wake from the remote

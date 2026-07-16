@@ -3,7 +3,7 @@
 //! Unlike the offset-free process API in some runtimes, `karmaio`'s
 //! [`Command`](Command) wraps the standard library's `Command` directly,
 //! so it inherits every configuration knob (`env`, `current_dir`, …) for free.
-//! Spawning is synchronous (as in `tokio`); the resulting [`Child`] is awaited
+//! Spawning is synchronous; the resulting [`Child`] is awaited
 //! asynchronously and its piped stdio streams are driven by the completion driver.
 
 use std::{

@@ -143,6 +143,8 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 impl<B: BoundedIoBufMut> Completable for RecvMsg<B> {
     type Result = BufResult<(usize, SocketAddr), Vec<B>>;
 
+    // `mut self` is required on Windows (`set_length`); unused on other targets.
+    #[allow(unused_mut)]
     fn complete(mut self, completion_result: Completion) -> Self::Result {
         let res = completion_result.result.map(|v| v as usize);
         let mut bufs = self.bufs;

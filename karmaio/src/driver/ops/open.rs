@@ -1,4 +1,4 @@
-use std::{io, path::Path};
+use std::path::Path;
 
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;

@@ -3,10 +3,13 @@ use crate::{
     driver::{
         Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{Completable, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };
+
+#[cfg(windows)]
+use crate::driver::ops::Completion;
 
 pub(crate) struct ReadAt<B: BoundedIoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.

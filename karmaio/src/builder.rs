@@ -12,8 +12,8 @@ use crate::runtime::local::Runtime;
 
 /// Configuration for a [`Runtime`].
 ///
-/// Created by [`RuntimeBuilder`] and owned by the [`Runtime`]. The knobs here
-/// describe runtime-global resources that are created when the runtime is built
+/// Created by [`RuntimeBuilder`] and consumed when the runtime is built.
+/// The knobs here describe runtime-global resources created at build time
 /// (the blocking pool and the platform driver).
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {

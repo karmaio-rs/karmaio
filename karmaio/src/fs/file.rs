@@ -25,7 +25,7 @@ use crate::{
 /// after in-flight operations complete (asynchronously via the driver).
 ///
 /// If the file is dropped without calling `close`, the handle is still closed
-/// **synchronously** when the last reference is dropped (compio / tokio-uring style).
+/// **synchronously** when the last reference is dropped.
 /// Explicit `close().await` is recommended when you need non-blocking close or to
 /// observe close errors. Closing a file does not guarantee writes have persisted
 /// to disk; use [`sync_all`] for that.

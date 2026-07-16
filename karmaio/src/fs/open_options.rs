@@ -1,4 +1,4 @@
-use std::{io, path::Path};
+use std::path::Path;
 
 #[cfg(windows)]
 use std::os::windows::fs::OpenOptionsExt;
@@ -215,7 +215,7 @@ impl OpenOptions {
 
 #[cfg(windows)]
 impl OpenOptions {
-    pub(crate) fn access_mode(&self) -> io::Result<u32> {
+    pub(crate) fn access_mode(&self) -> std::io::Result<u32> {
         match (self.read, self.write, self.append, self.access_mode) {
             (.., Some(mode)) => Ok(mode),
             (true, false, false, None) => Ok(GENERIC_READ),
@@ -223,21 +223,21 @@ impl OpenOptions {
             (true, true, false, None) => Ok(GENERIC_READ | GENERIC_WRITE),
             (false, _, true, None) => Ok(FILE_GENERIC_WRITE & !FILE_WRITE_DATA),
             (true, _, true, None) => Ok(GENERIC_READ | (FILE_GENERIC_WRITE & !FILE_WRITE_DATA)),
-            (false, false, false, None) => Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as _)),
+            (false, false, false, None) => Err(std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as _)),
         }
     }
 
-    pub(crate) fn creation_mode(&self) -> io::Result<u32> {
+    pub(crate) fn creation_mode(&self) -> std::io::Result<u32> {
         match (self.write, self.append) {
             (true, false) => {}
             (false, false) => {
                 if self.truncate || self.create || self.create_new {
-                    return Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as _));
+                    return Err(std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as _));
                 }
             }
             (_, true) => {
                 if self.truncate && !self.create_new {
-                    return Err(io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as _));
+                    return Err(std::io::Error::from_raw_os_error(ERROR_INVALID_PARAMETER as _));
                 }
             }
         }

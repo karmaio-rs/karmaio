@@ -28,8 +28,9 @@ pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
     // Reference to the in-flight buffer.
     pub(crate) buf: B,
 
-    // Internal pointers to the IOVEC strcuts
+    // Held so the iovec memory stays valid for the kernel while the op is in-flight.
     #[cfg(target_os = "linux")]
+    #[allow(dead_code)]
     io_slices: Vec<IoSliceMut<'static>>,
 
     // Pointer to the msghdr struct sent to the kernel
@@ -164,6 +165,8 @@ impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
 impl<B: BoundedIoBufMut> Completable for RecvFrom<B> {
     type Result = BufResult<(usize, SocketAddr), B>;
 
+    // `mut self` is required on Windows (`set_length`); unused on other targets.
+    #[allow(unused_mut)]
     fn complete(mut self, completion_result: Completion) -> Self::Result {
         let res = completion_result.result.map(|v| v as usize);
         let mut buf = self.buf;

@@ -1,6 +1,4 @@
 //! macOS/kqueue syscall helpers for `Submittable` implementations.
-//!
-//! Inspired by the syscall macros in compio-driver and mio.
 
 /// Execute a syscall that returns a non-negative value on success.
 ///

@@ -50,14 +50,16 @@ impl Submittable for Close {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::{Foundation::CloseHandle, Networking::WinSock::closesocket};
 
-        // Copy discriminant values for the Send job.
-        let handle = self.io_handle;
-        windows_syscall_blocking!({
-            match handle {
-                OsRawHandle::Handle(h) => windows_syscall!(BOOL, CloseHandle(h as _)),
-                OsRawHandle::Socket(s) => windows_syscall!(SOCKET, closesocket(s as _)),
+        // Capture as integer types so the blocking job is Send (RawHandle is *mut c_void).
+        match self.io_handle {
+            OsRawHandle::Handle(h) => {
+                let h = h as isize;
+                windows_syscall_blocking!({ windows_syscall!(BOOL, CloseHandle(h as _)) })
             }
-        })
+            OsRawHandle::Socket(s) => {
+                windows_syscall_blocking!({ windows_syscall!(SOCKET, closesocket(s as _)) })
+            }
+        }
     }
 }
 

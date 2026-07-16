@@ -10,7 +10,7 @@ use crate::{
     driver::{
         Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{Completable, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -20,6 +20,8 @@ pub(crate) struct SendMsg<B: BoundedIoBuf, C: BoundedIoBuf> {
     #[allow(unused)]
     io_handle: SharedIoHandle,
 
+    // Held so the sockaddr remains valid for the kernel while the op is in-flight.
+    #[allow(dead_code)]
     socket_addr: Option<Box<SockAddr>>,
 
     // Reference to the in-flight buffer.
@@ -27,8 +29,9 @@ pub(crate) struct SendMsg<B: BoundedIoBuf, C: BoundedIoBuf> {
 
     pub(crate) control: Option<C>,
 
-    // Internal pointers to the IOVEC strcuts
+    // Held so the iovec memory stays valid for the kernel while the op is in-flight.
     #[cfg(unix)]
+    #[allow(dead_code)]
     io_slices: Vec<IoSlice<'static>>,
 
     // Pointer to the msghdr struct sent to the kernel

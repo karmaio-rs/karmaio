@@ -3,7 +3,7 @@ use crate::{
     driver::{
         Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{Completable, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };

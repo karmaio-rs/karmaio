@@ -13,6 +13,8 @@ use crate::buf::{BoundedIoBuf, BufResult};
 // Types implementing this trait are required to manage asynchronous I/O operations, allowing for non-blocking writes.
 // This is particularly useful in scenarios where the object might need to interact
 // with other asynchronous tasks without blocking the executor.
+// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+#[allow(async_fn_in_trait)]
 pub trait AsyncWrite {
     // Writes the contents of a buffer into this writer, returning the number of bytes written.
     //
@@ -42,6 +44,8 @@ pub trait AsyncWrite {
 // Types implementing this trait are required to manage asynchronous I/O operations, allowing for non-blocking writes.
 // This is particularly useful in scenarios where the object might need to interact
 // with other asynchronous tasks without blocking the executor.
+// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+#[allow(async_fn_in_trait)]
 pub trait AsyncWriteAt {
     // Like [`AsyncWrite::write`], except that it writes at a specified position.
     async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B>;

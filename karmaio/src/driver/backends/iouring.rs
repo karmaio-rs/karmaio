@@ -6,7 +6,7 @@ use std::{
 };
 
 use io_uring::opcode::AsyncCancel;
-use io_uring::{Builder, IoUring, cqueue, squeue};
+use io_uring::{IoUring, squeue};
 
 use slab::Slab;
 

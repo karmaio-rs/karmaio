@@ -73,6 +73,11 @@ impl Driver {
         self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup)
     }
 
+    /// Flush the backend submission queue without waiting for completions.
+    ///
+    /// On io_uring this submits pending SQEs. On kqueue / IOCP this is a no-op
+    /// (those backends submit synchronously in `poll_op` / `submit_op`).
+    /// Called from the runtime cold path when tasks remain after a batch.
     pub(crate) fn submit(&self) -> io::Result<()> {
         self.backend.borrow_mut().submit()
     }

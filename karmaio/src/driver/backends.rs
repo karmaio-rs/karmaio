@@ -49,7 +49,10 @@ pub(crate) trait DriverBackend {
         wakeup: &Wakeup,
     ) -> Poll<T::Result>;
 
-    // Pushes any pending operations in the submission queue to the kernel.
+    /// Flush the submission queue without waiting for completions.
+    ///
+    /// Called from the runtime cold path when tasks remain after a scheduler batch
+    /// (so io_uring SQEs are not held until park). kqueue / IOCP return `Ok(())`.
     fn submit(&mut self) -> Result<()>;
 
     // Wait infinitely and process returned events.

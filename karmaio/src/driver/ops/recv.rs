@@ -3,7 +3,7 @@ use crate::{
     driver::{
         Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{Completable, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -22,6 +22,8 @@ pub(crate) struct Recv<B: BoundedIoBufMut> {
 }
 
 impl<B: BoundedIoBufMut> Op<Recv<B>> {
+    // `mut buf` is required on Windows (`stable_write_ptr`); unused on other targets.
+    #[allow(unused_mut)]
     pub(crate) fn recv(io_handle: &SharedIoHandle, mut buf: B) -> std::io::Result<Op<Recv<B>>> {
         #[cfg(windows)]
         let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {

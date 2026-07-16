@@ -43,8 +43,17 @@ impl<S: Schedule> Task<S> {
         self.raw.header()
     }
 
+    /// Run the task.
+    ///
+    /// Consumes the `Task` ref-count and transfers ownership of it into the
+    /// poll path. The task state machine is responsible for releasing that
+    /// ref-count (via `transition_to_idle` / `drop_reference` / `dealloc`).
+    /// The `Task` must not drop after `poll` returns, or refs would be double-decremented.
     pub(crate) fn run(self) {
-        self.raw.poll();
+        let raw = self.raw;
+        // Transfer the ref-count into `poll`; do not run `Drop for Task`.
+        std::mem::forget(self);
+        raw.poll();
     }
 }
 

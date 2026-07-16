@@ -57,6 +57,10 @@ impl VTable {
 
 /// Polls the future stored inside the task `Cell`.
 ///
+/// Takes ownership of one ref-count (the `Task` that called [`RawTask::poll`]).
+/// That ref-count is released by this function according to the transition
+/// result — callers must not drop the `Task` after calling `poll`.
+///
 /// # Safety
 ///
 /// `ptr` must be a non-null pointer to the `Header` of a `Cell<F>`.
@@ -72,24 +76,39 @@ fn poll<F: Future, S: Schedule>(ptr: NonNull<Header>) {
             let res = poll_future(internal_task, cx);
 
             if res == Poll::Ready(()) {
-                // The future completed. Move on to complete the task.
+                // The future completed. Finalize, then release the poller ref.
                 complete(internal_task_ptr);
+                RawTask::from_raw(ptr).drop_reference();
                 return;
             }
 
             match internal_task.header.state.transition_to_idle() {
-                TransitionToIdle::Ok => return,
+                // Poller ref already consumed inside the transition.
+                TransitionToIdle::Ok => {}
                 TransitionToIdle::OkNotified => {
-                    internal_task.header.state.ref_inc();
+                    // Transition created a new ref for the rescheduled task and
+                    // left the poller ref for us to drop after yield_now returns.
                     let task = unsafe { Task::from_raw(internal_task_ptr.cast()) };
                     internal_task.scheduler.yield_now(task);
+                    RawTask::from_raw(ptr).drop_reference();
                 }
+                // Poller held the last ref; free the allocation.
                 TransitionToIdle::OkDealloc => dealloc::<F, S>(ptr),
-                TransitionToIdle::Cancelled => cancel_task(internal_task_ptr),
+                TransitionToIdle::Cancelled => {
+                    // Cancelled during poll: RUNNING is still set. Finalize as a
+                    // cancelled completion, then release the poller ref.
+                    cancel_task(internal_task_ptr);
+                    RawTask::from_raw(ptr).drop_reference();
+                }
             }
         }
-        TransitionToRunning::Cancelled => cancel_task(internal_task_ptr),
-        TransitionToRunning::Failed => return,
+        TransitionToRunning::Cancelled => {
+            cancel_task(internal_task_ptr);
+            RawTask::from_raw(ptr).drop_reference();
+        }
+        // Transition already consumed the poller ref (task was not idle).
+        TransitionToRunning::Failed => {}
+        // Transition consumed the last ref.
         TransitionToRunning::Dealloc => dealloc::<F, S>(ptr),
     }
 }

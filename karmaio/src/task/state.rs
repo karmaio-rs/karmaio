@@ -65,12 +65,14 @@ pub(super) enum TransitionToRunning {
 
 #[must_use]
 pub(super) enum TransitionToIdle {
+    /// Idle and not re-notified; the poller ref-count was consumed.
     Ok,
+    /// Idle and re-notified; a new ref-count was created for reschedule and the
+    /// poller still owns its original ref-count (must drop it after scheduling).
     OkNotified,
-    // Matched in the task vtable; not produced by `transition_to_idle` today
-    // (dealloc currently happens via other transition paths).
-    #[allow(dead_code)]
+    /// Idle, not re-notified, and the poller held the last ref-count — free the task.
     OkDealloc,
+    /// Cancelled during the poll; RUNNING is still set, cancel/complete the task.
     Cancelled,
 }
 
@@ -148,6 +150,14 @@ impl State {
     ///
     /// The transition to `Idle` fails if the task has been flagged to be
     /// cancelled.
+    ///
+    /// # Ref-count contract
+    ///
+    /// The caller passes ownership of the `Task` / `Notified` ref-count into
+    /// [`Task::run`] / `poll`. This transition consumes that ref-count when the
+    /// task is not re-notified (`Ok` / `OkDealloc`). When re-notified
+    /// (`OkNotified`), a new ref-count is created for the scheduled task and the
+    /// original ref-count remains for the caller to drop after `yield_now`.
     pub(super) fn transition_to_idle(&self) -> TransitionToIdle {
         self.fetch_update(|mut state| {
             assert!(state.is_running());
@@ -161,12 +171,13 @@ impl State {
             state.unset_running();
 
             if !state.is_notified() {
-                // The task is now idle. The ref count that "ran" the task
-                // is not decremented here. It is the responsibility of the
-                // task handle that was `run` to be dropped, which will dec
-                // the ref count. If the future is pending, it should have
-                // cloned the waker, incrementing the ref count.
-                action = TransitionToIdle::Ok;
+                // Polling the future consumes the ref-count of the Notified.
+                state.ref_dec();
+                if state.ref_count() == 0 {
+                    action = TransitionToIdle::OkDealloc;
+                } else {
+                    action = TransitionToIdle::Ok;
+                }
             } else {
                 // The caller will schedule a new notification, so we create a
                 // new ref-count for the notification. Our own ref-count is kept

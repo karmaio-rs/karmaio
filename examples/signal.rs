@@ -1,22 +1,20 @@
-//! Demonstrates async signal handling with karmaio.
+//! Async signal handling (Ctrl-C and Unix signals).
 //!
-//! This example shows how to:
-//! - Handle Ctrl-C signals
-//! - Handle Unix signals (SIGTERM, SIGHUP, etc.)
+//! ```text
+//! cargo run --example signal
+//! ```
 //!
-//! Run the example and send signals:
+//! In another terminal (Unix):
 //!
-//!     cargo run --example signal
-//!
-//! Then in another terminal:
-//!
-//!     kill -SIGTERM <pid>
-//!     kill -SIGHUP <pid>
+//! ```text
+//! kill -SIGTERM <pid>
+//! kill -SIGHUP <pid>
+//! ```
 //!
 //! Or press Ctrl-C in the first terminal.
 
 #[cfg(unix)]
-use karmaio::signal::{SignalKind, signal, ctrl_c};
+use karmaio::signal::{SignalKind, ctrl_c, signal};
 
 #[cfg(windows)]
 use karmaio::signal::ctrl_c;
@@ -33,13 +31,12 @@ async fn main() -> std::io::Result<()> {
     let ctrl_c_future = ctrl_c()?;
     println!("Waiting for Ctrl-C...");
 
-    // We'll wait for Ctrl-C with a timeout
     match karmaio::time::timeout(Duration::from_secs(5), ctrl_c_future).await {
         Ok(_) => println!("Received Ctrl-C!"),
         Err(_) => println!("No Ctrl-C received within 5 seconds (timeout)."),
     }
 
-    // Example 2: Unix signals (only on Unix)
+    // Example 2: Unix signals
     #[cfg(unix)]
     {
         println!("\nExample 2: Unix signal handling");
@@ -50,7 +47,6 @@ async fn main() -> std::io::Result<()> {
         println!("Try: kill -SIGTERM {}", std::process::id());
         println!("Or:  kill -SIGHUP {}", std::process::id());
 
-        // Wait for SIGTERM with a timeout
         match karmaio::time::timeout(Duration::from_secs(10), sigterm.recv()).await {
             Ok(_) => println!("Received SIGTERM!"),
             Err(_) => println!("No SIGTERM received within 10 seconds (timeout)."),

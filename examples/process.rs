@@ -1,14 +1,8 @@
-//! Demonstrates async process execution with karmaio.
+//! Async process execution: spawn, pipe stdin/stdout, capture output.
 //!
-//! This example shows how to:
-//! - Spawn a child process
-//! - Wait for process completion
-//! - Capture process output
-//! - Pipe stdin/stdout
-//!
-//! Run the example:
-//!
-//!     cargo run --example process
+//! ```text
+//! cargo run --example process
+//! ```
 
 use karmaio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use karmaio::process::{Command, Stdio as KarmaioStdio};
@@ -17,18 +11,12 @@ use karmaio::process::{Command, Stdio as KarmaioStdio};
 async fn main() -> std::io::Result<()> {
     // Example 1: Simple command execution
     println!("Example 1: Simple command execution");
-    let status = Command::new("echo")
-        .arg("Hello from karmaio!")
-        .status()
-        .await?;
-    println!("Exit status: {}", status);
+    let status = Command::new("echo").arg("Hello from karmaio!").status().await?;
+    println!("Exit status: {status}");
 
     // Example 2: Capture command output
     println!("\nExample 2: Capture command output");
-    let output = Command::new("echo")
-        .arg("This is captured output")
-        .output()
-        .await?;
+    let output = Command::new("echo").arg("This is captured output").output().await?;
     println!("Exit status: {}", output.status);
     println!("Stdout: {}", String::from_utf8_lossy(&output.stdout));
     println!("Stderr: {}", String::from_utf8_lossy(&output.stderr));
@@ -51,18 +39,15 @@ async fn main() -> std::io::Result<()> {
     let buf = vec![0; 1024];
     let (result, buf) = stdout.read(buf).await;
     let n = result?;
-    println!("Read {} bytes: {}", n, String::from_utf8_lossy(&buf[..n]));
+    println!("Read {n} bytes: {}", String::from_utf8_lossy(&buf[..n]));
 
     // Wait for process to complete
     let status = child.wait().await?;
-    println!("Exit status: {}", status);
+    println!("Exit status: {status}");
 
     // Example 4: Run a command that fails
     println!("\nExample 4: Command that fails");
-    let output = Command::new("ls")
-        .arg("/nonexistent_path")
-        .output()
-        .await?;
+    let output = Command::new("ls").arg("/nonexistent_path").output().await?;
     println!("Exit status: {}", output.status);
     println!("Stderr: {}", String::from_utf8_lossy(&output.stderr));
 

@@ -1,14 +1,8 @@
-//! Demonstrates async file I/O operations with karmaio.
+//! Async file I/O: create, read, write, rename, and remove.
 //!
-//! This example shows how to:
-//! - Create and write to a file
-//! - Read from a file
-//! - Rename a file
-//! - Remove a file
-//!
-//! Run the example:
-//!
-//!     cargo run --example file_operations
+//! ```text
+//! cargo run --example file_operations
+//! ```
 
 use std::path::PathBuf;
 
@@ -45,7 +39,7 @@ async fn main() -> std::io::Result<()> {
     // Verify the file is removed
     match karmaio::fs::read(&new_path).await {
         Ok(_) => println!("File still exists (unexpected)!"),
-        Err(e) => println!("File properly removed (expected error: {})", e),
+        Err(e) => println!("File properly removed (expected error: {e})"),
     }
 
     Ok(())

@@ -3,9 +3,9 @@ use crate::task::Task;
 pub mod blocking;
 pub mod local;
 
+pub use crate::task::{JoinError, JoinHandle};
 pub use blocking::{BlockingPool, BlockingPoolHandle};
 pub use local::{Runtime, spawn_blocking, spawn_local};
-pub use crate::task::{JoinError, JoinHandle};
 
 pub(crate) trait Schedule: Sized + 'static {
     /// Schedule the task

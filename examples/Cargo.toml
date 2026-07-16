@@ -17,6 +17,10 @@ name = "echo_tcp"
 path = "echo_tcp.rs"
 
 [[example]]
+name = "udp_echo"
+path = "udp_echo.rs"
+
+[[example]]
 name = "udp_client"
 path = "udp_client.rs"
 
@@ -39,3 +43,7 @@ path = "signal.rs"
 [[example]]
 name = "runtime_builder"
 path = "runtime_builder.rs"
+
+[[example]]
+name = "spawn_tasks"
+path = "spawn_tasks.rs"

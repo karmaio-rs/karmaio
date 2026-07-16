@@ -1,13 +1,14 @@
-//! A simple client that opens a TCP stream, writes "hello world\n", and closes
-//! the connection.
+//! A simple TCP client that connects, writes a line, and closes.
 //!
-//! To start a server that this client can talk to on port 6142, you can use this command:
+//! Pair this with the echo server:
 //!
-//!     ncat -l 6142
+//! ```text
+//! # terminal 1
+//! cargo run --example echo_tcp
 //!
-//! And then in another terminal run:
-//!
-//!     cargo run --example hello_world
+//! # terminal 2
+//! cargo run --example hello_world
+//! ```
 
 use std::net::SocketAddr;
 
@@ -16,9 +17,9 @@ use karmaio::net::tcp::TcpStream;
 
 #[karmaio::main]
 async fn main() -> std::io::Result<()> {
-    let addr: SocketAddr = "127.0.0.1:6142".parse().unwrap();
+    let addr: SocketAddr = "127.0.0.1:8080".parse().unwrap();
     let mut stream = TcpStream::connect(addr).await?;
-    println!("created stream");
+    println!("connected to {addr}");
 
     let (result, _) = stream.write_all(b"hello world\n".to_vec()).await;
     println!("wrote to stream; success={:?}", result.is_ok());

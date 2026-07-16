@@ -1,16 +1,16 @@
 # karmaio Examples
 
-This directory contains examples demonstrating the main features of the karmaio runtime.
+Examples for the main features of the karmaio runtime.
 
 ## Running Examples
 
-To run an example, use the following command from the workspace root:
+From the workspace root:
 
 ```bash
-cargo run --example <example_name>
+cargo run -p karmaio-examples --example <example_name>
 ```
 
-Or from the examples directory:
+Or from this directory:
 
 ```bash
 cd examples
@@ -21,33 +21,50 @@ cargo run --example <example_name>
 
 ### Networking
 
-- **hello_world** - A simple TCP client that connects to a server and sends a message.
-- **echo_tcp** - A TCP echo server that accepts connections and echoes back data.
-- **udp_client** - A UDP client that sends a message to a server and receives a response.
+| Example | Description |
+|---------|-------------|
+| **echo_tcp** | TCP echo server; handles each connection with `spawn_local` (detached tasks). |
+| **hello_world** | TCP client; pairs with `echo_tcp` on `127.0.0.1:8080`. |
+| **udp_echo** | UDP echo server on `127.0.0.1:8080`. |
+| **udp_client** | UDP client; pairs with `udp_echo`. |
+
+### Tasks & runtime
+
+| Example | Description |
+|---------|-------------|
+| **spawn_tasks** | Spawn, join, abort, detach, and clean `Runtime` shutdown. |
+| **runtime_builder** | Builder config, spawn, `spawn_blocking`, and drop order. |
+| **timer** | `sleep`, `interval`, `timeout` (notes I/O detach on timeout). |
 
 ### File I/O
 
-- **file_operations** - Demonstrates async file operations: create, read, write, rename, and remove files.
+| Example | Description |
+|---------|-------------|
+| **file_operations** | Create, read, write, rename, remove files. |
 
-### Timers
+### Process & signals
 
-- **timer** - Shows how to use `sleep`, `interval`, and `timeout` for async timing operations.
+| Example | Description |
+|---------|-------------|
+| **process** | Spawn processes, pipes, capture output. |
+| **signal** | Ctrl-C and Unix signals (`SIGTERM` / `SIGHUP`). |
 
-### Process Management
+## Suggested pairings
 
-- **process** - Demonstrates async process execution, including spawning processes, piping stdin/stdout, and capturing output.
+```bash
+# TCP
+cargo run --example echo_tcp          # terminal 1
+cargo run --example hello_world       # terminal 2
 
-### Signals
-
-- **signal** - Shows how to handle Ctrl-C and Unix signals (SIGTERM, SIGHUP, etc.).
-
-### Runtime Configuration
-
-- **runtime_builder** - Demonstrates custom runtime configuration using the builder pattern.
+# UDP
+cargo run --example udp_echo          # terminal 1
+cargo run --example udp_client        # terminal 2
+```
 
 ## Notes
 
-- The echo_tcp example requires a running server. Start the echo_tcp server first, then connect with the hello_world client.
-- The udp_client example expects a UDP server listening on port 8080.
-- The signal example demonstrates signal handling and may require sending signals from another terminal.
-- All examples use the `#[karmaio::main]` attribute macro for the async entrypoint.
+- All `#[karmaio::main]` examples drive a single-threaded runtime for the async entrypoint.
+- Dropping a `JoinHandle` **detaches** the task; use `abort()` to cancel. Await (or drop) handles before dropping a manually created `Runtime` — see **spawn_tasks**.
+- Dropping an in-progress I/O future (e.g. via `timeout`) detaches from the result; kernel work may still complete. See runtime docs for details.
+- The **signal** example may need signals sent from another terminal (or Ctrl-C).
+- **process** uses `echo` / `cat` / `ls` (Unix-style); adjust if you are on a minimal environment.

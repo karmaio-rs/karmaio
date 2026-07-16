@@ -1,13 +1,13 @@
-//! Demonstrates async timer operations with karmaio.
+//! Async timers: `sleep`, `interval`, and `timeout`.
 //!
-//! This example shows how to:
-//! - Use `sleep` to pause execution
-//! - Use `interval` to create recurring timers
-//! - Use `timeout` to limit async operations
+//! Note on `timeout`: when the deadline fires, the inner future is **dropped**.
+//! For I/O that means the op is *detached* (buffers stay alive until the kernel
+//! finishes); it is not always an immediate kernel cancel. See the runtime
+//! docs on I/O cancellation.
 //!
-//! Run the example:
-//!
-//!     cargo run --example timer
+//! ```text
+//! cargo run --example timer
+//! ```
 
 use std::time::Duration;
 
@@ -26,22 +26,22 @@ async fn main() -> std::io::Result<()> {
     let mut interval = interval(Duration::from_millis(200));
     for i in 1..=3 {
         interval.tick().await;
-        println!("Tick {} at {:?}", i, std::time::Instant::now());
+        println!("Tick {i} at {:?}", std::time::Instant::now());
     }
 
-    // Example 3: Timeout
-    println!("\nExample 3: Timeout");
+    // Example 3: Timeout that succeeds
+    println!("\nExample 3: Timeout that succeeds");
     let result = timeout(Duration::from_millis(100), async {
         sleep(Duration::from_millis(50)).await;
         "Operation completed"
     })
     .await;
     match result {
-        Ok(msg) => println!("Success: {}", msg),
+        Ok(msg) => println!("Success: {msg}"),
         Err(_) => println!("Operation timed out"),
     }
 
-    // Example 4: Timeout that expires
+    // Example 4: Timeout that expires (inner future is dropped / detached)
     println!("\nExample 4: Timeout that expires");
     let result = timeout(Duration::from_millis(50), async {
         sleep(Duration::from_millis(100)).await;
@@ -49,8 +49,8 @@ async fn main() -> std::io::Result<()> {
     })
     .await;
     match result {
-        Ok(msg) => println!("Success: {}", msg),
-        Err(_) => println!("Operation timed out (expected)"),
+        Ok(msg) => println!("Success: {msg}"),
+        Err(_) => println!("Operation timed out (expected; inner future was dropped)"),
     }
 
     println!("\nAll timer examples completed!");

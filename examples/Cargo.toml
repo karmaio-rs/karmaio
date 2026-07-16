@@ -1,0 +1,41 @@
+[package]
+name = "karmaio-examples"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+karmaio = { path = "../karmaio" }
+
+[[example]]
+name = "hello_world"
+path = "hello_world.rs"
+
+[[example]]
+name = "echo_tcp"
+path = "echo_tcp.rs"
+
+[[example]]
+name = "udp_client"
+path = "udp_client.rs"
+
+[[example]]
+name = "file_operations"
+path = "file_operations.rs"
+
+[[example]]
+name = "timer"
+path = "timer.rs"
+
+[[example]]
+name = "process"
+path = "process.rs"
+
+[[example]]
+name = "signal"
+path = "signal.rs"
+
+[[example]]
+name = "runtime_builder"
+path = "runtime_builder.rs"

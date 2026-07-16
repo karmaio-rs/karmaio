@@ -20,6 +20,9 @@ edition = "2024"
 socket2 = { version = "0.6", features = ["all"] }
 slab = "0.4"
 
+# Macro support: #[karmaio::main] / #[karmaio::test] attribute macros.
+karmaio-macros = { path = "../karmaio-macros", version = "0.1.0" }
+
 # Unix platform dependencies
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

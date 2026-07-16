@@ -15,6 +15,7 @@ pub(crate) mod driver;
 pub(crate) mod task;
 
 pub use builder::{RuntimeBuilder, RuntimeConfig};
+pub use runtime::{JoinError, JoinHandle, Runtime};
 
 /// Attribute macros that turn an `async fn` into a runtime-driven entrypoint.
 ///

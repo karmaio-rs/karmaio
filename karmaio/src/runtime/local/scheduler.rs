@@ -1,6 +1,9 @@
 use std::{
     collections::VecDeque,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     thread::{self, ThreadId},
 };
 
@@ -31,6 +34,16 @@ impl Default for Scheduler {
             tasks: LocalTaskQueue::default(),
             remote: RemoteTaskQueue::default(),
         }
+    }
+}
+
+impl Drop for Scheduler {
+    fn drop(&mut self) {
+        // Break the remote-queue ownership cycle before fields are dropped:
+        // each queued `Task` holds a `ScheduleHandle` that clones the same
+        // `Arc` as this queue. Mark closed, drain, and drop those tasks while
+        // our `Arc` is still alive so the queue can empty cleanly.
+        self.remote.shutdown();
     }
 }
 
@@ -79,22 +92,49 @@ impl Schedule for ScheduleHandle {
     }
 }
 
+/// Shared remote run queue used by wakers and other threads.
+///
+/// The queue lives behind an `Arc` so `ScheduleHandle` (stored inside every
+/// task) can push from any thread. That creates a potential cycle:
+/// `Arc → Task → ScheduleHandle → Arc`. [`RemoteTaskQueue::shutdown`] and
+/// [`Drop`] for the storage break that cycle at runtime teardown.
 #[derive(Clone)]
 struct RemoteTaskQueue {
     // The queue itself is required to transfer `Task` objects from other threads
     // into the thread-local run queue. Even with a perfect wakeup, the scheduled
     // task handle must be stored somewhere that the owner thread can drain.
     // This is still needed as long as we allow `Task` / wakers to be `Send`.
-    queue: Arc<Mutex<VecDeque<Task<ScheduleHandle>>>>,
+    inner: Arc<RemoteQueueInner>,
     /// Optional wakeup token. When present, a push from a remote thread will
     /// use it to promptly wake the owner runtime's poller.
     wakeup: Option<Wakeup>,
 }
 
+struct RemoteQueueInner {
+    queue: Mutex<VecDeque<Task<ScheduleHandle>>>,
+    /// Once set, further pushes drop the task instead of enqueueing. Prevents
+    /// resurrecting the Arc cycle after the scheduler has shut down.
+    closed: AtomicBool,
+}
+
+impl Drop for RemoteQueueInner {
+    fn drop(&mut self) {
+        // Last Arc clone is going away — drop any remaining tasks so we never
+        // leave an Arc cycle if shutdown was skipped.
+        self.closed.store(true, Ordering::Relaxed);
+        if let Ok(queue) = self.queue.get_mut() {
+            queue.clear();
+        }
+    }
+}
+
 impl Default for RemoteTaskQueue {
     fn default() -> Self {
         Self {
-            queue: Arc::new(Mutex::new(VecDeque::new())),
+            inner: Arc::new(RemoteQueueInner {
+                queue: Mutex::new(VecDeque::new()),
+                closed: AtomicBool::new(false),
+            }),
             wakeup: None,
         }
     }
@@ -102,17 +142,37 @@ impl Default for RemoteTaskQueue {
 
 impl RemoteTaskQueue {
     fn push_back(&self, task: Task<ScheduleHandle>) {
-        self.queue.lock().expect("remote task queue poisoned").push_back(task);
+        {
+            let mut remote = self.inner.queue.lock().expect("remote task queue poisoned");
+            if self.inner.closed.load(Ordering::Acquire) {
+                // Scheduler is gone (or going). Drop the task handle rather than
+                // re-enqueue and recreate an Arc cycle.
+                drop(task);
+                return;
+            }
+            remote.push_back(task);
+        }
         if let Some(w) = &self.wakeup {
             w.wake();
         }
     }
 
     fn drain_into(&self, local: &LocalTaskQueue<ScheduleHandle>) {
-        let mut remote = self.queue.lock().expect("remote task queue poisoned");
+        let mut remote = self.inner.queue.lock().expect("remote task queue poisoned");
 
         while let Some(task) = remote.pop_front() {
             local.push_back(task);
         }
+    }
+
+    /// Mark the remote queue closed and drop all queued tasks.
+    ///
+    /// Called from [`Scheduler`]'s `Drop` to break the
+    /// `Arc → Task → ScheduleHandle → Arc` cycle before the scheduler's
+    /// `Arc` clone is released.
+    fn shutdown(&self) {
+        self.inner.closed.store(true, Ordering::Release);
+        let mut remote = self.inner.queue.lock().expect("remote task queue poisoned");
+        remote.clear();
     }
 }

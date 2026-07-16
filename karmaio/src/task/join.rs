@@ -79,8 +79,21 @@ impl fmt::Display for JoinError {
 
 impl std::error::Error for JoinError {}
 
-/// JoinHandle can be used to wait for a task to finish.
-/// Note if you drop it directly, task will not be terminated.
+/// Handle for awaiting (or aborting) a spawned task.
+///
+/// # Detach vs abort
+///
+/// Dropping a `JoinHandle` **detaches** from the task: the task keeps running
+/// and is **not** cancelled. Use [`JoinHandle::abort`] for cooperative
+/// cancellation. This matches the usual Tokio-style join-handle contract.
+///
+/// # Runtime lifetime
+///
+/// The handle is only useful while its
+/// [`Runtime`](crate::runtime::Runtime) is still alive and driving the
+/// scheduler. Awaiting after the runtime has been dropped will hang. Prefer
+/// finishing or aborting work before dropping the runtime (see
+/// [Runtime shutdown](crate::runtime::Runtime#shutdown)).
 pub struct JoinHandle<T> {
     raw: RawTask,
     _p: PhantomData<T>,

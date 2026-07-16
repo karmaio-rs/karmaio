@@ -25,6 +25,34 @@ scoped_thread_local!(static CURRENT_SCHEDULER: Scheduler);
 scoped_thread_local!(pub(crate) static CURRENT_DRIVER: Handle);
 scoped_thread_local!(pub(crate) static CURRENT_TIMER: Rc<RefCell<Timer>>);
 
+/// Single-threaded (current-thread) karmaio runtime.
+///
+/// # Shutdown
+///
+/// Dropping a [`Runtime`] tears down the scheduler, I/O driver, and blocking
+/// pool. Tasks still sitting in run queues are dropped; in-flight driver ops
+/// are cancelled or drained by the platform backend.
+///
+/// To shut down cleanly:
+///
+/// 1. Finish (or drop) the future passed to [`Runtime::block_on`].
+/// 2. Drop or fully await every [`JoinHandle`] you still care about **before**
+///    dropping the runtime.
+/// 3. Then drop the [`Runtime`].
+///
+/// Awaiting a [`JoinHandle`] *after* its runtime has been dropped will hang:
+/// the task is no longer polled. Dropping a [`JoinHandle`] does **not** abort
+/// the task (use [`JoinHandle::abort`]).
+///
+/// # I/O cancellation
+///
+/// Dropping an in-progress I/O future (for example via `select!` or a timeout)
+/// **detaches** from the result; it does not always cancel the kernel
+/// operation. On Linux (io_uring) the submission stays in flight until
+/// completion and buffers remain alive until then. IOCP requests cancel; kqueue
+/// removes readiness interest. Buffers and other op state are kept alive until
+/// the kernel (or blocking pool) finishes, so this is memory-safe, but it is
+/// not the same as eager cancellation.
 pub struct Runtime {
     pub(crate) driver: Driver,
     pub(crate) scheduler: Scheduler,
@@ -64,6 +92,13 @@ impl Runtime {
         })
     }
 
+    /// Runs `future` to completion on this runtime.
+    ///
+    /// Nested `block_on` calls (a runtime inside a runtime) panic.
+    ///
+    /// When this method returns, the main future has finished, but other
+    /// tasks spawned during the call may still be queued or waiting on I/O.
+    /// See [Shutdown](Runtime#shutdown) before dropping the runtime.
     pub fn block_on<F: Future + 'static>(&mut self, future: F) -> F::Output {
         assert!(!CURRENT_SCHEDULER.is_set(), "Can not start a runtime inside a runtime");
 
@@ -136,6 +171,14 @@ impl Runtime {
         })
     }
 
+    /// Spawns a future onto this runtime.
+    ///
+    /// The returned [`JoinHandle`] can be awaited for the output, or dropped
+    /// to detach (the task keeps running). Dropping the handle does not cancel
+    /// the task; call [`JoinHandle::abort`] for cooperative cancellation.
+    ///
+    /// The runtime must outlive any handle you still intend to poll. See
+    /// [Shutdown](Runtime#shutdown).
     pub fn spawn<F: Future + 'static>(&self, future: F) -> JoinHandle<F::Output> {
         let (task, join_handle) = new_task(future, self.scheduler.handle());
 
@@ -290,6 +333,64 @@ mod tests {
             .expect_err("task should be cancelled");
 
         assert!(err.is_cancelled());
+    }
+
+    #[test]
+    fn dropping_runtime_with_queued_and_remote_tasks_does_not_panic() {
+        // Regression: remote queue held Task → ScheduleHandle → Arc(queue),
+        // which could cycle on shutdown. Scheduler::Drop drains and closes the
+        // remote queue so Runtime drop stays leak- and panic-free.
+        let mut runtime = Runtime::new().expect("runtime should start");
+
+        // Fire-and-forget tasks (JoinHandle dropped) still in the local queue.
+        for _ in 0..8 {
+            let _ = runtime.spawn(pending::<()>());
+        }
+
+        // One task that parks a waker on another thread, so a remote schedule
+        // may race with teardown.
+        let ready = Arc::new(AtomicBool::new(false));
+        let (waker_tx, waker_rx) = mpsc::channel();
+        let _detached = runtime.spawn({
+            let ready = Arc::clone(&ready);
+            async move {
+                struct Once {
+                    ready: Arc<AtomicBool>,
+                    tx: Option<mpsc::Sender<Waker>>,
+                }
+                impl Future for Once {
+                    type Output = ();
+                    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                        if self.ready.load(Ordering::Acquire) {
+                            return Poll::Ready(());
+                        }
+                        if let Some(tx) = self.tx.take() {
+                            let _ = tx.send(cx.waker().clone());
+                        }
+                        Poll::Pending
+                    }
+                }
+                Once {
+                    ready,
+                    tx: Some(waker_tx),
+                }
+                .await
+            }
+        });
+
+        // Drive just enough for the task to install its waker, then tear down.
+        runtime.block_on(async {
+            crate::time::sleep(std::time::Duration::from_millis(10)).await;
+        });
+
+        let _ = thread::spawn(move || {
+            if let Ok(waker) = waker_rx.recv_timeout(std::time::Duration::from_millis(50)) {
+                ready.store(true, Ordering::Release);
+                waker.wake();
+            }
+        });
+
+        drop(runtime);
     }
 
     #[test]

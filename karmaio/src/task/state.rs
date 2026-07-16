@@ -247,9 +247,15 @@ impl State {
     /// Transitions the state to `NOTIFIED`.
     pub(super) fn transition_to_notified_by_ref(&self) -> TransitionToNotified {
         self.fetch_update(|mut state| {
-            if state.is_complete() || state.is_notified() {
-                // There is nothing to do in this case.
+            if state.is_complete() {
+                // The complete state is final.
                 (TransitionToNotified::DoNothing, None)
+            } else if state.is_notified() {
+                // Even though we have nothing to do in this branch,
+                // `wake_by_ref` should synchronize-with the task starting
+                // execution, so we must use a Release store (same value) to
+                // pair with the Acquire load in `transition_to_running`.
+                (TransitionToNotified::DoNothing, Some(state))
             } else if state.is_running() {
                 // If the task is running, we mark it as notified, but we should
                 // not submit as the thread currently running the future is

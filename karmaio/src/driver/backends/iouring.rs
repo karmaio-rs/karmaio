@@ -111,6 +111,8 @@ impl DriverBackend for IoUringBackend {
         };
 
         match state {
+            // Detach only: keep payload alive until the CQE. We do not submit
+            // AsyncCancel here; cancellation is reserved for driver Drop.
             State::Submitted | State::Waiting(..) => {
                 *state = State::Ignored(Box::new(op.take_data()));
             }

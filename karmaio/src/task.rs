@@ -1,11 +1,9 @@
 use std::{future::Future, marker::PhantomData, ptr::NonNull};
 
 use header::Header;
+use raw::RawTask;
 
-use crate::{
-    runtime::Schedule,
-    task::{join::JoinHandle, raw::RawTask},
-};
+use crate::runtime::Schedule;
 
 pub(crate) mod header;
 pub(crate) mod internal;
@@ -16,6 +14,9 @@ pub(crate) mod trailer;
 mod utils;
 mod vtable;
 pub(crate) mod waker;
+
+// Public task API (re-exported from `runtime` / crate root as needed).
+pub use join::{JoinError, JoinHandle};
 
 #[repr(transparent)]
 pub(crate) struct Task<S: Schedule> {

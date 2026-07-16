@@ -33,6 +33,26 @@ pub(crate) mod write;
 pub(crate) mod write_at;
 pub(crate) mod writev;
 
+// Lifecycle of a single I/O operation tracked by the driver.
+//
+// # Drop / cancellation semantics
+//
+// Dropping an [`Op`] future means the *caller* no longer wants the result
+// (**detach**), not that the kernel work is necessarily cancelled:
+//
+// * **io_uring**: the SQE stays in flight until its CQE arrives. Op payload
+//   (buffers, paths, …) is moved into `Ignored` so the kernel still has valid
+//   memory. `IORING_OP_ASYNC_CANCEL` is only submitted on *driver* shutdown,
+//   not on individual `Op` drop.
+// * **IOCP**: `CancelIoEx` is requested; the OVERLAPPED and payload stay alive
+//   until the completion packet is dequeued.
+// * **kqueue**: registered interest is `EV_DELETE`d synchronously. Blocking-
+//   pool jobs cannot be cancelled mid-flight; the slot stays until the worker
+//   finishes.
+//
+// Callers that need stronger cancel guarantees (e.g. releasing an FD promptly)
+// should close the resource or wait for the op to complete rather than only
+// dropping the future.
 pub(crate) enum State {
     // The operation has been submitted to the driver and is currently in-flight
     Submitted,
@@ -55,6 +75,9 @@ pub(crate) enum State {
     Completed(Completion),
 }
 
+/// A single in-flight driver operation, polled as a future.
+///
+/// See [`State`] for drop / detach semantics.
 pub(crate) struct Op<T: 'static> {
     driver: Handle,
     index: usize,
@@ -146,7 +169,12 @@ impl<T: Unpin + Operable> Future for Op<T> {
 
 impl<T: 'static> Drop for Op<T> {
     fn drop(&mut self) {
-        self.driver.upgrade().expect("Not in runtime context").remove_op(self);
+        // If the runtime/driver is already gone, in-flight work was cancelled
+        // or drained by backend `Drop`. Detach quietly instead of panicking
+        // during teardown (e.g. orphaned tasks after `Runtime` drop).
+        if let Some(driver) = self.driver.upgrade() {
+            driver.remove_op(self);
+        }
     }
 }
 

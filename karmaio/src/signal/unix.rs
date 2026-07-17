@@ -257,7 +257,7 @@ impl Future for CtrlC {
 ///
 /// ```no_run
 /// # async fn run() -> std::io::Result<()> {
-/// karmaio::signal::ctrl_c().await?;
+/// karmaio::signal::ctrl_c()?.await?;
 /// # Ok(())
 /// # }
 /// ```

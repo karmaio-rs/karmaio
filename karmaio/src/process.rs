@@ -106,7 +106,7 @@ mod tests {
             // Close stdin so `cat` observes EOF and flushes its output.
             stdin.shutdown().await.expect("shutdown stdin");
 
-            let mut buf = Box::new([0u8; 5]);
+            let buf = Box::new([0u8; 5]);
             let (res, buf) = stdout.read_exact(buf).await;
             res.expect("read from cat");
             assert_eq!(&*buf, b"hello");

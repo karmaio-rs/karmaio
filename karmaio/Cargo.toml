@@ -15,13 +15,39 @@ keywords = ["io", "thread-per-core", "iouring", "async", "futures"]
 rust-version = "1.90"
 edition = "2024"
 
+[features]
+# Include nothing by default. Opt into subsystems you need, or enable `full` for the complete public API.
+default = []
+
+# Enable every optional subsystem.
+full = ["fs", "macros", "net", "process", "signal"]
+
+# Asynchronous filesystem APIs (`karmaio::fs`) and path/file driver ops.
+# On Windows, pulls in file-system Win32 APIs used by open/stat/path ops.
+fs = ["windows-sys/Win32_Storage_FileSystem", "windows-sys/Win32_Security"]
+
+# karmaio helper macros.
+macros = ["dep:karmaio-macros"]
+
+# TCP / UDP / Unix socket APIs (`karmaio::net`) and socket driver ops.
+# Enables the `socket2` dependency.
+net = ["dep:socket2"]
+
+# Child process APIs (`karmaio::process`), stdio pipe I/O, and process-wait ops.
+# On Windows, pipe read/write use the same file Win32 APIs as `fs`.
+process = ["windows-sys/Win32_Storage_FileSystem"]
+
+# OS signal / Ctrl-C handling (`karmaio::signal`).
+# On Windows, enables console control handler APIs.
+signal = ["windows-sys/Win32_System_Console"]
+
 # Core dependencies. Cross Platform
 [dependencies]
-socket2 = { version = "0.6", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"], optional = true }
 slab = "0.4"
 
-# Macro support: #[karmaio::main] / #[karmaio::test] attribute macros.
-karmaio-macros = { path = "../karmaio-macros", version = "0.1.0" }
+# Internal package dependeices for redistribution
+karmaio-macros = { path = "../karmaio-macros", version = "0.1.0", optional = true }
 
 # Unix platform dependencies
 [target.'cfg(unix)'.dependencies]
@@ -32,5 +58,25 @@ libc = "0.2"
 io-uring = "0.7"
 
 # Windows platform dependencies
+# Core IOCP / foundation features always enabled; Storage / Console / Security
+# are activated by the `fs`, `process`, and `signal` crate features above.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_IO", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+] }
+
+[[test]]
+name = "test_attr"
+required-features = ["macros"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+    "aarch64-apple-darwin",
+]

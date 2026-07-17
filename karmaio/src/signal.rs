@@ -13,7 +13,7 @@
 //!
 //! ```no_run
 //! # async fn run() -> std::io::Result<()> {
-//! karmaio::signal::ctrl_c().await?;
+//! karmaio::signal::ctrl_c()?.await?;
 //! println!("received ctrl-c");
 //! # Ok(())
 //! # }

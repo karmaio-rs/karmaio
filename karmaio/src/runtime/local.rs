@@ -648,6 +648,7 @@ mod tests {
     }
 
     /// Path FS ops use `Submission::Blocking` on macOS/Windows (pool offload).
+    #[cfg(feature = "fs")]
     #[test]
     fn blocking_submission_create_and_remove_dir() {
         use std::time::{SystemTime, UNIX_EPOCH};

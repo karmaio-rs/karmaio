@@ -5,40 +5,57 @@ publish = false
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
+[features]
+default = ["full"]
+full = ["fs", "macros", "net", "process", "signal"]
+fs = ["karmaio/fs"]
+macros = ["karmaio/macros"]
+net = ["karmaio/net"]
+process = ["karmaio/process"]
+signal = ["karmaio/signal"]
+
 [dependencies]
-karmaio = { path = "../karmaio" }
+karmaio = { path = "../karmaio", default-features = false }
 
 [[example]]
 name = "hello_world"
 path = "hello_world.rs"
+required-features = ["macros", "net"]
 
 [[example]]
 name = "echo_tcp"
 path = "echo_tcp.rs"
+required-features = ["macros", "net"]
 
 [[example]]
 name = "udp_echo"
 path = "udp_echo.rs"
+required-features = ["macros", "net"]
 
 [[example]]
 name = "udp_client"
 path = "udp_client.rs"
+required-features = ["macros", "net"]
 
 [[example]]
 name = "file_operations"
 path = "file_operations.rs"
+required-features = ["fs", "macros"]
 
 [[example]]
 name = "timer"
 path = "timer.rs"
+required-features = ["macros"]
 
 [[example]]
 name = "process"
 path = "process.rs"
+required-features = ["macros", "process"]
 
 [[example]]
 name = "signal"
 path = "signal.rs"
+required-features = ["macros", "signal"]
 
 [[example]]
 name = "runtime_builder"

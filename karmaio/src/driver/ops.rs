@@ -5,33 +5,65 @@ use std::{
 
 use crate::driver::{Handle, Submission};
 
-pub(crate) mod accept;
+// Always available: every `SharedIoHandle` path closes through the driver.
 pub(crate) mod close;
-pub(crate) mod connect;
+
+// Filesystem ops (`feature = "fs"`).
+#[cfg(feature = "fs")]
 pub(crate) mod create_dir;
+#[cfg(feature = "fs")]
 pub(crate) mod hardlink;
+#[cfg(feature = "fs")]
 pub(crate) mod open;
-pub(crate) mod read;
+#[cfg(feature = "fs")]
 pub(crate) mod read_at;
+#[cfg(feature = "fs")]
 pub(crate) mod readv;
-pub(crate) mod recv;
-pub(crate) mod recv_from;
-pub(crate) mod recvmsg;
+#[cfg(feature = "fs")]
 pub(crate) mod rename;
-pub(crate) mod send;
-pub(crate) mod send_to;
-pub(crate) mod sendmsg;
+#[cfg(feature = "fs")]
 pub(crate) mod set_permissions;
+#[cfg(feature = "fs")]
 pub(crate) mod stat;
+#[cfg(feature = "fs")]
 pub(crate) mod symlink;
+#[cfg(feature = "fs")]
 pub(crate) mod sync;
+#[cfg(feature = "fs")]
 pub(crate) mod truncate;
+#[cfg(feature = "fs")]
 pub(crate) mod unlink;
-#[cfg(target_os = "linux")]
-pub(crate) mod wait_process;
-pub(crate) mod write;
+#[cfg(feature = "fs")]
 pub(crate) mod write_at;
+#[cfg(feature = "fs")]
 pub(crate) mod writev;
+
+// Network ops (`feature = "net"`).
+#[cfg(feature = "net")]
+pub(crate) mod accept;
+#[cfg(feature = "net")]
+pub(crate) mod connect;
+#[cfg(feature = "net")]
+pub(crate) mod recv;
+#[cfg(feature = "net")]
+pub(crate) mod recv_from;
+#[cfg(feature = "net")]
+pub(crate) mod recvmsg;
+#[cfg(feature = "net")]
+pub(crate) mod send;
+#[cfg(feature = "net")]
+pub(crate) mod send_to;
+#[cfg(feature = "net")]
+pub(crate) mod sendmsg;
+
+// Process / pipe stream ops (`feature = "process"`).
+// Offset-less read/write are used by child stdio pipes (not seekable).
+#[cfg(feature = "process")]
+pub(crate) mod read;
+#[cfg(all(feature = "process", target_os = "linux"))]
+pub(crate) mod wait_process;
+#[cfg(feature = "process")]
+pub(crate) mod write;
 
 // Lifecycle of a single I/O operation tracked by the driver.
 //

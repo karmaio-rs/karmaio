@@ -280,7 +280,9 @@ impl DriverBackend for KqueueBackend {
                 std::ptr::null(),
                 0,
                 self.events.as_mut_ptr(),
-                self.events.len() as i32,
+                // Use capacity, not len. `dispatch_completions` clears the vec (len = 0) after each round;
+                // kevent with nevents=0 returns immediately and would busy-spin.
+                self.events.capacity() as i32,
                 std::ptr::null(), // infinite timeout
             )
         };
@@ -310,7 +312,9 @@ impl DriverBackend for KqueueBackend {
                 std::ptr::null(),
                 0,
                 self.events.as_mut_ptr(),
-                self.events.len() as i32,
+                // Use capacity, not len. `dispatch_completions` clears the vec (len = 0) after each round;
+                // kevent with nevents=0 returns immediately and would busy-spin.
+                self.events.capacity() as i32,
                 &timeout,
             )
         };

@@ -20,29 +20,6 @@
 //! null. Scoped thread local storage is useful when a value is present for a known
 //! period of time and it is not required to relinquish ownership of the
 //! contents.
-//!
-//! # Examples
-//!
-//! ```
-//! use karmaio::scoped_thread_local;
-//!
-//! scoped_thread_local!(static FOO: u32);
-//!
-//! # fn main() {
-//! // Initially each scoped slot is empty.
-//! assert!(!FOO.is_set());
-//!
-//! // When inserting a value, the value is only in place for the duration
-//! // of the closure specified.
-//! FOO.set(&1, || {
-//!     FOO.with(|slot| {
-//!         assert_eq!(*slot, 1);
-//!     });
-//! });
-//! # }
-//! ```
-
-#![deny(missing_docs, warnings)]
 
 use std::{cell::Cell, marker, thread::LocalKey};
 
@@ -68,7 +45,7 @@ macro_rules! scoped_thread_local {
 /// type `T` scoped to a particular lifetime. Keys provides two methods, `set`
 /// and `with`, both of which currently use closures to control the scope of
 /// their contents.
-pub struct ScopedKey<T> {
+pub(crate) struct ScopedKey<T> {
     inner: &'static LocalKey<Cell<*const ()>>,
     _marker: marker::PhantomData<T>,
 }
@@ -94,30 +71,6 @@ impl<T> ScopedKey<T> {
     ///
     /// Upon return, this function will restore the previous value, if any
     /// was available.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use karmaio::scoped_thread_local;
-    ///
-    /// scoped_thread_local!(static FOO: u32);
-    ///
-    /// # fn main() {
-    /// FOO.set(&100, || {
-    ///     let val = FOO.with(|v| *v);
-    ///     assert_eq!(val, 100);
-    ///
-    ///     // set can be called recursively
-    ///     FOO.set(&101, || {
-    ///         // ...
-    ///     });
-    ///
-    ///     // Recursive calls restore the previous value.
-    ///     let val = FOO.with(|v| *v);
-    ///     assert_eq!(val, 100);
-    /// });
-    /// # }
-    /// ```
     pub fn set<F, R>(&'static self, t: &T, f: F) -> R
     where
         F: FnOnce() -> R,
@@ -151,21 +104,6 @@ impl<T> ScopedKey<T> {
     /// # Panics
     ///
     /// This function will panic if `set` has not previously been called.
-    ///
-    /// # Examples
-    ///
-    /// ```no_run
-    /// use karmaio::scoped_thread_local;
-    ///
-    /// scoped_thread_local!(static FOO: u32);
-    ///
-    /// # fn main() {
-    /// FOO.with(|slot| {
-    ///     // work with `slot`
-    /// # drop(slot);
-    /// });
-    /// # }
-    /// ```
     pub fn with<F, R>(&'static self, f: F) -> R
     where
         F: FnOnce(&T) -> R,

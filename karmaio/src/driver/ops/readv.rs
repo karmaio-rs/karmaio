@@ -90,13 +90,14 @@ impl<B: BoundedIoBufMut> Submittable for Readv<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBufMut> Submittable for Readv<B> {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            macos_syscall!(libc::preadv(
-                self.io_handle.raw_fd(),
-                self.iovs.as_ptr() as *const libc::iovec,
-                self.iovs.len() as i32,
-                self.offset as i64,
-            ))
+        // Same rationale as ReadAt: kqueue is useless for regular files and
+        // preadv may block. Keep iovecs/buffers alive in the Op while the pool runs.
+        let fd = self.io_handle.raw_fd();
+        let iovs = self.iovs.as_ptr() as usize;
+        let iovcnt = self.iovs.len() as i32;
+        let offset = self.offset as i64;
+        macos_syscall_blocking!({
+            macos_syscall!(libc::preadv(fd, iovs as *const libc::iovec, iovcnt, offset))
         })
     }
 }

@@ -54,16 +54,16 @@ impl<B: BoundedIoBufMut> Submittable for ReadAt<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBufMut> Submittable for ReadAt<B> {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            let ptr = self.buf.stable_write_ptr();
-            let len = self.buf.bytes_total();
-
-            macos_syscall!(libc::pread(
-                self.io_handle.raw_fd(),
-                ptr as *mut libc::c_void,
-                len,
-                self.offset as i64,
-            ))
+        // Regular files always report ready under kqueue, and pread can block on
+        // disk I/O — offload to the blocking pool so the runtime thread stays free.
+        // Buffer pointers remain valid: the Op (and its buffers) stay alive until
+        // the pool job completes and `complete` runs.
+        let fd = self.io_handle.raw_fd();
+        let ptr = self.buf.stable_write_ptr() as usize;
+        let len = self.buf.bytes_total();
+        let offset = self.offset as i64;
+        macos_syscall_blocking!({
+            macos_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset))
         })
     }
 }

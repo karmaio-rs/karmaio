@@ -55,16 +55,16 @@ impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
-            let ptr = self.buf.stable_read_ptr();
-            let len = self.buf.bytes_init();
-
-            macos_syscall!(libc::pwrite(
-                self.io_handle.raw_fd(),
-                ptr as *const libc::c_void,
-                len,
-                self.offset as i64,
-            ))
+        // Regular files always report ready under kqueue, and pwrite can block on
+        // disk I/O — offload to the blocking pool so the runtime thread stays free.
+        // Buffer pointers remain valid: the Op (and its buffers) stay alive until
+        // the pool job completes and `complete` runs.
+        let fd = self.io_handle.raw_fd();
+        let ptr = self.buf.stable_read_ptr() as usize;
+        let len = self.buf.bytes_init();
+        let offset = self.offset as i64;
+        macos_syscall_blocking!({
+            macos_syscall!(libc::pwrite(fd, ptr as *const libc::c_void, len, offset))
         })
     }
 }

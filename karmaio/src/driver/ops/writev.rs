@@ -90,13 +90,14 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
 #[cfg(target_os = "macos")]
 impl<B: BoundedIoBuf> Submittable for Writev<B> {
     fn submit(&mut self) -> Submission {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
-            macos_syscall!(libc::pwritev(
-                self.io_handle.raw_fd(),
-                self.iovs.as_ptr() as *const libc::iovec,
-                self.iovs.len() as i32,
-                self.offset as i64,
-            ))
+        // Same rationale as WriteAt: kqueue is useless for regular files and
+        // pwritev may block. Keep iovecs/buffers alive in the Op while the pool runs.
+        let fd = self.io_handle.raw_fd();
+        let iovs = self.iovs.as_ptr() as usize;
+        let iovcnt = self.iovs.len() as i32;
+        let offset = self.offset as i64;
+        macos_syscall_blocking!({
+            macos_syscall!(libc::pwritev(fd, iovs as *const libc::iovec, iovcnt, offset))
         })
     }
 }

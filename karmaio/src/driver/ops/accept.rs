@@ -61,7 +61,7 @@ impl Submittable for Accept {
             &mut self.socketaddr.0 as *mut _ as *mut _,
             &mut self.socketaddr.1,
         )
-        .flags(libc::O_CLOEXEC)
+        .flags(libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK)
         .build()
     }
 }
@@ -133,6 +133,8 @@ impl Completable for Accept {
         let io_handle = unsafe { SharedIoHandle::from_raw_fd(raw_fd as i32) };
         let socket = Socket::from(io_handle);
 
+        let _ = socket.set_async_flags();
+
         let (_, addr) = unsafe {
             socket2::SockAddr::try_init(move |addr_storage, len| {
                 let storage = &mut *addr_storage;
@@ -203,6 +205,8 @@ impl Completable for Accept {
         let accepted_socket = self.accepted_socket.take().expect("missing accepted socket");
         let io_handle = unsafe { SharedIoHandle::from_raw_socket(accepted_socket) };
         let socket = Socket::from(io_handle);
+
+        let _ = socket.set_async_flags();
 
         Ok((socket, addr.as_socket()))
     }

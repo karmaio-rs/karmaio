@@ -34,6 +34,9 @@ impl UnixSocket {
     /// Creates a new Unix domain stream socket.
     pub fn new() -> std::io::Result<Self> {
         let inner = Socket::new_unix(libc::SOCK_STREAM)?;
+
+        inner.set_async_flags()?;
+
         Ok(Self { inner })
     }
 
@@ -44,6 +47,9 @@ impl UnixSocket {
         let addr = SockAddr::unix(path)?;
         let sock_ref = socket2::SockRef::from(&self.inner);
         sock_ref.bind(&addr)?;
+
+        self.inner.set_async_flags()?;
+
         Ok(self)
     }
 

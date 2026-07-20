@@ -44,10 +44,11 @@ impl TcpSocket {
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
         )?;
-        socket.set_nonblocking(true)?;
-        #[cfg(target_os = "macos")]
-        socket.set_nosigpipe(true)?;
+
         let inner = Socket::from(socket);
+
+        inner.set_async_flags()?;
+
         Ok(Self { inner })
     }
 
@@ -58,10 +59,11 @@ impl TcpSocket {
             socket2::Type::STREAM,
             Some(socket2::Protocol::TCP),
         )?;
-        socket.set_nonblocking(true)?;
-        #[cfg(target_os = "macos")]
-        socket.set_nosigpipe(true)?;
+
         let inner = Socket::from(socket);
+
+        inner.set_async_flags()?;
+
         Ok(Self { inner })
     }
 

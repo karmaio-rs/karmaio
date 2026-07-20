@@ -39,6 +39,8 @@ impl UdpSocket {
     /// or an [`io::Error`](std::io::Error) on failure.
     pub async fn bind(socket_addr: SocketAddr) -> std::io::Result<UdpSocket> {
         let socket = Socket::bind(socket_addr, socket2::Type::DGRAM)?;
+        socket.set_async_flags()?;
+
         Ok(UdpSocket { inner: socket })
     }
 

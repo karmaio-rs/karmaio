@@ -21,15 +21,32 @@ pub(crate) struct Socket {
 }
 
 impl Socket {
+    pub(crate) fn set_async_flags(&self) -> Result<()> {
+        let socket = socket2::SockRef::from(self);
+
+        socket.set_nonblocking(true)?;
+        #[cfg(target_os = "macos")]
+        {
+            socket.set_cloexec(true)?;
+            // This will not crash the entire program when writing to a closed socket
+            socket.set_nosigpipe(true)?;
+        }
+
+        Ok(())
+    }
+
     /// Creates a new network socket (TCP/UDP)
     pub(crate) fn new(socket_addr: SocketAddr, socket_type: socket2::Type) -> Result<Self> {
         let socket = socket2::Socket::new(socket2::Domain::for_address(socket_addr), socket_type, None)?;
 
         socket.set_nonblocking(true)?;
-
         // This will not crash the entire program when writing to a closed socket
         #[cfg(target_os = "macos")]
-        socket.set_nosigpipe(true)?;
+        {
+            socket.set_cloexec(true)?;
+            // This will not crash the entire program when writing to a closed socket
+            socket.set_nosigpipe(true)?;
+        }
 
         let handle = Self::shared_handle_from_socket(socket)?;
 
@@ -42,10 +59,12 @@ impl Socket {
         let socket = socket2::Socket::new(socket2::Domain::UNIX, socket_type.into(), None)?;
 
         socket.set_nonblocking(true)?;
-
-        // This will not crash the entire program when writing to a closed socket
         #[cfg(target_os = "macos")]
-        socket.set_nosigpipe(true)?;
+        {
+            socket.set_cloexec(true)?;
+            // This will not crash the entire program when writing to a closed socket
+            socket.set_nosigpipe(true)?;
+        }
 
         let handle = Self::shared_handle_from_socket(socket)?;
 
@@ -78,11 +97,14 @@ impl Socket {
         socket.set_reuse_address(true)?;
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
-        socket.set_nonblocking(true)?;
 
-        // This will not crash the entire program when writing to a closed socket
+        socket.set_nonblocking(true)?;
         #[cfg(target_os = "macos")]
-        socket.set_nosigpipe(true)?;
+        {
+            socket.set_cloexec(true)?;
+            // This will not crash the entire program when writing to a closed socket
+            socket.set_nosigpipe(true)?;
+        }
 
         socket.bind(&socket_addr)?;
 

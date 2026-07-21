@@ -13,7 +13,7 @@ use crate::{
 pub(crate) struct Writev<B: BoundedIoBuf> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<std::fs::File>,
 
     // Reference to the in-flight buffers.
     pub(crate) bufs: Vec<B>,
@@ -32,7 +32,11 @@ pub(crate) struct Writev<B: BoundedIoBuf> {
 }
 
 impl<B: BoundedIoBuf> Op<Writev<B>> {
-    pub(crate) fn writev(io_handle: &SharedIoHandle, bufs: Vec<B>, offset: u64) -> io::Result<Op<Writev<B>>> {
+    pub(crate) fn writev(
+        io_handle: &SharedIoHandle<std::fs::File>,
+        bufs: Vec<B>,
+        offset: u64,
+    ) -> io::Result<Op<Writev<B>>> {
         #[cfg(unix)]
         let iovs: Vec<libc::iovec> = bufs
             .iter()
@@ -96,9 +100,7 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
         let iovs = self.iovs.as_ptr() as usize;
         let iovcnt = self.iovs.len() as i32;
         let offset = self.offset as i64;
-        macos_syscall_blocking!({
-            macos_syscall!(libc::pwritev(fd, iovs as *const libc::iovec, iovcnt, offset))
-        })
+        macos_syscall_blocking!({ macos_syscall!(libc::pwritev(fd, iovs as *const libc::iovec, iovcnt, offset)) })
     }
 }
 
@@ -106,39 +108,27 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
 impl<B: BoundedIoBuf> Submittable for Writev<B> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use crate::driver::helpers::io_handle::OsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::WriteFileGather;
 
         let total_bytes: u32 = self.bufs.iter().map(|b| b.bytes_init() as u32).sum();
+        let handle = self.io_handle.raw_handle();
+        let mut interest = Interest::new(handle as _);
 
-        match self.io_handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => {
-                let mut interest = Interest::new(handle as _);
-
-                unsafe {
-                    let overlapped = &mut *interest.as_mut_ptr();
-                    overlapped.Anonymous.Anonymous.Offset = (self.offset & 0xFFFF_FFFF) as u32;
-                    overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
-                }
-
-                windows_syscall_submit_overlapped!(interest, file, {
-                    WriteFileGather(
-                        handle as _,
-                        self.segments.as_ptr(),
-                        total_bytes,
-                        std::ptr::null(),
-                        interest.as_mut_ptr(),
-                    )
-                })
-            }
-            OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "WriteFileGather requires a file handle",
-                )),
-                flags: 0,
-            }),
+        unsafe {
+            let overlapped = &mut *interest.as_mut_ptr();
+            overlapped.Anonymous.Anonymous.Offset = (self.offset & 0xFFFF_FFFF) as u32;
+            overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
         }
+
+        windows_syscall_submit_overlapped!(interest, file, {
+            WriteFileGather(
+                handle as _,
+                self.segments.as_ptr(),
+                total_bytes,
+                std::ptr::null(),
+                interest.as_mut_ptr(),
+            )
+        })
     }
 }
 

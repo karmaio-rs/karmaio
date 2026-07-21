@@ -1,4 +1,3 @@
-use std::os::fd::AsRawFd;
 use std::path::Path;
 
 use socket2::SockAddr;
@@ -48,22 +47,20 @@ impl UnixStream {
 
     /// Returns the socket address of the local half of this Unix connection.
     pub fn local_addr(&self) -> std::io::Result<std::os::unix::net::SocketAddr> {
-        use std::os::fd::FromRawFd;
-        let fd = self.inner.as_raw_fd();
-        let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        let addr = s.local_addr();
-        std::mem::forget(s);
-        addr
+        self.inner
+            .handle
+            .local_addr()?
+            .as_unix()
+            .ok_or_else(|| std::io::Error::other("Could not get socket path"))
     }
 
     /// Returns the socket address of the remote half of this Unix connection.
     pub fn peer_addr(&self) -> std::io::Result<std::os::unix::net::SocketAddr> {
-        use std::os::fd::FromRawFd;
-        let fd = self.inner.as_raw_fd();
-        let s = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
-        let addr = s.peer_addr();
-        std::mem::forget(s);
-        addr
+        self.inner
+            .handle
+            .peer_addr()?
+            .as_unix()
+            .ok_or_else(|| std::io::Error::other("Could not get peer path"))
     }
 
     /// Splits a [`TcpStream`] into a read half and a write half, which can be

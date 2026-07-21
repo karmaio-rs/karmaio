@@ -5,7 +5,7 @@ use std::{
 
 use crate::driver::{Handle, Submission};
 
-// Always available: every `SharedIoHandle` path closes through the driver.
+// Always available: every `SharedIoHandle<T>` path closes through the driver.
 pub(crate) mod close;
 
 // Filesystem ops (`feature = "fs"`).

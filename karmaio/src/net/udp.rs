@@ -7,7 +7,7 @@ use socket2::SockAddr;
 
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
-    driver::helpers::{io_handle::SharedIoHandle, socket::Socket},
+    driver::helpers::socket::Socket,
 };
 
 #[cfg(windows)]
@@ -54,33 +54,12 @@ impl UdpSocket {
     /// Returns the local address to which this UDP socket is bound.
     ///
     /// This can be useful, for example, when binding to port 0 to figure out which port was actually bound.
-    #[cfg(unix)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        let fd = self.inner.as_raw_fd();
-        // SAFETY: Our fd is the handle the kernel has given us for a UdpSocket.
-        // Create a std::net::UdpSocket long enough to call its local_addr method
-        // and then forget it so the socket is not closed here.
-        let s = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
-        let local_addr = s.local_addr();
-        std::mem::forget(s);
-        local_addr
-    }
-
-    /// Returns the local address to which this UDP socket is bound.
-    ///
-    /// This can be useful, for example, when binding to port 0 to figure out which port was actually bound.
-    #[cfg(windows)]
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::windows::io::{AsRawSocket, FromRawSocket};
-
-        let handle = self.inner.as_raw_socket();
-        // SAFETY: Our handle is the handle the kernel has given us for a UdpSocket.
-        // Create a std::net::UdpSocket long enough to call its local_addr method
-        // and then forget it so the socket is not closed here.
-        let s = unsafe { std::net::UdpSocket::from_raw_socket(handle) };
-        let local_addr = s.local_addr();
-        std::mem::forget(s);
-        local_addr
+        self.inner
+            .handle
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| std::io::Error::other("Could not get socket IP address"))
     }
 
     /// "Connects" this UDP socket to a remote address.
@@ -160,7 +139,8 @@ impl UdpSocket {
 #[cfg(unix)]
 impl FromRawFd for UdpSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        UdpSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
+        // Safety: caller guarantees `fd` is an open UDP socket.
+        UdpSocket::from(unsafe { Socket::from_raw_fd(fd) })
     }
 }
 
@@ -174,7 +154,8 @@ impl AsRawFd for UdpSocket {
 #[cfg(windows)]
 impl FromRawSocket for UdpSocket {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        UdpSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
+        // Safety: caller guarantees `socket` is an open UDP socket.
+        UdpSocket::from(unsafe { Socket::from_raw_socket(socket) })
     }
 }
 

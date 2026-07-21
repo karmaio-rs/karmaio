@@ -1,7 +1,5 @@
 use std::io;
 
-#[cfg(windows)]
-use crate::driver::helpers::io_handle::OsRawHandle;
 use crate::{
     driver::{
         Submission,
@@ -12,12 +10,12 @@ use crate::{
 };
 
 pub(crate) struct Truncate {
-    handle: SharedIoHandle,
+    handle: SharedIoHandle<std::fs::File>,
     size: u64,
 }
 
 impl Op<Truncate> {
-    pub(crate) fn truncate(handle: &SharedIoHandle, size: u64) -> io::Result<Op<Truncate>> {
+    pub(crate) fn truncate(handle: &SharedIoHandle<std::fs::File>, size: u64) -> io::Result<Op<Truncate>> {
         let data = Truncate {
             handle: handle.clone(),
             size,
@@ -52,31 +50,23 @@ impl Submittable for Truncate {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::{SetEndOfFile, SetFilePointerEx};
 
-        match self.handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => {
-                let handle = handle as isize;
-                let distance_to_move: i64 = self.size as i64;
+        let handle = self.handle.raw_handle() as isize;
+        let distance_to_move: i64 = self.size as i64;
 
-                windows_syscall_blocking!({
-                    let mut new_file_pointer: i64 = 0;
-                    match windows_syscall!(BOOL, {
-                        SetFilePointerEx(
-                            handle as _,
-                            distance_to_move,
-                            &mut new_file_pointer,
-                            windows_sys::Win32::Storage::FileSystem::FILE_BEGIN,
-                        )
-                    }) {
-                        Ok(_) => windows_syscall!(BOOL, SetEndOfFile(handle as _)),
-                        Err(err) => Err(err),
-                    }
-                })
+        windows_syscall_blocking!({
+            let mut new_file_pointer: i64 = 0;
+            match windows_syscall!(BOOL, {
+                SetFilePointerEx(
+                    handle as _,
+                    distance_to_move,
+                    &mut new_file_pointer,
+                    windows_sys::Win32::Storage::FileSystem::FILE_BEGIN,
+                )
+            }) {
+                Ok(_) => windows_syscall!(BOOL, SetEndOfFile(handle as _)),
+                Err(err) => Err(err),
             }
-            OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(io::Error::new(io::ErrorKind::Unsupported, "cannot truncate a socket")),
-                flags: 0,
-            }),
-        }
+        })
     }
 }
 

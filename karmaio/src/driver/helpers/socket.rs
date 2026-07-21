@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 use std::{io::Result, os::raw::c_int};
 
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, OwnedSocket, RawSocket};
+use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket};
 
 use crate::buf::{BoundedIoBuf, BoundedIoBufMut, BufResult};
 use crate::driver::helpers::io_handle::SharedIoHandle;
@@ -13,23 +13,23 @@ use crate::driver::ops::Op;
 
 // This is an internal wrapper around socket operations for the runtime.
 // This wrapper abstracts and handles all the driver operations and os compatiblity,
-// presenting a clean, reusable api for the top level socket modules
+// presenting a clean, reusable api for the top level socket modules.
+//
+// The owned resource is a `socket2::Socket` so control-plane APIs (listen, nodelay,
+// etc.) go through `SharedIoHandle`/`Deref` without reconverting through raw FDs.
 #[derive(Clone)]
 pub(crate) struct Socket {
-    // Open file descriptor
-    pub(crate) handle: SharedIoHandle,
+    pub(crate) handle: SharedIoHandle<socket2::Socket>,
 }
 
 impl Socket {
     pub(crate) fn set_async_flags(&self) -> Result<()> {
-        let socket = socket2::SockRef::from(self);
-
-        socket.set_nonblocking(true)?;
+        self.handle.set_nonblocking(true)?;
         #[cfg(target_os = "macos")]
         {
-            socket.set_cloexec(true)?;
+            self.handle.set_cloexec(true)?;
             // This will not crash the entire program when writing to a closed socket
-            socket.set_nosigpipe(true)?;
+            self.handle.set_nosigpipe(true)?;
         }
 
         Ok(())
@@ -40,7 +40,6 @@ impl Socket {
         let socket = socket2::Socket::new(socket2::Domain::for_address(socket_addr), socket_type, None)?;
 
         socket.set_nonblocking(true)?;
-        // This will not crash the entire program when writing to a closed socket
         #[cfg(target_os = "macos")]
         {
             socket.set_cloexec(true)?;
@@ -48,9 +47,9 @@ impl Socket {
             socket.set_nosigpipe(true)?;
         }
 
-        let handle = Self::shared_handle_from_socket(socket)?;
-
-        Ok(Self { handle })
+        Ok(Self {
+            handle: SharedIoHandle::new(socket),
+        })
     }
 
     /// Creates a new UNIX socket
@@ -66,9 +65,9 @@ impl Socket {
             socket.set_nosigpipe(true)?;
         }
 
-        let handle = Self::shared_handle_from_socket(socket)?;
-
-        Ok(Self { handle })
+        Ok(Self {
+            handle: SharedIoHandle::new(socket),
+        })
     }
 
     /// Binds a socket to the specified address.
@@ -108,9 +107,9 @@ impl Socket {
 
         socket.bind(&socket_addr)?;
 
-        let handle = Self::shared_handle_from_socket(socket)?;
-
-        Ok(Self { handle })
+        Ok(Self {
+            handle: SharedIoHandle::new(socket),
+        })
     }
 
     // ================================
@@ -135,16 +134,14 @@ impl Socket {
 
     /// Begins listening for incoming connections.
     pub(crate) fn listen(&self, backlog: c_int) -> Result<()> {
-        let socket = socket2::SockRef::from(self);
-        socket.listen(backlog)
+        self.handle.listen(backlog)
     }
 
     /// Shuts down the read, write, or both halves of this connection.
     ///
     /// This function will cause all pending and future I/O on the specified portions to return immediately with an appropriate value.
     pub fn shutdown(&self, how: std::net::Shutdown) -> Result<()> {
-        let socket_ref = socket2::SockRef::from(self);
-        socket_ref.shutdown(how)
+        self.handle.shutdown(how)
     }
 
     /// Closes the socket, waiting for in-flight operations to complete.
@@ -161,8 +158,7 @@ impl Socket {
     /// This means that segments are always sent as soon as possible, even if there is only a small amount of data.
     /// When not set, data is buffered until there is a sufficient amount to send out, thereby avoiding the frequent sending of small packets.
     pub fn set_nodelay(&self, nodelay: bool) -> Result<()> {
-        let socket_ref = socket2::SockRef::from(self);
-        socket_ref.set_tcp_nodelay(nodelay)
+        self.handle.set_tcp_nodelay(nodelay)
     }
 
     // ================================
@@ -214,16 +210,6 @@ impl Socket {
         let op = Op::sendmsg(&self.handle, io_slices, control, socket_addr).unwrap();
         op.await
     }
-
-    #[cfg(unix)]
-    fn shared_handle_from_socket(socket: socket2::Socket) -> Result<SharedIoHandle> {
-        Ok(SharedIoHandle::new(OwnedFd::from(socket)))
-    }
-
-    #[cfg(windows)]
-    fn shared_handle_from_socket(socket: socket2::Socket) -> Result<SharedIoHandle> {
-        Ok(SharedIoHandle::new_socket(OwnedSocket::from(socket)))
-    }
 }
 
 #[cfg(unix)]
@@ -256,92 +242,102 @@ impl AsRawSocket for Socket {
     }
 }
 
-impl From<SharedIoHandle> for Socket {
-    fn from(value: SharedIoHandle) -> Self {
+impl From<SharedIoHandle<socket2::Socket>> for Socket {
+    fn from(value: SharedIoHandle<socket2::Socket>) -> Self {
         Self { handle: value }
+    }
+}
+
+impl From<socket2::Socket> for Socket {
+    fn from(socket: socket2::Socket) -> Self {
+        Self {
+            handle: SharedIoHandle::new(socket),
+        }
     }
 }
 
 #[cfg(unix)]
 impl From<OwnedFd> for Socket {
     fn from(fd: OwnedFd) -> Self {
-        Self::from(SharedIoHandle::new(fd))
+        Self::from(socket2::Socket::from(fd))
     }
 }
 
 #[cfg(windows)]
 impl From<OwnedSocket> for Socket {
     fn from(socket: OwnedSocket) -> Self {
-        Self::from(SharedIoHandle::new_socket(socket))
+        Self::from(socket2::Socket::from(socket))
+    }
+}
+
+#[cfg(unix)]
+impl FromRawFd for Socket {
+    unsafe fn from_raw_fd(fd: RawFd) -> Self {
+        // Safety: caller guarantees `fd` is an open socket; ownership transfers here.
+        Self::from(unsafe { socket2::Socket::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(windows)]
+impl FromRawSocket for Socket {
+    unsafe fn from_raw_socket(socket: RawSocket) -> Self {
+        // Safety: caller guarantees `socket` is open; ownership transfers here.
+        Self::from(unsafe { socket2::Socket::from_raw_socket(socket) })
     }
 }
 
 #[cfg(unix)]
 impl From<std::net::TcpStream> for Socket {
     fn from(socket: std::net::TcpStream) -> Self {
-        Self::from(OwnedFd::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(windows)]
 impl From<std::net::TcpStream> for Socket {
     fn from(socket: std::net::TcpStream) -> Self {
-        Self::from(OwnedSocket::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(unix)]
 impl From<std::net::TcpListener> for Socket {
     fn from(socket: std::net::TcpListener) -> Self {
-        Self::from(OwnedFd::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(windows)]
 impl From<std::net::TcpListener> for Socket {
     fn from(socket: std::net::TcpListener) -> Self {
-        Self::from(OwnedSocket::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(unix)]
 impl From<std::net::UdpSocket> for Socket {
     fn from(socket: std::net::UdpSocket) -> Self {
-        Self::from(OwnedFd::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(windows)]
 impl From<std::net::UdpSocket> for Socket {
     fn from(socket: std::net::UdpSocket) -> Self {
-        Self::from(OwnedSocket::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(unix)]
 impl From<std::os::unix::net::UnixStream> for Socket {
     fn from(socket: std::os::unix::net::UnixStream) -> Self {
-        Self::from(OwnedFd::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }
 
 #[cfg(unix)]
 impl From<std::os::unix::net::UnixListener> for Socket {
     fn from(socket: std::os::unix::net::UnixListener) -> Self {
-        Self::from(OwnedFd::from(socket))
-    }
-}
-
-#[cfg(unix)]
-impl From<socket2::Socket> for Socket {
-    fn from(socket: socket2::Socket) -> Self {
-        Self::from(OwnedFd::from(socket))
-    }
-}
-
-#[cfg(windows)]
-impl From<socket2::Socket> for Socket {
-    fn from(socket: socket2::Socket) -> Self {
-        Self::from(OwnedSocket::from(socket))
+        Self::from(socket2::Socket::from(socket))
     }
 }

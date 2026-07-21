@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use socket2::SockAddr;
 
-use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::driver::helpers::socket::Socket;
 use crate::net::unix::{UnixListener, UnixStream};
 
@@ -45,8 +44,7 @@ impl UnixSocket {
     /// This consumes the socket and returns a bound `UnixSocket`.
     pub fn bind<P: AsRef<Path>>(self, path: P) -> std::io::Result<Self> {
         let addr = SockAddr::unix(path)?;
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.bind(&addr)?;
+        self.inner.handle.bind(&addr)?;
 
         self.inner.set_async_flags()?;
 
@@ -72,8 +70,8 @@ impl UnixSocket {
 
     /// Returns the local address that this socket is bound to.
     pub fn local_addr(&self) -> std::io::Result<std::os::unix::net::SocketAddr> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref
+        self.inner
+            .handle
             .local_addr()?
             .as_unix()
             .ok_or_else(|| std::io::Error::other("Could not get socket path"))
@@ -83,68 +81,59 @@ impl UnixSocket {
 
     /// Sets the value of `SO_REUSEADDR` on this socket.
     pub fn set_reuseaddr(&self, reuseaddr: bool) -> std::io::Result<()> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.set_reuse_address(reuseaddr)
+        self.inner.handle.set_reuse_address(reuseaddr)
     }
 
     /// Gets the value of the `SO_REUSEADDR` option on this socket.
     pub fn reuseaddr(&self) -> std::io::Result<bool> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.reuse_address()
+        self.inner.handle.reuse_address()
     }
 
     /// Sets the value of `SO_KEEPALIVE` on this socket.
     pub fn set_keepalive(&self, keepalive: bool) -> std::io::Result<()> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.set_keepalive(keepalive)
+        self.inner.handle.set_keepalive(keepalive)
     }
 
     /// Gets the value of the `SO_KEEPALIVE` option on this socket.
     pub fn keepalive(&self) -> std::io::Result<bool> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.keepalive()
+        self.inner.handle.keepalive()
     }
 
     /// Sets the value of `SO_LINGER` on this socket.
     pub fn set_linger(&self, dur: Option<Duration>) -> std::io::Result<()> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.set_linger(dur)
+        self.inner.handle.set_linger(dur)
     }
 
     /// Gets the value of the `SO_LINGER` option on this socket.
     pub fn linger(&self) -> std::io::Result<Option<Duration>> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.linger()
+        self.inner.handle.linger()
     }
 
     /// Sets the value of `SO_RCVBUF` on this socket.
     pub fn set_recv_buffer_size(&self, size: u32) -> std::io::Result<()> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.set_recv_buffer_size(size as usize)
+        self.inner.handle.set_recv_buffer_size(size as usize)
     }
 
     /// Gets the value of the `SO_RCVBUF` option on this socket.
     pub fn recv_buffer_size(&self) -> std::io::Result<u32> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.recv_buffer_size().map(|s| s as u32)
+        self.inner.handle.recv_buffer_size().map(|s| s as u32)
     }
 
     /// Sets the value of `SO_SNDBUF` on this socket.
     pub fn set_send_buffer_size(&self, size: u32) -> std::io::Result<()> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.set_send_buffer_size(size as usize)
+        self.inner.handle.set_send_buffer_size(size as usize)
     }
 
     /// Gets the value of the `SO_SNDBUF` option on this socket.
     pub fn send_buffer_size(&self) -> std::io::Result<u32> {
-        let sock_ref = socket2::SockRef::from(&self.inner);
-        sock_ref.send_buffer_size().map(|s| s as u32)
+        self.inner.handle.send_buffer_size().map(|s| s as u32)
     }
 }
 
 impl FromRawFd for UnixSocket {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        UnixSocket::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
+        // Safety: caller guarantees `fd` is an open Unix domain socket.
+        UnixSocket::from(unsafe { Socket::from_raw_fd(fd) })
     }
 }
 

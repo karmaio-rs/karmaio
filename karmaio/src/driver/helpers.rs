@@ -2,7 +2,7 @@
 #[cfg(feature = "fs")]
 pub(crate) mod cstr;
 
-// Shared file / socket handle tracking; always required by the driver.
+// Typed shared OS-resource handle (`SharedIoHandle<T>`); always required by the driver.
 pub(crate) mod io_handle;
 
 // Low-level socket wrapper used by `net`.

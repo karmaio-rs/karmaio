@@ -1,4 +1,15 @@
-use std::{cell::RefCell, future::poll_fn, io, mem, rc::Rc, task::Waker};
+//! Typed shared ownership of an OS resource for completion-based I/O.
+//!
+//! [`SharedIoHandle<T>`] keeps a cloneable (`Rc`) handle so in-flight ops can pin
+//! the resource until their CQEs complete. Prefer [`SharedIoHandle::close`] over
+//! drop when close errors matter; drop still sync-closes when the last unique
+//! owner remains.
+//!
+//! Resource identity is preserved in `T` (`socket2::Socket`, `std::fs::File`,
+//! `OwnedFd`, …). Submit and close paths extract a copyable [`OsRawHandle`] via
+//! [`AsRawOsHandle`] / [`IntoRawOsHandle`].
+
+use std::{cell::RefCell, future::poll_fn, io, mem, ops::Deref, rc::Rc, task::Waker};
 
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
@@ -10,163 +21,76 @@ use std::os::windows::io::{
 
 use crate::driver::ops::Op;
 
-// Tracks in-flight operations on a file or socket handle. Ensures all in-flight
-// operations complete before submitting the close.
-//
-// When the last reference is dropped without an explicit `close().await`, the
-// owned OS handle is closed synchronously.
-// Prefer explicit `close().await` so close errors are observed and the release is
-// asynchronous when backed by the driver.
-//
-// The closed state is tracked so close calls after the first are ignored.
-// Only the first close call returns the true result of closing the handle.
-//
-// This type is cross-platform (Unix + Windows) and supports both file and socket
-// handles using conditional compilation. Ownership uses I/O-safe types
-// (`OwnedFd` / `OwnedHandle` / `OwnedSocket`) rather than bare raw integers.
-#[derive(Clone)]
-pub(crate) struct SharedIoHandle {
-    inner: Rc<InnerFd>,
+// ---------------------------------------------------------------------------
+// SharedIoHandle<T>
+// ---------------------------------------------------------------------------
+
+/// Shared ownership of an OS resource for completion-based I/O.
+///
+/// Clones are cheap (`Rc`). In-flight ops hold clones so the resource cannot be
+/// closed until those ops complete. Prefer `close().await` over drop when close
+/// errors matter.
+///
+/// Note: `Clone` is implemented manually so it does **not** require `T: Clone` —
+/// only the `Rc` is cloned; `T` is shared, not duplicated.
+pub(crate) struct SharedIoHandle<T> {
+    inner: Rc<Inner<T>>,
 }
 
-impl SharedIoHandle {
-    // Create from an owned Unix file descriptor.
-    #[cfg(unix)]
-    pub(crate) fn new(fd: OwnedFd) -> SharedIoHandle {
-        SharedIoHandle {
-            inner: Rc::new(InnerFd {
-                handle: Some(OwnedOsHandle::Fd(fd)),
+impl<T> Clone for SharedIoHandle<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Rc::clone(&self.inner),
+        }
+    }
+}
+
+impl<T> SharedIoHandle<T> {
+    /// Create a new shared handle owning `resource`.
+    pub(crate) fn new(resource: T) -> Self {
+        Self {
+            inner: Rc::new(Inner {
+                resource: Some(resource),
                 state: RefCell::new(State::Init),
             }),
         }
     }
 
-    // Create from a raw Unix FD, taking ownership.
-    //
-    // # Safety
-    // `fd` must be an open file descriptor. After this call, only `SharedIoHandle`
-    // (and clones / in-flight ops) may close it.
-    #[cfg(unix)]
-    pub(crate) unsafe fn from_raw_fd(fd: RawFd) -> SharedIoHandle {
-        SharedIoHandle::new(unsafe { OwnedFd::from_raw_fd(fd) })
-    }
-
-    // Create from an owned Windows file handle.
-    #[cfg(windows)]
-    pub(crate) fn new_file(handle: OwnedHandle) -> SharedIoHandle {
-        SharedIoHandle {
-            inner: Rc::new(InnerFd {
-                handle: Some(OwnedOsHandle::Handle(handle)),
-                state: RefCell::new(State::Init),
-            }),
-        }
-    }
-
-    // Create from a raw Windows file handle, taking ownership.
-    //
-    // # Safety
-    // `handle` must be an open Win32 handle. After this call, only `SharedIoHandle`
-    // may close it.
-    #[cfg(windows)]
-    pub(crate) unsafe fn from_raw_handle(handle: RawHandle) -> SharedIoHandle {
-        SharedIoHandle::new_file(unsafe { OwnedHandle::from_raw_handle(handle) })
-    }
-
-    // Create from an owned Windows socket.
-    #[cfg(windows)]
-    pub(crate) fn new_socket(socket: OwnedSocket) -> SharedIoHandle {
-        SharedIoHandle {
-            inner: Rc::new(InnerFd {
-                handle: Some(OwnedOsHandle::Socket(socket)),
-                state: RefCell::new(State::Init),
-            }),
-        }
-    }
-
-    // Create from a raw Windows socket, taking ownership.
-    //
-    // # Safety
-    // `socket` must be an open socket. After this call, only `SharedIoHandle` may close it.
-    #[cfg(windows)]
-    pub(crate) unsafe fn from_raw_socket(socket: RawSocket) -> SharedIoHandle {
-        SharedIoHandle::new_socket(unsafe { OwnedSocket::from_raw_socket(socket) })
-    }
-
-    // Returns the RawFd (Unix-only).
-    #[cfg(unix)]
-    pub(crate) fn raw_fd(&self) -> RawFd {
-        match self.as_raw_os_handle() {
-            OsRawHandle::Fd(fd) => fd,
-        }
-    }
-
-    // Returns the RawHandle (Windows file handle only).
-    // Kept as a counterpart to `raw_socket` / `raw_fd`; ops currently use `raw_os_handle`.
-    #[cfg(windows)]
-    #[allow(dead_code)]
-    pub(crate) fn raw_handle(&self) -> RawHandle {
-        match self.as_raw_os_handle() {
-            OsRawHandle::Handle(h) => h,
-            OsRawHandle::Socket(_) => {
-                unreachable!("SharedIoHandle was created with new_socket; use raw_socket")
-            }
-        }
-    }
-
-    // Returns the RawSocket (Windows socket handle only).
-    #[cfg(windows)]
-    pub(crate) fn raw_socket(&self) -> RawSocket {
-        match self.as_raw_os_handle() {
-            OsRawHandle::Socket(s) => s,
-            OsRawHandle::Handle(_) => {
-                unreachable!("SharedIoHandle was created with new_file; use raw_handle")
-            }
-        }
-    }
-
-    // Returns the raw OS handle enum (file handle or socket on Windows, fd on Unix).
-    pub(crate) fn as_raw_os_handle(&self) -> OsRawHandle {
-        self.inner
-            .handle
+    /// Access the owned resource. Panics if used after close transferred ownership.
+    pub(crate) fn with_resource<R>(&self, f: impl FnOnce(&T) -> R) -> R {
+        f(self
+            .inner
+            .resource
             .as_ref()
-            .expect("SharedIoHandle used after close transferred ownership")
-            .as_raw()
+            .expect("SharedIoHandle used after close transferred ownership"))
     }
 
-    // Windows-only alias used by existing ops.
-    #[cfg(windows)]
-    pub(crate) fn raw_os_handle(&self) -> OsRawHandle {
-        self.as_raw_os_handle()
-    }
-
-    // Try to unwrap the owned handle if this is the unique strong reference.
-    // Does not close the handle. Currently exercised by unit tests; useful for ownership transfer.
+    /// Try to unwrap the owned resource if this is the unique strong reference.
+    /// Does not close the resource.
     #[allow(dead_code)]
-    pub(crate) fn try_unwrap(self) -> Result<OwnedOsHandle, Self> {
+    pub(crate) fn try_unwrap(self) -> Result<T, Self> {
         // Avoid running `Drop for SharedIoHandle` while we move out of `self`.
         let this = mem::ManuallyDrop::new(self);
         // Safety: `this` is not dropped; we take ownership of `inner` exactly once.
         let inner = unsafe { std::ptr::read(&this.inner) };
         match Rc::try_unwrap(inner) {
             Ok(inner) => {
-                // Avoid running `Drop for InnerFd` (which would sync-close the handle).
+                // Avoid running `Drop for Inner` (which would drop/close `T`).
                 let mut inner = mem::ManuallyDrop::new(inner);
-                let handle = inner.handle.take().expect("handle already taken by close");
-                // Drop state without closing the handle.
+                let resource = inner.resource.take().expect("resource already taken by close");
+                // Drop state without dropping the resource.
                 unsafe {
                     std::ptr::drop_in_place(&mut inner.state);
                 }
-                Ok(handle)
+                Ok(resource)
             }
             Err(inner) => Err(Self { inner }),
         }
     }
 
-    // Wait until this is the unique strong reference, then take the owned handle
-    // without closing it. Returns `None` if the handle was already closed.
-    //
-    // Useful for FFI handoff or custom close paths).
-    pub(crate) async fn take(mut self) -> Option<OwnedOsHandle> {
+    /// Wait until this is the unique strong reference, then take the owned
+    /// resource without closing it. Returns `None` if already closed.
+    pub(crate) async fn take(mut self) -> Option<T> {
         loop {
             if let Some(inner) = Rc::get_mut(&mut self.inner) {
                 return inner.take_owned();
@@ -175,35 +99,13 @@ impl SharedIoHandle {
         }
     }
 
-    // Wait for all in-flight operations to complete, then close the handle.
-    //
-    // Prefer this over dropping the handle when possible so close errors are
-    // returned to the caller and the OS resource is released promptly.
-    pub(crate) async fn close(self) -> io::Result<()> {
-        match self.take().await {
-            Some(owned) => {
-                let raw = owned.into_raw();
-                match Op::close(raw) {
-                    Ok(op) => op.await,
-                    Err(e) => {
-                        // Submit failed: reclaim ownership and close synchronously.
-                        drop(unsafe { OwnedOsHandle::from_raw(raw) });
-                        Err(e)
-                    }
-                }
-            }
-            // Already closed (e.g. double close).
-            None => Ok(()),
-        }
-    }
-
-    // Completes when the SharedIoHandle's Inner Rc strong count is 1.
-    // Gets polled any time a SharedIoHandle is dropped.
+    /// Completes when the strong `Rc` count is 1.
+    /// Polled again whenever a clone is dropped (see `Drop`).
     async fn is_unique(&self) {
         use std::task::Poll;
 
         poll_fn(|cx| {
-            if Rc::<InnerFd>::strong_count(&self.inner) == 1 {
+            if Rc::<Inner<T>>::strong_count(&self.inner) == 1 {
                 return Poll::Ready(());
             }
 
@@ -218,7 +120,6 @@ impl SharedIoHandle {
                     if !waker.will_wake(cx.waker()) {
                         waker.clone_from(cx.waker());
                     }
-
                     Poll::Pending
                 }
                 State::Closed => Poll::Ready(()),
@@ -228,10 +129,87 @@ impl SharedIoHandle {
     }
 }
 
+impl<T: IntoRawOsHandle> SharedIoHandle<T> {
+    /// Wait for all in-flight operations to complete, then close the resource
+    /// through the driver (or sync-close if submit fails).
+    ///
+    /// Prefer this over dropping when possible so close errors are returned and
+    /// the OS resource is released promptly.
+    pub(crate) async fn close(self) -> io::Result<()> {
+        match self.take().await {
+            Some(resource) => {
+                let raw = resource.into_raw_os_handle();
+                match Op::close(raw) {
+                    Ok(op) => op.await,
+                    Err(e) => {
+                        // Submit failed: reclaim ownership and close synchronously.
+                        // Safety: `raw` is open and not owned elsewhere; we just
+                        // extracted it from `T` and failed to hand it to the driver.
+                        unsafe { drop_raw_os_handle(raw) };
+                        Err(e)
+                    }
+                }
+            }
+            // Already closed (e.g. double close).
+            None => Ok(()),
+        }
+    }
+}
+
+impl<T: AsRawOsHandle> SharedIoHandle<T> {
+    /// Returns the copyable raw OS value for kernel submission.
+    #[allow(dead_code)] // available for submit paths; many ops use raw_fd/raw_handle helpers instead
+    pub(crate) fn as_raw_os_handle(&self) -> OsRawHandle {
+        self.with_resource(|r| r.as_raw_os_handle())
+    }
+
+    /// Windows-only alias used by existing ops.
+    #[cfg(windows)]
+    pub(crate) fn raw_os_handle(&self) -> OsRawHandle {
+        self.as_raw_os_handle()
+    }
+}
+
+#[cfg(unix)]
+impl<T: AsRawFd> SharedIoHandle<T> {
+    /// Returns the underlying `RawFd`.
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.with_resource(|r| r.as_raw_fd())
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsRawHandle> SharedIoHandle<T> {
+    /// Returns the underlying Win32 file handle (not a socket).
+    #[allow(dead_code)]
+    pub(crate) fn raw_handle(&self) -> RawHandle {
+        self.with_resource(|r| r.as_raw_handle())
+    }
+}
+
+#[cfg(windows)]
+impl<T: AsRawSocket> SharedIoHandle<T> {
+    /// Returns the underlying Win32 socket.
+    pub(crate) fn raw_socket(&self) -> RawSocket {
+        self.with_resource(|r| r.as_raw_socket())
+    }
+}
+
+impl<T> Deref for SharedIoHandle<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        self.inner
+            .resource
+            .as_ref()
+            .expect("SharedIoHandle used after close transferred ownership")
+    }
+}
+
 // Wake any task waiting for uniqueness when a clone is dropped.
 // Without this, `close().await` / `take().await` can hang forever after
 // in-flight ops complete.
-impl Drop for SharedIoHandle {
+impl<T> Drop for SharedIoHandle<T> {
     fn drop(&mut self) {
         let mut state = self.inner.state.borrow_mut();
         if let State::Waiting(_) = *state {
@@ -246,19 +224,38 @@ impl Drop for SharedIoHandle {
 }
 
 #[cfg(unix)]
-impl AsRawFd for SharedIoHandle {
+impl<T: AsRawFd> AsRawFd for SharedIoHandle<T> {
     fn as_raw_fd(&self) -> RawFd {
         self.raw_fd()
     }
 }
 
 #[cfg(unix)]
-impl AsFd for SharedIoHandle {
+impl<T: AsFd> AsFd for SharedIoHandle<T> {
     fn as_fd(&self) -> BorrowedFd<'_> {
-        // Safety: the owned handle remains open for the lifetime of `&self`
-        // while this SharedIoHandle (or an Rc clone) is alive and not closed.
-        unsafe { BorrowedFd::borrow_raw(self.raw_fd()) }
+        // Borrow from the stored resource; lifetime is tied to `&self`.
+        self.inner
+            .resource
+            .as_ref()
+            .expect("SharedIoHandle used after close transferred ownership")
+            .as_fd()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Raw / owned extraction traits
+// ---------------------------------------------------------------------------
+
+/// Extract a copyable raw OS value for kernel submission.
+/// Implemented for the owned resource types we wrap.
+#[allow(dead_code)] // available for submit paths; many ops use AsRawFd/AsRawHandle helpers instead
+pub(crate) trait AsRawOsHandle {
+    fn as_raw_os_handle(&self) -> OsRawHandle;
+}
+
+/// Consume into a raw value for exclusive close (no Drop of the OS resource).
+pub(crate) trait IntoRawOsHandle {
+    fn into_raw_os_handle(self) -> OsRawHandle;
 }
 
 // Platform-specific raw handle (file descriptor on Unix, file handle or socket on Windows).
@@ -273,69 +270,144 @@ pub(crate) enum OsRawHandle {
     Socket(RawSocket),
 }
 
-// Owned platform handle. Drop closes the OS resource.
-pub(crate) enum OwnedOsHandle {
-    #[cfg(unix)]
-    Fd(OwnedFd),
-    #[cfg(windows)]
-    Handle(OwnedHandle),
-    #[cfg(windows)]
-    Socket(OwnedSocket),
-}
-
-impl OwnedOsHandle {
-    pub(crate) fn as_raw(&self) -> OsRawHandle {
-        match self {
-            #[cfg(unix)]
-            OwnedOsHandle::Fd(fd) => OsRawHandle::Fd(fd.as_raw_fd()),
-            #[cfg(windows)]
-            OwnedOsHandle::Handle(h) => OsRawHandle::Handle(h.as_raw_handle()),
-            #[cfg(windows)]
-            OwnedOsHandle::Socket(s) => OsRawHandle::Socket(s.as_raw_socket()),
-        }
-    }
-
-    // Consume the owned handle into a raw value without closing it.
-    pub(crate) fn into_raw(self) -> OsRawHandle {
-        match self {
-            #[cfg(unix)]
-            OwnedOsHandle::Fd(fd) => OsRawHandle::Fd(fd.into_raw_fd()),
-            #[cfg(windows)]
-            OwnedOsHandle::Handle(h) => OsRawHandle::Handle(h.into_raw_handle()),
-            #[cfg(windows)]
-            OwnedOsHandle::Socket(s) => OsRawHandle::Socket(s.into_raw_socket()),
-        }
-    }
-
-    // Rebuild an owned handle from a raw value.
-    //
-    // # Safety
-    // `raw` must be open and not owned elsewhere.
-    pub(crate) unsafe fn from_raw(raw: OsRawHandle) -> Self {
-        match raw {
-            #[cfg(unix)]
-            OsRawHandle::Fd(fd) => OwnedOsHandle::Fd(unsafe { OwnedFd::from_raw_fd(fd) }),
-            #[cfg(windows)]
-            OsRawHandle::Handle(h) => OwnedOsHandle::Handle(unsafe { OwnedHandle::from_raw_handle(h) }),
-            #[cfg(windows)]
-            OsRawHandle::Socket(s) => OwnedOsHandle::Socket(unsafe { OwnedSocket::from_raw_socket(s) }),
-        }
+/// Rebuild an owned OS resource from a raw value and drop it (closes the resource).
+///
+/// Used when close submit fails and we must reclaim + sync-close.
+///
+/// # Safety
+/// `raw` must be open and not owned elsewhere.
+pub(crate) unsafe fn drop_raw_os_handle(raw: OsRawHandle) {
+    match raw {
+        #[cfg(unix)]
+        OsRawHandle::Fd(fd) => drop(unsafe { OwnedFd::from_raw_fd(fd) }),
+        #[cfg(windows)]
+        OsRawHandle::Handle(h) => drop(unsafe { OwnedHandle::from_raw_handle(h) }),
+        #[cfg(windows)]
+        OsRawHandle::Socket(s) => drop(unsafe { OwnedSocket::from_raw_socket(s) }),
     }
 }
 
-struct InnerFd {
-    // Open file/socket handle. `None` after ownership was transferred to an async close.
-    // Only mutated when this Inner is uniquely owned (`Rc::get_mut`) or on Drop.
-    handle: Option<OwnedOsHandle>,
+// --- Unix: OwnedFd ---------------------------------------------------------
+
+#[cfg(unix)]
+impl AsRawOsHandle for OwnedFd {
+    fn as_raw_os_handle(&self) -> OsRawHandle {
+        OsRawHandle::Fd(self.as_raw_fd())
+    }
+}
+
+#[cfg(unix)]
+impl IntoRawOsHandle for OwnedFd {
+    fn into_raw_os_handle(self) -> OsRawHandle {
+        OsRawHandle::Fd(self.into_raw_fd())
+    }
+}
+
+// --- std::fs::File ---------------------------------------------------------
+
+impl AsRawOsHandle for std::fs::File {
+    fn as_raw_os_handle(&self) -> OsRawHandle {
+        #[cfg(unix)]
+        {
+            OsRawHandle::Fd(self.as_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            OsRawHandle::Handle(self.as_raw_handle())
+        }
+    }
+}
+
+impl IntoRawOsHandle for std::fs::File {
+    fn into_raw_os_handle(self) -> OsRawHandle {
+        #[cfg(unix)]
+        {
+            OsRawHandle::Fd(self.into_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            OsRawHandle::Handle(self.into_raw_handle())
+        }
+    }
+}
+
+// --- socket2::Socket (net feature) -----------------------------------------
+
+#[cfg(feature = "net")]
+impl AsRawOsHandle for socket2::Socket {
+    fn as_raw_os_handle(&self) -> OsRawHandle {
+        #[cfg(unix)]
+        {
+            OsRawHandle::Fd(self.as_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            OsRawHandle::Socket(self.as_raw_socket())
+        }
+    }
+}
+
+#[cfg(feature = "net")]
+impl IntoRawOsHandle for socket2::Socket {
+    fn into_raw_os_handle(self) -> OsRawHandle {
+        #[cfg(unix)]
+        {
+            OsRawHandle::Fd(self.into_raw_fd())
+        }
+        #[cfg(windows)]
+        {
+            OsRawHandle::Socket(self.into_raw_socket())
+        }
+    }
+}
+
+// --- Windows: OwnedHandle / OwnedSocket ------------------------------------
+
+#[cfg(windows)]
+impl AsRawOsHandle for OwnedHandle {
+    fn as_raw_os_handle(&self) -> OsRawHandle {
+        OsRawHandle::Handle(self.as_raw_handle())
+    }
+}
+
+#[cfg(windows)]
+impl IntoRawOsHandle for OwnedHandle {
+    fn into_raw_os_handle(self) -> OsRawHandle {
+        OsRawHandle::Handle(self.into_raw_handle())
+    }
+}
+
+#[cfg(windows)]
+impl AsRawOsHandle for OwnedSocket {
+    fn as_raw_os_handle(&self) -> OsRawHandle {
+        OsRawHandle::Socket(self.as_raw_socket())
+    }
+}
+
+#[cfg(windows)]
+impl IntoRawOsHandle for OwnedSocket {
+    fn into_raw_os_handle(self) -> OsRawHandle {
+        OsRawHandle::Socket(self.into_raw_socket())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Inner storage
+// ---------------------------------------------------------------------------
+
+struct Inner<T> {
+    // Open resource. `None` after ownership was transferred to an async close/take.
+    // Only mutated when this Inner is uniquely owned (`Rc::get_mut`) or on Drop of T.
+    resource: Option<T>,
 
     // Track the sharing state of the handle:
     // normal, being waited on to allow a close by the parent's owner, or already closed.
     state: RefCell<State>,
 }
 
-impl InnerFd {
-    // Take ownership of the handle, marking state Closed so Drop does not close again.
-    fn take_owned(&mut self) -> Option<OwnedOsHandle> {
+impl<T> Inner<T> {
+    // Take ownership of the resource, marking state Closed so Drop does not close again.
+    fn take_owned(&mut self) -> Option<T> {
         {
             let state = RefCell::get_mut(&mut self.state);
             if let State::Closed = *state {
@@ -343,13 +415,13 @@ impl InnerFd {
             }
             *state = State::Closed;
         }
-        self.handle.take()
+        self.resource.take()
     }
 }
 
-// Drop of `InnerFd` closes any remaining owned handle synchronously via
-// OwnedFd / OwnedHandle / OwnedSocket. After explicit `close`/`take`,
-// `handle` is `None` so Drop is a no-op.
+// Drop of `Inner<T>` drops any remaining `T`, which closes the OS resource
+// (File / Socket / OwnedFd / OwnedHandle / OwnedSocket). After explicit
+// `close`/`take`, `resource` is `None` so Drop is a no-op for the OS handle.
 
 enum State {
     // Initial state
@@ -363,15 +435,19 @@ enum State {
     Closed,
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::task::Poll;
 
     #[cfg(unix)]
-    fn dev_null_handle() -> SharedIoHandle {
+    fn dev_null_handle() -> SharedIoHandle<std::fs::File> {
         let file = std::fs::File::open("/dev/null").expect("/dev/null");
-        SharedIoHandle::new(OwnedFd::from(file))
+        SharedIoHandle::new(file)
     }
 
     #[cfg(unix)]
@@ -460,7 +536,7 @@ mod tests {
 
         runtime.block_on(async move {
             let owned = handle.take().await.expect("take should return owned handle");
-            // Caller owns the fd; drop closes it.
+            // Caller owns the file; drop closes it.
             drop(owned);
         });
     }
@@ -501,7 +577,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn drop_closes_synchronously_without_explicit_close() {
-        // last ref Drop closes via OwnedFd.
+        // last ref Drop closes via File / OwnedFd Drop.
         let handle = dev_null_handle();
         drop(handle);
     }
@@ -511,7 +587,7 @@ mod tests {
     fn take_after_prior_take_is_none_via_closed_state() {
         // take() marks Closed before returning; a second exclusive take on a
         // reconstructed handle is not possible through the public API. Instead
-        // verify take_owned semantics: after take, Inner is Closed with no handle.
+        // verify take_owned semantics: after take, Inner is Closed with no resource.
         use crate::runtime::local::Runtime;
 
         let mut runtime = Runtime::new().expect("runtime should start");
@@ -521,5 +597,35 @@ mod tests {
             let owned = handle.take().await.expect("first take");
             drop(owned);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn as_raw_os_handle_matches_as_raw_fd() {
+        let handle = dev_null_handle();
+        let raw = handle.as_raw_os_handle();
+        match raw {
+            OsRawHandle::Fd(fd) => assert_eq!(fd, handle.as_raw_fd()),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn try_unwrap_owned_fd_variant() {
+        let file = std::fs::File::open("/dev/null").expect("/dev/null");
+        let handle = SharedIoHandle::new(OwnedFd::from(file));
+        let owned = match handle.try_unwrap() {
+            Ok(owned) => owned,
+            Err(_) => panic!("unique handle should unwrap"),
+        };
+        drop(owned);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deref_exposes_resource() {
+        let handle = dev_null_handle();
+        // Deref to File — metadata is a smoke check that we have a live File.
+        let _ = handle.metadata().expect("metadata");
     }
 }

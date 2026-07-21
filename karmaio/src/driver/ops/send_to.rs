@@ -22,7 +22,7 @@ use crate::{
 pub(crate) struct SendTo<B: BoundedIoBuf> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
 
     // Held so the sockaddr remains valid for the kernel while the op is in-flight.
     #[allow(dead_code)]
@@ -47,7 +47,7 @@ pub(crate) struct SendTo<B: BoundedIoBuf> {
 
 impl<B: BoundedIoBuf> Op<SendTo<B>> {
     pub(crate) fn send_to(
-        io_handle: &SharedIoHandle,
+        io_handle: &SharedIoHandle<socket2::Socket>,
         buf: B,
         socket_addr: SocketAddr,
     ) -> std::io::Result<Op<SendTo<B>>> {

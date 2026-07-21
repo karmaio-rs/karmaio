@@ -15,7 +15,7 @@ use crate::{
 pub(crate) struct RecvMsg<B: BoundedIoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
 
     pub(crate) socket_addr: Box<SockAddr>,
 
@@ -40,7 +40,10 @@ pub(crate) struct RecvMsg<B: BoundedIoBufMut> {
 }
 
 impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
-    pub(crate) fn recvmsg(io_handle: &SharedIoHandle, mut bufs: Vec<B>) -> std::io::Result<Op<RecvMsg<B>>> {
+    pub(crate) fn recvmsg(
+        io_handle: &SharedIoHandle<socket2::Socket>,
+        mut bufs: Vec<B>,
+    ) -> std::io::Result<Op<RecvMsg<B>>> {
         let mut io_slices = Vec::with_capacity(bufs.len());
         for buf in &mut bufs {
             io_slices.push(IoSliceMut::new(unsafe {

@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::{driver::helpers::socket::Socket, net::tcp::TcpStream};
 
 #[cfg(windows)]
@@ -42,35 +41,12 @@ impl TcpListener {
     /// Returns the local address that this listener is bound to.
     ///
     /// This can be useful, for example, when binding to port 0 to figure out which port was actually bound.
-    #[cfg(unix)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        let fd = self.inner.as_raw_fd();
-        // SAFETY: Our fd is the handle the kernel has given us for a TcpListener.
-        // Create a std::net::TcpListener long enough to call its local_addr method
-        // and then forget it so the socket is not closed here.
-        let l = unsafe { std::net::TcpListener::from_raw_fd(fd) };
-        let local_addr = l.local_addr();
-        std::mem::forget(l);
-        local_addr
-    }
-
-    /// Returns the local address to which this UDP socket is bound.
-    ///
-    /// This can be useful, for example, when binding to port 0 to figure out which port was actually bound.
-    #[cfg(windows)]
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::windows::io::{AsRawSocket, FromRawSocket};
-
-        let handle = self.inner.as_raw_socket();
-        // SAFETY: Our handle is the handle the kernel has given us for a TcpListener.
-        // Create a std::net::TcpListener long enough to call its local_addr method
-        // and then forget it so the socket is not closed here.
-        let l = unsafe { std::net::TcpListener::from_raw_socket(handle) };
-        let local_addr = l.local_addr();
-        std::mem::forget(l);
-        local_addr
+        self.inner
+            .handle
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| std::io::Error::other("Could not get socket IP address"))
     }
 
     /// Accepts a new incoming connection from this listener.
@@ -88,7 +64,8 @@ impl TcpListener {
 #[cfg(unix)]
 impl FromRawFd for TcpListener {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        TcpListener::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
+        // Safety: caller guarantees `fd` is an open TCP listener socket.
+        TcpListener::from(unsafe { Socket::from_raw_fd(fd) })
     }
 }
 
@@ -102,7 +79,8 @@ impl AsRawFd for TcpListener {
 #[cfg(windows)]
 impl FromRawSocket for TcpListener {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        TcpListener::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
+        // Safety: caller guarantees `socket` is an open TCP listener socket.
+        TcpListener::from(unsafe { Socket::from_raw_socket(socket) })
     }
 }
 

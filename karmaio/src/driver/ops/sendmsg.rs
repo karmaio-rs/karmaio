@@ -18,7 +18,7 @@ use crate::{
 pub(crate) struct SendMsg<B: BoundedIoBuf, C: BoundedIoBuf> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
 
     // Held so the sockaddr remains valid for the kernel while the op is in-flight.
     #[allow(dead_code)]
@@ -45,7 +45,7 @@ pub(crate) struct SendMsg<B: BoundedIoBuf, C: BoundedIoBuf> {
 
 impl<B: BoundedIoBuf, C: BoundedIoBuf> Op<SendMsg<B, C>> {
     pub(crate) fn sendmsg(
-        io_handle: &SharedIoHandle,
+        io_handle: &SharedIoHandle<socket2::Socket>,
         bufs: Vec<B>,
         control: Option<C>,
         socket_addr: Option<SocketAddr>,

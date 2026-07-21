@@ -10,11 +10,8 @@ use crate::{
     runtime::local::CURRENT_DRIVER,
 };
 
-#[cfg(windows)]
-use crate::driver::helpers::io_handle::OsRawHandle;
-
 pub(crate) struct Stat {
-    handle: SharedIoHandle,
+    handle: SharedIoHandle<std::fs::File>,
     #[cfg(target_os = "linux")]
     statx_buf: Box<libc::statx>,
     #[cfg(target_os = "macos")]
@@ -25,7 +22,7 @@ pub(crate) struct Stat {
 }
 
 impl Op<Stat> {
-    pub(crate) fn stat(handle: &SharedIoHandle) -> io::Result<Op<Stat>> {
+    pub(crate) fn stat(handle: &SharedIoHandle<std::fs::File>) -> io::Result<Op<Stat>> {
         #[cfg(target_os = "linux")]
         let data = Stat {
             handle: handle.clone(),
@@ -94,25 +91,16 @@ impl Submittable for Stat {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Foundation::HANDLE;
 
-        match self.handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => match Metadata::from_handle(handle as HANDLE) {
-                Ok(metadata) => {
-                    self.result = Some(metadata);
-                    Submission::Ready(Completion {
-                        result: Ok(0),
-                        flags: 0,
-                    })
-                }
-                Err(err) => Submission::Ready(Completion {
-                    result: Err(err),
+        match Metadata::from_handle(self.handle.raw_handle() as HANDLE) {
+            Ok(metadata) => {
+                self.result = Some(metadata);
+                Submission::Ready(Completion {
+                    result: Ok(0),
                     flags: 0,
-                }),
-            },
-            OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "cannot query metadata for a socket",
-                )),
+                })
+            }
+            Err(err) => Submission::Ready(Completion {
+                result: Err(err),
                 flags: 0,
             }),
         }

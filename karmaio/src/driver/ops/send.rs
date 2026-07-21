@@ -11,7 +11,7 @@ use crate::{
 pub(crate) struct Send<B: BoundedIoBuf> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
 
     // Reference to the in-flight buffer.
     pub(crate) buf: B,
@@ -22,7 +22,7 @@ pub(crate) struct Send<B: BoundedIoBuf> {
 }
 
 impl<B: BoundedIoBuf> Op<Send<B>> {
-    pub(crate) fn send(io_handle: &SharedIoHandle, buf: B) -> std::io::Result<Op<Send<B>>> {
+    pub(crate) fn send(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> std::io::Result<Op<Send<B>>> {
         #[cfg(windows)]
         let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
             len: buf.bytes_init() as u32,

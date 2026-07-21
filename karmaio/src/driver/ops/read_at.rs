@@ -8,13 +8,10 @@ use crate::{
     runtime::local::CURRENT_DRIVER,
 };
 
-#[cfg(windows)]
-use crate::driver::ops::Completion;
-
 pub(crate) struct ReadAt<B: BoundedIoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(dead_code)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<std::fs::File>,
 
     // Reference to the in-flight buffer.
     pub(crate) buf: B,
@@ -24,7 +21,11 @@ pub(crate) struct ReadAt<B: BoundedIoBufMut> {
 }
 
 impl<B: BoundedIoBufMut> Op<ReadAt<B>> {
-    pub(crate) fn read_at(io_handle: &SharedIoHandle, buf: B, offset: u64) -> std::io::Result<Op<ReadAt<B>>> {
+    pub(crate) fn read_at(
+        io_handle: &SharedIoHandle<std::fs::File>,
+        buf: B,
+        offset: u64,
+    ) -> std::io::Result<Op<ReadAt<B>>> {
         let data = ReadAt {
             io_handle: io_handle.clone(),
             buf,
@@ -62,9 +63,7 @@ impl<B: BoundedIoBufMut> Submittable for ReadAt<B> {
         let ptr = self.buf.stable_write_ptr() as usize;
         let len = self.buf.bytes_total();
         let offset = self.offset as i64;
-        macos_syscall_blocking!({
-            macos_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset))
-        })
+        macos_syscall_blocking!({ macos_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset)) })
     }
 }
 
@@ -72,35 +71,24 @@ impl<B: BoundedIoBufMut> Submittable for ReadAt<B> {
 impl<B: BoundedIoBufMut> Submittable for ReadAt<B> {
     fn submit(&mut self) -> Submission {
         use crate::driver::backends::iocp::Interest;
-        use crate::driver::helpers::io_handle::OsRawHandle;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
         let ptr = self.buf.stable_write_ptr();
         let len = self.buf.bytes_total() as u32;
+        let handle = self.io_handle.raw_handle();
 
-        match self.io_handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => {
-                let mut interest = Interest::new(handle as _);
+        let mut interest = Interest::new(handle as _);
 
-                unsafe {
-                    let overlapped = &mut *interest.as_mut_ptr();
-                    overlapped.Anonymous.Anonymous.Offset = (self.offset & 0xFFFF_FFFF) as u32;
-                    overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
-                }
-
-                let mut bytes_read = 0u32;
-                windows_syscall_submit_overlapped!(interest, file, {
-                    ReadFile(handle as _, ptr as *mut u8, len, &mut bytes_read, interest.as_mut_ptr())
-                })
-            }
-            OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "use recv for socket reads on Windows",
-                )),
-                flags: 0,
-            }),
+        unsafe {
+            let overlapped = &mut *interest.as_mut_ptr();
+            overlapped.Anonymous.Anonymous.Offset = (self.offset & 0xFFFF_FFFF) as u32;
+            overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
         }
+
+        let mut bytes_read = 0u32;
+        windows_syscall_submit_overlapped!(interest, file, {
+            ReadFile(handle as _, ptr as *mut u8, len, &mut bytes_read, interest.as_mut_ptr())
+        })
     }
 }
 

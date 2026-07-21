@@ -22,7 +22,7 @@ use crate::{
 pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
     pub(crate) socket_addr: Box<SockAddr>,
 
     // Reference to the in-flight buffer.
@@ -49,7 +49,7 @@ pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
 
 impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
     #![allow(unused_mut)] // The linux code uses mutablity
-    pub(crate) fn recv_from(io_handle: &SharedIoHandle, mut buf: B) -> io::Result<Op<RecvFrom<B>>> {
+    pub(crate) fn recv_from(io_handle: &SharedIoHandle<socket2::Socket>, mut buf: B) -> io::Result<Op<RecvFrom<B>>> {
         let socket_addr = Box::new(unsafe { SockAddr::try_init(|_, _| Ok(()))?.1 });
 
         #[cfg(target_os = "linux")]

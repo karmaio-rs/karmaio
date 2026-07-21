@@ -2,7 +2,6 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
-use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
     driver::helpers::socket::Socket,
@@ -61,51 +60,21 @@ impl TcpStream {
     }
 
     /// Returns the socket address of the local half of this TCP connection.
-    #[cfg(unix)]
     pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        let fd = self.inner.as_raw_fd();
-        let s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        let addr = s.local_addr();
-        std::mem::forget(s);
-        addr
-    }
-
-    /// Returns the socket address of the local half of this TCP connection.
-    #[cfg(windows)]
-    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::windows::io::{AsRawSocket, FromRawSocket};
-
-        let handle = self.inner.as_raw_socket();
-        let s = unsafe { std::net::TcpStream::from_raw_socket(handle) };
-        let addr = s.local_addr();
-        std::mem::forget(s);
-        addr
+        self.inner
+            .handle
+            .local_addr()?
+            .as_socket()
+            .ok_or_else(|| std::io::Error::other("Could not get socket IP address"))
     }
 
     /// Returns the socket address of the remote half of this TCP connection.
-    #[cfg(unix)]
     pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::fd::{AsRawFd, FromRawFd};
-
-        let fd = self.inner.as_raw_fd();
-        let s = unsafe { std::net::TcpStream::from_raw_fd(fd) };
-        let addr = s.peer_addr();
-        std::mem::forget(s);
-        addr
-    }
-
-    /// Returns the socket address of the remote half of this TCP connection.
-    #[cfg(windows)]
-    pub fn peer_addr(&self) -> std::io::Result<SocketAddr> {
-        use std::os::windows::io::{AsRawSocket, FromRawSocket};
-
-        let handle = self.inner.as_raw_socket();
-        let s = unsafe { std::net::TcpStream::from_raw_socket(handle) };
-        let addr = s.peer_addr();
-        std::mem::forget(s);
-        addr
+        self.inner
+            .handle
+            .peer_addr()?
+            .as_socket()
+            .ok_or_else(|| std::io::Error::other("Could not get peer IP address"))
     }
 
     /// Splits a [`TcpStream`] into a read half and a write half, which can be
@@ -182,7 +151,8 @@ impl AsyncWrite for TcpStream {
 #[cfg(unix)]
 impl FromRawFd for TcpStream {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        TcpStream::from(Socket::from(unsafe { SharedIoHandle::from_raw_fd(fd) }))
+        // Safety: caller guarantees `fd` is an open TCP stream socket.
+        TcpStream::from(unsafe { Socket::from_raw_fd(fd) })
     }
 }
 
@@ -196,7 +166,8 @@ impl AsRawFd for TcpStream {
 #[cfg(windows)]
 impl FromRawSocket for TcpStream {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
-        TcpStream::from(Socket::from(unsafe { SharedIoHandle::from_raw_socket(socket) }))
+        // Safety: caller guarantees `socket` is an open TCP stream socket.
+        TcpStream::from(unsafe { Socket::from_raw_socket(socket) })
     }
 }
 

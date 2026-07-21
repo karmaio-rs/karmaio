@@ -1,10 +1,5 @@
 use std::path::Path;
 
-#[cfg(unix)]
-use std::os::fd::OwnedFd;
-#[cfg(windows)]
-use std::os::windows::io::OwnedHandle;
-
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
     driver::{helpers::io_handle::SharedIoHandle, ops::Op},
@@ -30,8 +25,8 @@ use crate::{
 /// observe close errors. Closing a file does not guarantee writes have persisted
 /// to disk; use [`sync_all`] for that.
 pub struct File {
-    /// Open file descriptor
-    pub(crate) handle: SharedIoHandle,
+    /// Open file; shared so in-flight ops can pin the resource until complete.
+    pub(crate) handle: SharedIoHandle<std::fs::File>,
 }
 
 impl File {
@@ -135,24 +130,16 @@ impl File {
     }
 }
 
-#[cfg(unix)]
 impl From<std::fs::File> for File {
     fn from(file: std::fs::File) -> Self {
-        File::from(SharedIoHandle::new(OwnedFd::from(file)))
+        Self {
+            handle: SharedIoHandle::new(file),
+        }
     }
 }
 
-#[cfg(windows)]
-impl From<std::fs::File> for File {
-    fn from(file: std::fs::File) -> Self {
-        // Transfer ownership of the underlying handle out of the std File
-        // so that SharedIoHandle becomes responsible for closing it.
-        File::from(SharedIoHandle::new_file(OwnedHandle::from(file)))
-    }
-}
-
-impl From<SharedIoHandle> for File {
-    fn from(handle: SharedIoHandle) -> Self {
+impl From<SharedIoHandle<std::fs::File>> for File {
+    fn from(handle: SharedIoHandle<std::fs::File>) -> Self {
         Self { handle }
     }
 }

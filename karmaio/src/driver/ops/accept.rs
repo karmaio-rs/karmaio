@@ -19,7 +19,7 @@ const ACCEPT_ADDR_LEN: u32 =
 const ACCEPT_ADDR_BUF_LEN: usize = ACCEPT_ADDR_LEN as usize * 2;
 
 pub(crate) struct Accept {
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
     #[cfg(unix)]
     socketaddr: Box<(libc::sockaddr_storage, libc::socklen_t)>,
     #[cfg(windows)]
@@ -29,7 +29,7 @@ pub(crate) struct Accept {
 }
 
 impl Op<Accept> {
-    pub(crate) fn accept(io_handle: &SharedIoHandle) -> io::Result<Self> {
+    pub(crate) fn accept(io_handle: &SharedIoHandle<socket2::Socket>) -> io::Result<Self> {
         #[cfg(unix)]
         let socketaddr = Box::new((
             unsafe { std::mem::zeroed() },
@@ -129,9 +129,14 @@ impl Completable for Accept {
     type Result = io::Result<(Socket, Option<SocketAddr>)>;
 
     fn complete(self, completion: Completion) -> Self::Result {
-        let raw_fd = completion.result?;
-        let io_handle = unsafe { SharedIoHandle::from_raw_fd(raw_fd as i32) };
-        let socket = Socket::from(io_handle);
+        use std::os::fd::{FromRawFd, RawFd};
+
+        let raw_fd = completion.result? as RawFd;
+        // Safety: accept returned a new open socket fd; ownership transfers here.
+        let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+        let socket = Socket {
+            handle: SharedIoHandle::new(sock),
+        };
 
         let _ = socket.set_async_flags();
 
@@ -154,6 +159,7 @@ impl Completable for Accept {
     type Result = io::Result<(Socket, Option<SocketAddr>)>;
 
     fn complete(mut self, completion: Completion) -> Self::Result {
+        use std::os::windows::io::FromRawSocket;
         use windows_sys::Win32::Networking::WinSock::{
             GetAcceptExSockaddrs, SO_UPDATE_ACCEPT_CONTEXT, SOCKADDR, SOCKET, SOL_SOCKET, setsockopt,
         };
@@ -203,8 +209,11 @@ impl Completable for Accept {
         };
 
         let accepted_socket = self.accepted_socket.take().expect("missing accepted socket");
-        let io_handle = unsafe { SharedIoHandle::from_raw_socket(accepted_socket) };
-        let socket = Socket::from(io_handle);
+        // Safety: AcceptEx produced an open socket; ownership transfers here.
+        let sock = unsafe { socket2::Socket::from_raw_socket(accepted_socket) };
+        let socket = Socket {
+            handle: SharedIoHandle::new(sock),
+        };
 
         let _ = socket.set_async_flags();
 

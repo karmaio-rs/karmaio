@@ -1,5 +1,3 @@
-#[cfg(windows)]
-use crate::driver::helpers::io_handle::OsRawHandle;
 use crate::{
     driver::{
         Submission,
@@ -10,13 +8,13 @@ use crate::{
 };
 
 pub(crate) struct Sync {
-    handle: SharedIoHandle,
+    handle: SharedIoHandle<std::fs::File>,
     #[allow(dead_code)] // This only works on linux. Macos and Windows do no support this
     sync_data: bool,
 }
 
 impl Op<Sync> {
-    pub(crate) fn sync(handle: &SharedIoHandle) -> std::io::Result<Op<Sync>> {
+    pub(crate) fn sync(handle: &SharedIoHandle<std::fs::File>) -> std::io::Result<Op<Sync>> {
         let data = Sync {
             handle: handle.clone(),
             sync_data: false,
@@ -25,7 +23,7 @@ impl Op<Sync> {
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
     }
 
-    pub(crate) fn sync_data(handle: &SharedIoHandle) -> std::io::Result<Op<Sync>> {
+    pub(crate) fn sync_data(handle: &SharedIoHandle<std::fs::File>) -> std::io::Result<Op<Sync>> {
         let data = Sync {
             handle: handle.clone(),
             sync_data: true,
@@ -66,19 +64,8 @@ impl Submittable for Sync {
     fn submit(&mut self) -> Submission {
         use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
 
-        match self.handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => {
-                let handle = handle as isize;
-                windows_syscall_blocking!({ windows_syscall!(BOOL, FlushFileBuffers(handle as _)) })
-            }
-            OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(std::io::Error::new(
-                    std::io::ErrorKind::Unsupported,
-                    "cannot sync a socket",
-                )),
-                flags: 0,
-            }),
-        }
+        let handle = self.handle.raw_handle() as isize;
+        windows_syscall_blocking!({ windows_syscall!(BOOL, FlushFileBuffers(handle as _)) })
     }
 }
 

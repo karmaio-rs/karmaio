@@ -4,7 +4,7 @@
 //! expose them through the crate's [`AsyncRead`]/[`AsyncWrite`] traits.
 //! The underlying pipe ends are stored as a cloneable [`SharedIoHandle`] so that the
 //! completion driver owns a reference for the duration of each in-flight operation;
-//! dropping the user-facing handle closes the pipe end exactly once (shared handles via fd/handle duplication)
+//! dropping the user-facing handle closes the pipe end exactly once
 //! and never races with a submission in progress.
 //!
 //! [`AsyncRead`]: crate::io::AsyncRead
@@ -12,98 +12,97 @@
 
 use std::io;
 
+#[cfg(unix)]
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+#[cfg(windows)]
+use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
+
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
     driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     io::{AsyncRead, AsyncWrite},
 };
 
+/// Platform pipe-end type stored in child stdio handles.
+#[cfg(unix)]
+type PipeHandle = SharedIoHandle<OwnedFd>;
+#[cfg(windows)]
+type PipeHandle = SharedIoHandle<OwnedHandle>;
+
 /// A handle to a child process's standard input (writable).
 pub struct ChildStdin {
-    handle: Option<SharedIoHandle>,
+    handle: Option<PipeHandle>,
 }
 
 /// A handle to a child process's standard output (readable).
 pub struct ChildStdout {
-    handle: Option<SharedIoHandle>,
+    handle: Option<PipeHandle>,
 }
 
 /// A handle to a child process's standard error (readable).
 pub struct ChildStderr {
-    handle: Option<SharedIoHandle>,
+    handle: Option<PipeHandle>,
+}
+
+#[cfg(unix)]
+fn take_pipe_fd(io: impl IntoRawFd) -> PipeHandle {
+    // Safety: ChildStd* into_raw_fd transfers exclusive ownership of the pipe end.
+    SharedIoHandle::new(unsafe { OwnedFd::from_raw_fd(io.into_raw_fd()) })
+}
+
+#[cfg(windows)]
+fn take_pipe_handle(io: impl IntoRawHandle) -> PipeHandle {
+    // Safety: ChildStd* into_raw_handle transfers exclusive ownership of the pipe end.
+    SharedIoHandle::new(unsafe { OwnedHandle::from_raw_handle(io.into_raw_handle() as _) })
 }
 
 impl From<std::process::ChildStdin> for ChildStdin {
     fn from(io: std::process::ChildStdin) -> Self {
-        Self {
-            handle: Some(SharedIoHandle::from(io)),
+        #[cfg(unix)]
+        {
+            Self {
+                handle: Some(take_pipe_fd(io)),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                handle: Some(take_pipe_handle(io)),
+            }
         }
     }
 }
 
 impl From<std::process::ChildStdout> for ChildStdout {
     fn from(io: std::process::ChildStdout) -> Self {
-        Self {
-            handle: Some(SharedIoHandle::from(io)),
+        #[cfg(unix)]
+        {
+            Self {
+                handle: Some(take_pipe_fd(io)),
+            }
+        }
+        #[cfg(windows)]
+        {
+            Self {
+                handle: Some(take_pipe_handle(io)),
+            }
         }
     }
 }
 
 impl From<std::process::ChildStderr> for ChildStderr {
     fn from(io: std::process::ChildStderr) -> Self {
-        Self {
-            handle: Some(SharedIoHandle::from(io)),
-        }
-    }
-}
-
-impl From<std::process::ChildStdin> for SharedIoHandle {
-    fn from(io: std::process::ChildStdin) -> Self {
         #[cfg(unix)]
         {
-            use std::os::fd::{FromRawFd, IntoRawFd};
-            SharedIoHandle::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(io.into_raw_fd()) })
+            Self {
+                handle: Some(take_pipe_fd(io)),
+            }
         }
         #[cfg(windows)]
         {
-            use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-            SharedIoHandle::new_file(unsafe {
-                std::os::windows::io::OwnedHandle::from_raw_handle(io.into_raw_handle() as _)
-            })
-        }
-    }
-}
-
-impl From<std::process::ChildStdout> for SharedIoHandle {
-    fn from(io: std::process::ChildStdout) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::fd::{FromRawFd, IntoRawFd};
-            SharedIoHandle::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(io.into_raw_fd()) })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-            SharedIoHandle::new_file(unsafe {
-                std::os::windows::io::OwnedHandle::from_raw_handle(io.into_raw_handle() as _)
-            })
-        }
-    }
-}
-
-impl From<std::process::ChildStderr> for SharedIoHandle {
-    fn from(io: std::process::ChildStderr) -> Self {
-        #[cfg(unix)]
-        {
-            use std::os::fd::{FromRawFd, IntoRawFd};
-            SharedIoHandle::new(unsafe { std::os::fd::OwnedFd::from_raw_fd(io.into_raw_fd()) })
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-            SharedIoHandle::new_file(unsafe {
-                std::os::windows::io::OwnedHandle::from_raw_handle(io.into_raw_handle() as _)
-            })
+            Self {
+                handle: Some(take_pipe_handle(io)),
+            }
         }
     }
 }

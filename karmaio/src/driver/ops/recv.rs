@@ -11,7 +11,7 @@ use crate::{
 pub(crate) struct Recv<B: BoundedIoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
 
     // Reference to the in-flight buffer.
     pub(crate) buf: B,
@@ -24,7 +24,7 @@ pub(crate) struct Recv<B: BoundedIoBufMut> {
 impl<B: BoundedIoBufMut> Op<Recv<B>> {
     // `mut buf` is required on Windows (`stable_write_ptr`); unused on other targets.
     #[allow(unused_mut)]
-    pub(crate) fn recv(io_handle: &SharedIoHandle, mut buf: B) -> std::io::Result<Op<Recv<B>>> {
+    pub(crate) fn recv(io_handle: &SharedIoHandle<socket2::Socket>, mut buf: B) -> std::io::Result<Op<Recv<B>>> {
         #[cfg(windows)]
         let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
             len: buf.bytes_total() as u32,

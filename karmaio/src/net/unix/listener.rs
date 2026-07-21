@@ -30,16 +30,11 @@ impl UnixListener {
 
     /// Returns the local address that this listener is bound to.
     pub fn local_addr(&self) -> std::io::Result<std::os::unix::net::SocketAddr> {
-        use std::os::unix::io::{AsRawFd, FromRawFd};
-
-        let fd = self.inner.as_raw_fd();
-        // SAFETY: Our fd is the handle the kernel has given us for a UnixListener.
-        // Create a std::net::UnixListener long enough to call its local_addr method
-        // and then forget it so the socket is not closed here.
-        let l = unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) };
-        let local_addr = l.local_addr();
-        std::mem::forget(l);
-        local_addr
+        self.inner
+            .handle
+            .local_addr()?
+            .as_unix()
+            .ok_or_else(|| std::io::Error::other("Could not get socket path"))
     }
 
     /// Accepts a new incoming connection from this listener.

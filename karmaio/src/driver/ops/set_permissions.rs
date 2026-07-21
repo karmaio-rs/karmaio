@@ -3,8 +3,6 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
-#[cfg(windows)]
-use crate::driver::helpers::io_handle::OsRawHandle;
 use crate::{
     driver::{
         Submission,
@@ -16,14 +14,17 @@ use crate::{
 };
 
 pub(crate) struct SetPermissions {
-    handle: SharedIoHandle,
+    handle: SharedIoHandle<std::fs::File>,
     perm: Permissions,
     #[cfg(target_os = "linux")]
     result: Option<io::Result<()>>,
 }
 
 impl Op<SetPermissions> {
-    pub(crate) fn set_permissions(handle: &SharedIoHandle, perm: Permissions) -> io::Result<Op<SetPermissions>> {
+    pub(crate) fn set_permissions(
+        handle: &SharedIoHandle<std::fs::File>,
+        perm: Permissions,
+    ) -> io::Result<Op<SetPermissions>> {
         let data = SetPermissions {
             handle: handle.clone(),
             perm,
@@ -90,39 +91,28 @@ impl Submittable for SetPermissions {
             file_attributes: u32,
         }
 
-        match self.handle.raw_os_handle() {
-            OsRawHandle::Handle(handle) => {
-                // Setting only `file_attributes` (with the time fields zeroed) asks
-                // Windows to update the attributes and leave the timestamps alone.
-                let handle = handle as isize;
-                let attrs = self.perm.attrs();
+        // Setting only `file_attributes` (with the time fields zeroed) asks
+        // Windows to update the attributes and leave the timestamps alone.
+        let handle = self.handle.raw_handle() as isize;
+        let attrs = self.perm.attrs();
 
-                windows_syscall_blocking!({
-                    let info = FileBasicInformation {
-                        creation_time: 0,
-                        last_access_time: 0,
-                        last_write_time: 0,
-                        change_time: 0,
-                        file_attributes: attrs,
-                    };
-                    windows_syscall!(BOOL, {
-                        SetFileInformationByHandle(
-                            handle as _,
-                            FileBasicInfo,
-                            &info as *const _ as *const _,
-                            std::mem::size_of::<FileBasicInformation>() as u32,
-                        )
-                    })
-                })
-            }
-            OsRawHandle::Socket(_) => Submission::Ready(Completion {
-                result: Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "cannot set permissions on a socket",
-                )),
-                flags: 0,
-            }),
-        }
+        windows_syscall_blocking!({
+            let info = FileBasicInformation {
+                creation_time: 0,
+                last_access_time: 0,
+                last_write_time: 0,
+                change_time: 0,
+                file_attributes: attrs,
+            };
+            windows_syscall!(BOOL, {
+                SetFileInformationByHandle(
+                    handle as _,
+                    FileBasicInfo,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<FileBasicInformation>() as u32,
+                )
+            })
+        })
     }
 }
 

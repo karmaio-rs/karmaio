@@ -11,7 +11,7 @@ use crate::{
 
 /// Open a file
 pub(crate) struct Connect {
-    io_handle: SharedIoHandle,
+    io_handle: SharedIoHandle<socket2::Socket>,
     // this avoids a UAF (UAM?) if the future is moved, but not if the future is dropped.
     // No Op can be dropped before completion right now.
     socket_addr: Box<SockAddr>,
@@ -19,7 +19,10 @@ pub(crate) struct Connect {
 
 impl Op<Connect> {
     /// Submit a request to connect.
-    pub(crate) fn connect(io_handle: &SharedIoHandle, socket_addr: SockAddr) -> std::io::Result<Op<Connect>> {
+    pub(crate) fn connect(
+        io_handle: &SharedIoHandle<socket2::Socket>,
+        socket_addr: SockAddr,
+    ) -> std::io::Result<Op<Connect>> {
         let data = Connect {
             io_handle: io_handle.clone(),
             socket_addr: Box::new(socket_addr),

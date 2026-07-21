@@ -16,6 +16,11 @@ use crate::{
     runtime::local::CURRENT_DRIVER,
 };
 
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
+#[cfg(windows)]
+use std::os::windows::io::FromRawHandle;
+
 /// Open a file
 pub(crate) struct Open {
     pub(crate) path: OsPath,
@@ -184,7 +189,11 @@ impl Completable for Open {
     type Result = std::io::Result<File>;
 
     fn complete(self, cqe: Completion) -> Self::Result {
-        Ok(File::from(unsafe { SharedIoHandle::from_raw_fd(cqe.result? as _) }))
+        // Safety: open returned a new open file descriptor; ownership transfers here.
+        let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
+        Ok(File {
+            handle: SharedIoHandle::new(file),
+        })
     }
 }
 
@@ -195,6 +204,10 @@ impl Completable for Open {
     fn complete(mut self, cqe: Completion) -> Self::Result {
         let _ = cqe.result?;
         let handle = self.handle.take().expect("Open handle not set");
-        Ok(File::from(unsafe { SharedIoHandle::from_raw_handle(handle) }))
+        // Safety: open produced an open Win32 file handle; ownership transfers here.
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        Ok(File {
+            handle: SharedIoHandle::new(file),
+        })
     }
 }

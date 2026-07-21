@@ -13,9 +13,12 @@
 use std::io;
 
 #[cfg(unix)]
-use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
+
+#[cfg(unix)]
+use libc::{F_GETFL, F_SETFL, O_NONBLOCK, fcntl};
 
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
@@ -47,7 +50,16 @@ pub struct ChildStderr {
 #[cfg(unix)]
 fn take_pipe_fd(io: impl IntoRawFd) -> PipeHandle {
     // Safety: ChildStd* into_raw_fd transfers exclusive ownership of the pipe end.
-    SharedIoHandle::new(unsafe { OwnedFd::from_raw_fd(io.into_raw_fd()) })
+    let fd = unsafe { OwnedFd::from_raw_fd(io.into_raw_fd()) };
+    // Set non-blocking mode for async I/O readiness notifications (kqueue, epoll, etc.)
+    // This is required for readiness-based backends to work correctly.
+    unsafe {
+        let flags = fcntl(fd.as_raw_fd(), F_GETFL);
+        if flags >= 0 {
+            let _ = fcntl(fd.as_raw_fd(), F_SETFL, flags | O_NONBLOCK);
+        }
+    }
+    SharedIoHandle::new(fd)
 }
 
 #[cfg(windows)]

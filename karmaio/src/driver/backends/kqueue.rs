@@ -12,7 +12,7 @@ use slab::Slab;
 use crate::driver::{
     Handle, Wakeup,
     backends::DriverBackend,
-    ops::{BlockingJob, Completion, Op, Operable, State, Submittable},
+    ops::{BlockingJob, Completable, Completion, Op, Operable, State},
 };
 use crate::runtime::blocking::BlockingPoolHandle;
 
@@ -132,7 +132,7 @@ impl KqueueBackend {
 }
 
 impl DriverBackend for KqueueBackend {
-    fn submit_op<T: Submittable>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+    fn submit_op<T: Operable>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
         let index = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
@@ -141,7 +141,7 @@ impl DriverBackend for KqueueBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>) {
+    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>) {
         let index = op.index();
         let slot = match self.ops.get_mut(index) {
             Some(val) => val,
@@ -152,18 +152,36 @@ impl DriverBackend for KqueueBackend {
         };
 
         match &slot.state {
-            State::Submitted | State::Waiting(..) => {
-                // Cancel any registered interest (EV_DELETE is synchronous and safe)
-                // The future was dropped while the kernel may still complete the operation.
-                // Ask the kernel to cancel it, but keep the slot and data alive until the completion packet arrives.
-                // Blocking-pool jobs cannot be cancelled; the slot stays until the worker finishes.
-                if let Some(interest) = slot.interest.take() {
-                    Self::delete_interest(self.kqueue.as_raw_fd(), interest);
-                }
-                slot.state = State::Ignored(Box::new(()));
+            State::Submitted => {
+                // Never polled — no in-flight work and no produced resource.
+                self.ops.remove(index);
+                let _ = op.take_data();
             }
-            State::Completed(..) | State::Ready => {
-                // The kernel already completed and no one will poll the future, so the slot can be released immediately.
+            State::Waiting(..) => {
+                if let Some(interest) = slot.interest.take() {
+                    // Register-path cancel: EV_DELETE is synchronous. The
+                    // non-blocking syscall has not produced a resource yet.
+                    Self::delete_interest(self.kqueue.as_raw_fd(), interest);
+                    self.ops.remove(index);
+                    let _ = op.take_data();
+                } else {
+                    // Blocking-pool job still running. Keep payload so a late
+                    // completion can cleanup produced FDs (e.g. open).
+                    let data = op.take_data().expect("op data missing on detach");
+                    slot.state = State::Ignored(Box::new(data));
+                }
+            }
+            State::Completed(_) => {
+                // Completion already stored but never polled — cleanup now.
+                let slot = self.ops.remove(index);
+                if let State::Completed(completion) = slot.state {
+                    if let Some(data) = op.take_data() {
+                        drop(data.complete(completion));
+                    }
+                }
+            }
+            State::Ready => {
+                // Ready to re-issue syscall; nothing produced yet.
                 self.ops.remove(index);
                 let _ = op.take_data();
             }

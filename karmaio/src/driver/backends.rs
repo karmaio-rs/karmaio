@@ -13,7 +13,7 @@ pub(crate) mod kqueue;
 
 use crate::driver::{
     Handle, Wakeup,
-    ops::{Op, Operable, Submittable},
+    ops::{Completable, Op, Operable},
 };
 use crate::runtime::blocking::BlockingPoolHandle;
 
@@ -32,10 +32,14 @@ pub(crate) use self::kqueue::Submission;
 
 pub(crate) trait DriverBackend {
     // Submit a prepared entry to the backend.
-    fn submit_op<T: Submittable>(&mut self, data: T, handle: Handle) -> Result<Op<T>>;
+    // `Operable` so every in-flight op can be type-erased into [`IgnoredOp`] on detach.
+    fn submit_op<T: Operable>(&mut self, data: T, handle: Handle) -> Result<Op<T>>;
 
-    /// Removes an operation from the driver's tracking (version 2).
-    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>);
+    /// Detach an operation: the caller no longer wants the result.
+    ///
+    /// Keeps the payload alive until the kernel completion when needed,
+    /// then cleans them up via [`crate::driver::ops::IgnoredOp`] so accept/open FDs close.
+    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>);
 
     // Checks if an operation is still pending/valid.
     //

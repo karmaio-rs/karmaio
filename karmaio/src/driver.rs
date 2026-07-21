@@ -1,5 +1,5 @@
 use crate::driver::backends::{DriverBackend, PlatformBackend};
-use crate::driver::ops::{Op, Operable, Submittable};
+use crate::driver::ops::{Completable, Op, Operable};
 use crate::runtime::blocking::BlockingPoolHandle;
 use std::ops::Deref;
 #[cfg(unix)]
@@ -61,11 +61,11 @@ impl Driver {
         })
     }
 
-    pub(crate) fn submit_op<T: Submittable>(&self, data: T) -> io::Result<Op<T>> {
+    pub(crate) fn submit_op<T: Operable>(&self, data: T) -> io::Result<Op<T>> {
         self.backend.borrow_mut().submit_op(data, self.into())
     }
 
-    pub(crate) fn remove_op<T: 'static>(&self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: Completable + 'static>(&self, op: &mut Op<T>) {
         self.backend.borrow_mut().remove_op(op)
     }
 

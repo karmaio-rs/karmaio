@@ -22,30 +22,30 @@ pub(crate) struct Socket {
     pub(crate) handle: SharedIoHandle<socket2::Socket>,
 }
 
+/// Configure a socket for async use on the current platform.
+///
+/// Sets non-blocking mode, and on macOS also `CLOEXEC` and `NOSIGPIPE`.
+/// Used by create, bind, and accept paths so flags stay consistent.
+fn configure_async_socket(socket: &socket2::Socket) -> Result<()> {
+    socket.set_nonblocking(true)?;
+    #[cfg(target_os = "macos")]
+    {
+        socket.set_cloexec(true)?;
+        // Avoid SIGPIPE killing the process when writing to a closed socket.
+        socket.set_nosigpipe(true)?;
+    }
+    Ok(())
+}
+
 impl Socket {
     pub(crate) fn set_async_flags(&self) -> Result<()> {
-        self.handle.set_nonblocking(true)?;
-        #[cfg(target_os = "macos")]
-        {
-            self.handle.set_cloexec(true)?;
-            // This will not crash the entire program when writing to a closed socket
-            self.handle.set_nosigpipe(true)?;
-        }
-
-        Ok(())
+        configure_async_socket(&*self.handle)
     }
 
     /// Creates a new network socket (TCP/UDP)
     pub(crate) fn new(socket_addr: SocketAddr, socket_type: socket2::Type) -> Result<Self> {
         let socket = socket2::Socket::new(socket2::Domain::for_address(socket_addr), socket_type, None)?;
-
-        socket.set_nonblocking(true)?;
-        #[cfg(target_os = "macos")]
-        {
-            socket.set_cloexec(true)?;
-            // This will not crash the entire program when writing to a closed socket
-            socket.set_nosigpipe(true)?;
-        }
+        configure_async_socket(&socket)?;
 
         Ok(Self {
             handle: SharedIoHandle::new(socket),
@@ -56,14 +56,7 @@ impl Socket {
     #[cfg(unix)]
     pub(crate) fn new_unix(socket_type: c_int) -> Result<Self> {
         let socket = socket2::Socket::new(socket2::Domain::UNIX, socket_type.into(), None)?;
-
-        socket.set_nonblocking(true)?;
-        #[cfg(target_os = "macos")]
-        {
-            socket.set_cloexec(true)?;
-            // This will not crash the entire program when writing to a closed socket
-            socket.set_nosigpipe(true)?;
-        }
+        configure_async_socket(&socket)?;
 
         Ok(Self {
             handle: SharedIoHandle::new(socket),
@@ -97,13 +90,7 @@ impl Socket {
         #[cfg(unix)]
         socket.set_reuse_port(true)?;
 
-        socket.set_nonblocking(true)?;
-        #[cfg(target_os = "macos")]
-        {
-            socket.set_cloexec(true)?;
-            // This will not crash the entire program when writing to a closed socket
-            socket.set_nosigpipe(true)?;
-        }
+        configure_async_socket(&socket)?;
 
         socket.bind(&socket_addr)?;
 

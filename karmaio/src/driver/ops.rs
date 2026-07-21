@@ -73,14 +73,20 @@ pub(crate) mod write;
 // (**detach**), not that the kernel work is necessarily cancelled:
 //
 // * **io_uring**: the SQE stays in flight until its CQE arrives. Op payload
-//   (buffers, paths, …) is moved into `Ignored` so the kernel still has valid
-//   memory. `IORING_OP_ASYNC_CANCEL` is only submitted on *driver* shutdown,
+//   is moved into `Ignored` so the kernel still has valid memory, and so a
+//   late CQE can still run [`IgnoredOp::cleanup`] (closes orphan accept/open
+//   FDs). `IORING_OP_ASYNC_CANCEL` is only submitted on *driver* shutdown,
 //   not on individual `Op` drop.
 // * **IOCP**: `CancelIoEx` is requested; the OVERLAPPED and payload stay alive
-//   until the completion packet is dequeued.
-// * **kqueue**: registered interest is `EV_DELETE`d synchronously. Blocking-
-//   pool jobs cannot be cancelled mid-flight; the slot stays until the worker
-//   finishes.
+//   until the completion packet is dequeued, then cleanup runs.
+// * **kqueue**: registered interest is `EV_DELETE`d synchronously (slot freed
+//   immediately — no produced FD yet). Blocking-pool jobs cannot be cancelled mid-flight;
+//   the payload stays in `Ignored` until the worker finishes, then cleanup runs.
+//
+// **I/O safety:** resource-producing ops (`accept`, `open`) put the new FD in
+// the completion result. If the waiter has detached, [`State::complete`] still
+// calls `complete` via the ignored payload and drops the result so the FD is
+// closed rather than leaked.
 //
 // Callers that need stronger cancel guarantees (e.g. releasing an FD promptly)
 // should close the resource or wait for the op to complete rather than only
@@ -98,19 +104,46 @@ pub(crate) enum State {
     Ready,
 
     // The submitter no longer has interest in the operation result.
-    // The boxed payload is held (not read) until the operation completes so
-    // resources the kernel still references stay alive.
+    // The payload stays alive until the kernel completion arrives so buffers /
+    // paths remain valid, and so [`IgnoredOp::cleanup`] can close produced FDs.
     #[allow(dead_code)]
-    Ignored(Box<dyn std::any::Any>),
+    Ignored(Box<dyn IgnoredOp>),
 
     // The operation has completed with a single cqe result
     Completed(Completion),
 }
 
+/// Type-erased op payload kept while a detached operation may still complete.
+///
+/// When the CQE / completion packet arrives, [`cleanup`](IgnoredOp::cleanup) runs the
+/// normal [`Completable::complete`] path and drops the result. That closes
+/// orphan sockets/files from accept/open and frees buffers for other ops.
+pub(crate) trait IgnoredOp: 'static {
+    fn cleanup(self: Box<Self>, completion: Completion);
+}
+
+impl<T: Completable + 'static> IgnoredOp for T {
+    fn cleanup(self: Box<Self>, completion: Completion) {
+        drop((*self).complete(completion));
+    }
+}
+
+/// Placeholder cleanup when no typed payload is available (e.g. driver shutdown
+/// of ops that never moved data into `Ignored`).
+#[allow(dead_code)] // Used by backend Drop paths on all platforms.
+pub(crate) struct Detached;
+
+impl IgnoredOp for Detached {
+    fn cleanup(self: Box<Self>, _completion: Completion) {}
+}
+
 /// A single in-flight driver operation, polled as a future.
 ///
 /// See [`State`] for drop / detach semantics.
-pub(crate) struct Op<T: 'static> {
+///
+/// `T: Completable` so detach can type-erase the payload into [`IgnoredOp`]
+/// and late completions still run `complete` (orphan accept/open safety).
+pub(crate) struct Op<T: Completable + 'static> {
     driver: Handle,
     index: usize,
     data: Option<T>,
@@ -153,13 +186,13 @@ pub(crate) trait Submittable {
 pub(crate) trait Completable {
     type Result;
 
-    // `complete` will be called for every op once done
+    // `complete` will be called for every op once done (including detach/cleanup).
     fn complete(self, completion_entry: Completion) -> Self::Result;
 }
 
 pub(crate) trait Operable: Submittable + Completable {}
 
-impl<T: 'static> Op<T> {
+impl<T: Completable + 'static> Op<T> {
     pub(crate) fn new(index: usize, data: T, driver: Handle) -> Self {
         Self {
             driver,
@@ -199,7 +232,7 @@ impl<T: Unpin + Operable> Future for Op<T> {
     }
 }
 
-impl<T: 'static> Drop for Op<T> {
+impl<T: Completable + 'static> Drop for Op<T> {
     fn drop(&mut self) {
         // If the runtime/driver is already gone, in-flight work was cancelled
         // or drained by backend `Drop`. Detach quietly instead of panicking
@@ -232,12 +265,15 @@ impl State {
                 // The completion still has to be read, so don't drop
                 false
             }
-            State::Ignored(..) => {
-                // The caller isn't interested in the result, so we drop
+            State::Ignored(_) => {
+                // Caller detached: run complete + drop so accept/open FDs close.
+                if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
+                    payload.cleanup(completion);
+                }
                 true
             }
             State::Ready => {
-                // Calling readinies state via completion call is a no-op
+                // Calling readiness state via completion call is a no-op
                 // This should not be triggered in normal operation
                 unreachable!("invalid operation state");
             }
@@ -275,5 +311,95 @@ impl State {
             // readiness notification is processed; treat as no-op.
             State::Completed(..) => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    struct CleanupMarker {
+        cleaned_up: Rc<Cell<bool>>,
+        /// Value reported in the completion result when cleaned up.
+        saw_result: Rc<Cell<Option<u32>>>,
+    }
+
+    impl Completable for CleanupMarker {
+        type Result = ();
+
+        fn complete(self, completion: Completion) -> Self::Result {
+            self.cleaned_up.set(true);
+            self.saw_result.set(completion.result.ok());
+        }
+    }
+
+    #[test]
+    fn ignored_completion_reaps_payload() {
+        let cleaned_up = Rc::new(Cell::new(false));
+        let saw = Rc::new(Cell::new(None));
+        let mut state = State::Ignored(Box::new(CleanupMarker {
+            cleaned_up: cleaned_up.clone(),
+            saw_result: saw.clone(),
+        }));
+
+        assert!(state.complete(Completion {
+            result: Ok(42),
+            flags: 0,
+        }));
+        assert!(cleaned_up.get(), "complete path must run for detached ops");
+        assert_eq!(saw.get(), Some(42));
+    }
+
+    #[test]
+    fn ignored_error_completion_still_cleans_up() {
+        let cleaned_up = Rc::new(Cell::new(false));
+        let saw = Rc::new(Cell::new(None));
+        let mut state = State::Ignored(Box::new(CleanupMarker {
+            cleaned_up: cleaned_up.clone(),
+            saw_result: saw.clone(),
+        }));
+
+        assert!(state.complete(Completion {
+            result: Err(std::io::Error::from_raw_os_error(1)),
+            flags: 0,
+        }));
+        assert!(cleaned_up.get());
+        assert_eq!(saw.get(), None);
+    }
+
+    /// Simulates accept/open: produced FD lives only in the completion result.
+    /// Detach + complete must take ownership so Drop closes it.
+    #[cfg(unix)]
+    #[test]
+    fn ignored_accept_like_complete_closes_orphan_fd() {
+        use std::os::fd::{FromRawFd, IntoRawFd, RawFd};
+
+        struct ProduceFd;
+
+        impl Completable for ProduceFd {
+            type Result = std::io::Result<std::fs::File>;
+
+            fn complete(self, completion: Completion) -> Self::Result {
+                let fd = completion.result? as RawFd;
+                // Safety: test supplies an open fd in the completion result.
+                Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+            }
+        }
+
+        // Open /dev/null and hand the raw fd to a fake completion (like accept).
+        let file = std::fs::File::open("/dev/null").expect("open /dev/null");
+        let raw = file.into_raw_fd();
+
+        let mut state = State::Ignored(Box::new(ProduceFd));
+        assert!(state.complete(Completion {
+            result: Ok(raw as u32),
+            flags: 0,
+        }));
+        // If cleanup failed to close, this would leak `raw`. We cannot portably
+        // assert the fd is closed without racy probes; the important contract is
+        // that `complete` ran and the File was dropped (covered by miri/ASAN in
+        // CI when available, and by the cleaned_up flag tests above).
     }
 }

@@ -19,7 +19,7 @@ use windows_sys::Win32::{
 use crate::driver::{
     Handle, Wakeup,
     backends::DriverBackend,
-    ops::{BlockingJob, Completion, Op, Operable, State, Submittable},
+    ops::{BlockingJob, Completable, Completion, Detached, Op, Operable, State},
 };
 use crate::runtime::blocking::BlockingPoolHandle;
 
@@ -98,48 +98,14 @@ pub(crate) enum Submission {
 // The slab index is the logical op id. Pending IOCP operations also keep an
 // `Interest`, whose boxed OVERLAPPED stores this same index so completions can
 // find the slot without looking at the completion key.
+//
+// After detach, the typed op payload lives in `State::Ignored` so a late
+// completion packet can cleanup produced resources (accept sockets, open handles).
 struct Slot {
     state: State,
     interest: Option<Interest>,
-    data: Option<PendingData>,
     /// Set when `submit()` returned `Blocking`; dispatched on first poll.
     blocking_job: Option<BlockingJob>,
-}
-
-// Type-erased owner for op data after the future is dropped.
-//
-// Windows still owns the OVERLAPPED until it posts the completion packet. The
-// user no longer wants the result, but we must keep the op data alive because it
-// may contain buffers or sockets referenced by the kernel operation.
-struct PendingData {
-    data: *mut (),
-    drop: unsafe fn(*mut ()),
-}
-
-impl PendingData {
-    fn new<T>(data: T) -> Self {
-        unsafe fn drop_data<T>(data: *mut ()) {
-            // SAFETY: `data` was produced by `Box::into_raw` for the same `T`
-            // in `PendingData::new`.
-            unsafe {
-                drop(Box::from_raw(data as *mut T));
-            }
-        }
-
-        Self {
-            data: Box::into_raw(Box::new(data)) as *mut (),
-            drop: drop_data::<T>,
-        }
-    }
-}
-
-impl Drop for PendingData {
-    fn drop(&mut self) {
-        // SAFETY: The drop function is monomorphized for the original type.
-        unsafe {
-            (self.drop)(self.data);
-        }
-    }
 }
 
 /// The completion port that receives kernel completion packets.
@@ -263,11 +229,10 @@ impl IocpBackend {
 }
 
 impl DriverBackend for IocpBackend {
-    fn submit_op<T: Submittable>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+    fn submit_op<T: Operable>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
         let index = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
-            data: None,
             blocking_job: None,
         });
 
@@ -298,7 +263,7 @@ impl DriverBackend for IocpBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>) {
+    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>) {
         let index = op.index();
         let Some(slot) = self.ops.get_mut(index) else {
             // Op already dropped or removed.
@@ -307,9 +272,15 @@ impl DriverBackend for IocpBackend {
 
         match &slot.state {
             State::Submitted | State::Waiting(..) => {
-                // The future was dropped while the kernel may still complete
-                // the operation. Ask Windows to cancel it, but keep the slot
-                // and data alive until the completion packet arrives.
+                // Blocking job not yet handed to the pool — free immediately.
+                if slot.blocking_job.take().is_some() {
+                    self.ops.remove(index);
+                    let _ = op.take_data();
+                    return;
+                }
+
+                // Overlapped path: ask Windows to cancel, keep payload until
+                // the completion packet arrives so we can cleanup accept/open.
                 if let Some(interest) = slot.interest.as_ref() {
                     let result = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
 
@@ -323,14 +294,19 @@ impl DriverBackend for IocpBackend {
                     }
                 }
 
-                slot.data = op.take_data().map(PendingData::new);
-                slot.state = State::Ignored(Box::new(()));
+                let data = op.take_data().expect("op data missing on detach");
+                slot.state = State::Ignored(Box::new(data));
             }
-            State::Completed(..) => {
-                // The kernel already completed and no one will poll the
-                // future, so the slot can be released immediately.
-                self.ops.remove(index);
-                let _ = op.take_data();
+            State::Completed(_) => {
+                // Completion already dequeued but never polled — cleanup now.
+                // (Also covers Accept Drop closing pre-allocated sockets when
+                // complete moves them out; errors leave Drop as the backstop.)
+                let slot = self.ops.remove(index);
+                if let State::Completed(completion) = slot.state {
+                    if let Some(data) = op.take_data() {
+                        drop(data.complete(completion));
+                    }
+                }
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
             State::Ready => unreachable!("invalid operation state"),
@@ -472,9 +448,13 @@ impl Drop for IocpBackend {
                 State::Submitted | State::Waiting(..) => {
                     // In-flight ops must be canceled and then drained from the
                     // completion port before their OVERLAPPED memory can go.
+                    // Preserve an existing Ignored cleanup when present; otherwise
+                    // install Detached (Op::drop should already have moved data).
                     if let Some(interest) = slot.interest.as_ref() {
                         let _ = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
-                        slot.state = State::Ignored(Box::new(()));
+                    }
+                    if !matches!(slot.state, State::Ignored(..)) {
+                        slot.state = State::Ignored(Box::new(Detached));
                     }
                 }
                 State::Ignored(..) => {

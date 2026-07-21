@@ -13,7 +13,7 @@ use slab::Slab;
 use crate::driver::Handle;
 use crate::driver::{
     backends::DriverBackend,
-    ops::{Completion, Op, Operable, State, Submittable},
+    ops::{Completable, Completion, Detached, Op, Operable, State},
 };
 
 pub(crate) type Submission = squeue::Entry;
@@ -84,7 +84,7 @@ impl IoUringBackend {
 }
 
 impl DriverBackend for IoUringBackend {
-    fn submit_op<T: Submittable>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+    fn submit_op<T: Operable>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
         // Allocate a new entry in the driver
         let index = self.ops.insert(State::Submitted);
 
@@ -100,9 +100,10 @@ impl DriverBackend for IoUringBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T: 'static>(&mut self, op: &mut Op<T>) {
+    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>) {
+        let index = op.index();
         // Get the op state from the driver
-        let state = match self.ops.get_mut(op.index()) {
+        let state = match self.ops.get_mut(index) {
             Some(val) => val,
             None => {
                 // Op already dropped or removed
@@ -111,13 +112,21 @@ impl DriverBackend for IoUringBackend {
         };
 
         match state {
-            // Detach only: keep payload alive until the CQE. We do not submit
-            // AsyncCancel here; cancellation is reserved for driver Drop.
+            // Detach only: keep payload alive until the CQE so buffers stay valid
+            // and so a late completion can cleanup produced FDs (accept/open).
+            // We do not submit AsyncCancel here; cancellation is reserved for driver Drop.
             State::Submitted | State::Waiting(..) => {
-                *state = State::Ignored(Box::new(op.take_data()));
+                let data = op.take_data().expect("op data missing on detach");
+                *state = State::Ignored(Box::new(data));
             }
-            State::Completed(..) => {
-                self.ops.remove(op.index());
+            State::Completed(_) => {
+                // Completion already arrived but the future never polled it.
+                // Run complete so orphan accept/open FDs are closed.
+                if let State::Completed(completion) = self.ops.remove(index) {
+                    if let Some(data) = op.take_data() {
+                        drop(data.complete(completion));
+                    }
+                }
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
             State::Ready => unreachable!("invalid operation state"),
@@ -287,17 +296,22 @@ impl Drop for IoUringBackend {
             self.submit().expect("Internal error when dropping driver");
         }
 
-        // Pre-determine what to cancel
-        // After this pass, all ops will be marked either as Completed or Ignored, as appropriate
+        // Pre-determine what to cancel.
+        // After this pass, all ops are Completed or Ignored.
+        // Preserve existing Ignored payloads so late CQEs still cleanup orphan FDs.
         for (_, state) in self.ops.iter_mut() {
-            match std::mem::replace(state, State::Ignored(Box::new(()))) {
+            match std::mem::replace(state, State::Ignored(Box::new(Detached))) {
                 old_state @ State::Completed(_) => {
                     // Don't cancel completed ops
                     *state = old_state;
                 }
+                State::Ignored(payload) => {
+                    // Keep the typed cleanup installed by Op::drop.
+                    *state = State::Ignored(payload);
+                }
                 _ => {
-                    // All other states need cancelling.
-                    // The mem::replace means these are now marked Ignored.
+                    // Submitted / Waiting without a detached payload (driver
+                    // dropped before Op::drop). No typed cleanup available.
                 }
             }
         }

@@ -27,8 +27,26 @@ pub struct TcpStream {
 
 impl TcpStream {
     /// Opens a TCP connection to a remote host at the given `SocketAddr`
+    ///
+    /// On Windows, the socket is automatically bound to an unspecified address
+    /// before connecting, as required by `ConnectEx`.
     pub async fn connect(addr: SocketAddr) -> std::io::Result<TcpStream> {
         let socket = Socket::new(addr, socket2::Type::STREAM)?;
+
+        // ConnectEx on Windows requires the socket to be bound before calling it.
+        // Bind to an ephemeral port on the appropriate unspecified address.
+        #[cfg(windows)]
+        {
+            use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+
+            let bind_addr = if addr.is_ipv4() {
+                socket2::SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))
+            } else {
+                socket2::SockAddr::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
+            };
+            socket.inner.handle.bind(&bind_addr)?;
+        }
+
         socket.connect(socket2::SockAddr::from(addr)).await?;
         let tcp_stream = TcpStream { inner: socket };
         Ok(tcp_stream)

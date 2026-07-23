@@ -100,10 +100,6 @@ impl Submittable for Connect {
             Some(ptr.expect("WSAIoctl returned success but ConnectEx pointer is null"))
         });
 
-        // TODO: ConnectEx may require the socket to be explicitly bound first.
-        // If the socket was created without an explicit bind, ConnectEx can fail
-        // with WSAEINVAL on some Windows configurations. Consider adding a bind
-        // to INADDR_ANY:0 before calling ConnectEx.
         let connectex = connectex.expect("ConnectEx not loaded");
         let mut interest = Interest::new(socket as _);
 

@@ -151,6 +151,7 @@ impl AsyncReadAt for File {
             .await
     }
 
+    #[cfg(not(windows))]
     async fn read_vectored_at<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
         Op::readv(&self.handle, bufs, pos)
             .expect("Failed to submit readv operation (no runtime or driver error)")
@@ -165,6 +166,7 @@ impl AsyncWriteAt for File {
             .await
     }
 
+    #[cfg(not(windows))]
     async fn write_vectored_at<B: BoundedIoBuf>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
         Op::writev(&self.handle, bufs, pos)
             .expect("Failed to submit writev operation (no runtime or driver error)")

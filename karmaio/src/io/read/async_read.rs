@@ -20,7 +20,31 @@ pub trait AsyncRead {
     /// Ownership of the `bufs` vector and its buffers is transferred to the operation;
     /// the same vector of buffers is returned on completion.
     /// Implementors should fill buffers in order.
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>>;
+    ///
+    /// The default implementation reads into each buffer sequentially via [`AsyncRead::read`].
+    /// Types with native scatter-gather support (e.g. io_uring `readv`) should override this.
+    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let mut total = 0usize;
+        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
+        for buf in bufs {
+            let cap = buf.bytes_total();
+            let (res, buf) = self.read(buf).await;
+            match res {
+                Ok(n) => {
+                    total += n;
+                    returned.push(buf);
+                    if n < cap {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    returned.push(buf);
+                    return (Err(e), returned);
+                }
+            }
+        }
+        (Ok(total), returned)
+    }
 }
 
 // The AsyncReadAt trait defines asynchronous reading operations for objects that implement it.
@@ -35,8 +59,34 @@ pub trait AsyncReadAt {
     // Like [`AsyncRead::read`], except that it reads at a specified position.
     async fn read_at<B: BoundedIoBufMut>(&mut self, buf: B, pos: u64) -> BufResult<usize, B>;
 
-    /// Like [`AsyncRead::readv`], except that it reads at a specified position (vectored).
-    async fn read_vectored_at<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>>;
+    /// Like [`AsyncRead::read_vectored`], except that it reads at a specified position (vectored).
+    ///
+    /// The default implementation reads into each buffer sequentially via [`AsyncReadAt::read_at`].
+    /// Types with native scatter-gather support (e.g. io_uring `readv`, `preadv`) should override this.
+    async fn read_vectored_at<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
+        let mut total = 0usize;
+        let mut offset = pos;
+        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
+        for buf in bufs {
+            let cap = buf.bytes_total();
+            let (res, buf) = self.read_at(buf, offset).await;
+            match res {
+                Ok(n) => {
+                    total += n;
+                    offset += n as u64;
+                    returned.push(buf);
+                    if n < cap {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    returned.push(buf);
+                    return (Err(e), returned);
+                }
+            }
+        }
+        (Ok(total), returned)
+    }
 }
 
 impl<T: ?Sized + AsyncRead> AsyncRead for &mut T {

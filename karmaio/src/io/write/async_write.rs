@@ -25,7 +25,31 @@ pub trait AsyncWrite {
 
     /// Writes the contents of multiple buffers into this writer (vectored / gather).
     /// Ownership of the `bufs` vector and its buffers is transferred; the same vector is returned on completion.
-    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>>;
+    ///
+    /// The default implementation writes each buffer sequentially via [`AsyncWrite::write`].
+    /// Types with native gather support (e.g. io_uring `writev`) should override this.
+    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+        let mut total = 0usize;
+        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
+        for buf in bufs {
+            let init = buf.bytes_init();
+            let (res, buf) = self.write(buf).await;
+            match res {
+                Ok(n) => {
+                    total += n;
+                    returned.push(buf);
+                    if n < init {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    returned.push(buf);
+                    return (Err(e), returned);
+                }
+            }
+        }
+        (Ok(total), returned)
+    }
 
     // Flushes this output stream, ensuring that all buffered content is successfully written to its destination.
     async fn flush(&mut self) -> Result<()>;
@@ -50,8 +74,34 @@ pub trait AsyncWriteAt {
     // Like [`AsyncWrite::write`], except that it writes at a specified position.
     async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B>;
 
-    /// Like [`AsyncWrite::writev`], except that it writes at a specified position (vectored).
-    async fn write_vectored_at<B: BoundedIoBuf>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>>;
+    /// Like [`AsyncWrite::write_vectored`], except that it writes at a specified position (vectored).
+    ///
+    /// The default implementation writes each buffer sequentially via [`AsyncWriteAt::write_at`].
+    /// Types with native gather support (e.g. io_uring `writev`, `pwritev`) should override this.
+    async fn write_vectored_at<B: BoundedIoBuf>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
+        let mut total = 0usize;
+        let mut offset = pos;
+        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
+        for buf in bufs {
+            let init = buf.bytes_init();
+            let (res, buf) = self.write_at(buf, offset).await;
+            match res {
+                Ok(n) => {
+                    total += n;
+                    offset += n as u64;
+                    returned.push(buf);
+                    if n < init {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    returned.push(buf);
+                    return (Err(e), returned);
+                }
+            }
+        }
+        (Ok(total), returned)
+    }
 }
 
 impl<T: ?Sized + AsyncWriteAt> AsyncWriteAt for &mut T {

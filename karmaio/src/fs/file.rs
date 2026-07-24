@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
-    driver::{helpers::io_handle::SharedIoHandle, ops::Op},
+    driver::{helpers::attached_handle::AttachedHandle, ops::Op},
     fs::{Metadata, OpenOptions, Permissions},
     io::{AsyncReadAt, AsyncWriteAt},
 };
@@ -25,8 +25,9 @@ use crate::{
 /// observe close errors. Closing a file does not guarantee writes have persisted
 /// to disk; use [`sync_all`] for that.
 pub struct File {
-    /// Open file; shared so in-flight ops can pin the resource until complete.
-    pub(crate) handle: SharedIoHandle<std::fs::File>,
+    /// Open file; associated with the driver and shared so in-flight ops can
+    /// pin the resource until complete.
+    pub(crate) handle: AttachedHandle<std::fs::File>,
 }
 
 impl File {
@@ -84,7 +85,7 @@ impl File {
     /// Dropping a [`File`] without calling `close` still closes the handle
     /// synchronously when the last reference is dropped.
     pub async fn close(self) -> std::io::Result<()> {
-        self.handle.close().await
+        self.handle.into_inner().close().await
     }
 
     /// Attempts to sync all OS-internal metadata to disk.
@@ -133,13 +134,16 @@ impl File {
 impl From<std::fs::File> for File {
     fn from(file: std::fs::File) -> Self {
         Self {
-            handle: SharedIoHandle::new(file),
+            // SAFETY: We're creating an AttachedHandle that will associate with
+            // the driver on first use. This is safe because the File will be used
+            // within a runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(file) },
         }
     }
 }
 
-impl From<SharedIoHandle<std::fs::File>> for File {
-    fn from(handle: SharedIoHandle<std::fs::File>) -> Self {
+impl From<AttachedHandle<std::fs::File>> for File {
+    fn from(handle: AttachedHandle<std::fs::File>) -> Self {
         Self { handle }
     }
 }

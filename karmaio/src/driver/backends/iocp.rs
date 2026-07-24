@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashSet, VecDeque},
+    collections::VecDeque,
     io::{Error, Result},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
     sync::{Arc, Mutex},
@@ -10,6 +10,9 @@ use std::{
 use slab::Slab;
 use windows_sys::Win32::{
     Foundation::{ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, WAIT_TIMEOUT},
+    Storage::FileSystem::{
+        FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, FILE_SKIP_SET_EVENT_ON_HANDLE, SetFileCompletionNotificationModes,
+    },
     System::IO::{
         CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
         PostQueuedCompletionStatus,
@@ -188,9 +191,6 @@ pub(crate) struct IocpBackend {
     //    a. Reading completions from kernel
     //    b. Processing completions
     entries: Vec<OVERLAPPED_ENTRY>,
-    // Tracks handles already associated with the IOCP port to avoid redundant
-    // CreateIoCompletionPort calls.
-    attached_handles: HashSet<HANDLE>,
     /// Completions produced by blocking-pool workers (index, result).
     blocking_done: Arc<Mutex<VecDeque<(usize, Completion)>>>,
 }
@@ -201,18 +201,8 @@ impl IocpBackend {
             port: CompletionPort::new()?,
             ops: Slab::with_capacity(capacity),
             entries: vec![unsafe { std::mem::zeroed() }; capacity],
-            attached_handles: HashSet::new(),
             blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         })
-    }
-
-    // Associates a file or socket handle with this backend's completion port.
-    //
-    // Windows requires this before issuing overlapped I/O on the handle. The
-    // completion key is intentionally separate from op identity; op identity is
-    // recovered from the stable `OVERLAPPED` pointer.
-    pub(crate) fn add_handle(&self, handle: RawHandle, completion_key: usize) -> Result<()> {
-        self.port.add_handle(handle, completion_key)
     }
 
     fn push_blocking(&self, index: usize, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) {
@@ -243,12 +233,9 @@ impl DriverBackend for IocpBackend {
                 self.ops[index].state = State::Completed(completion);
             }
             Submission::Pending(mut interest) => {
-                // Ensure the handle is associated with the IOCP before the
-                // kernel completes the overlapped operation.
-                if self.attached_handles.insert(interest.handle()) {
-                    self.add_handle(interest.handle() as RawHandle, 0)?;
-                }
-
+                // The handle must be attached to the IOCP before submitting.
+                // This is now enforced by the Attacher type at handle creation.
+                //
                 // The kernel owns this OVERLAPPED until completion. Stamp the
                 // slab index into the stable allocation before storing it.
                 interest.set_index(index);
@@ -438,6 +425,21 @@ impl DriverBackend for IocpBackend {
         crate::driver::Wakeup::new(move || unsafe {
             PostQueuedCompletionStatus(port_handle as HANDLE, 0, 0, std::ptr::null_mut());
         })
+    }
+
+    fn attach(&self, handle: RawHandle) -> Result<()> {
+        self.port.add_handle(handle, 0)?;
+
+        // Optimization: skip completion port notifications for synchronous completions.
+        // This reduces unnecessary I/O wake-ups when operations complete immediately.
+        unsafe {
+            SetFileCompletionNotificationModes(
+                handle as HANDLE,
+                (FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE) as u32,
+            );
+        }
+
+        Ok(())
     }
 }
 

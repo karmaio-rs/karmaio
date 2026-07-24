@@ -6,7 +6,7 @@ use std::os::windows::io::RawSocket;
 use crate::{
     driver::{
         Submission,
-        helpers::{io_handle::SharedIoHandle, socket::Socket},
+        helpers::{attached_handle::AttachedHandle, io_handle::SharedIoHandle, socket::Socket},
         ops::{Completable, Completion, Op, Operable, Submittable},
     },
     runtime::local::CURRENT_DRIVER,
@@ -135,7 +135,8 @@ impl Completable for Accept {
         // Safety: accept returned a new open socket fd; ownership transfers here.
         let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
         let socket = Socket {
-            handle: SharedIoHandle::new(sock),
+            // SAFETY: The socket was just accepted and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(sock) },
         };
 
         let _ = socket.set_async_flags();
@@ -212,7 +213,8 @@ impl Completable for Accept {
         // Safety: AcceptEx produced an open socket; ownership transfers here.
         let sock = unsafe { socket2::Socket::from_raw_socket(accepted_socket) };
         let socket = Socket {
-            handle: SharedIoHandle::new(sock),
+            // SAFETY: The socket was just accepted and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(sock) },
         };
 
         let _ = socket.set_async_flags();

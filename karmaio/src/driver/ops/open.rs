@@ -7,8 +7,8 @@ use crate::{
     driver::{
         Submission,
         helpers::{
+            attached_handle::AttachedHandle,
             cstr::{OsPath, cstr},
-            io_handle::SharedIoHandle,
         },
         ops::{Completable, Completion, Op, Operable, Submittable},
     },
@@ -192,7 +192,8 @@ impl Completable for Open {
         // Safety: open returned a new open file descriptor; ownership transfers here.
         let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
         Ok(File {
-            handle: SharedIoHandle::new(file),
+            // SAFETY: The file was just opened and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(file) },
         })
     }
 }
@@ -207,7 +208,8 @@ impl Completable for Open {
         // Safety: open produced an open Win32 file handle; ownership transfers here.
         let file = unsafe { std::fs::File::from_raw_handle(handle) };
         Ok(File {
-            handle: SharedIoHandle::new(file),
+            // SAFETY: The file was just opened and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(file) },
         })
     }
 }

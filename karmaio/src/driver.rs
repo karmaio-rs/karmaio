@@ -3,7 +3,7 @@ use crate::driver::ops::{Completable, Op, Operable};
 use crate::runtime::blocking::BlockingPoolHandle;
 use std::ops::Deref;
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
 use std::task::Poll;
@@ -113,12 +113,22 @@ impl Driver {
         &self.blocking
     }
 
-    /// Associates a file or socket handle with the IOCP completion port.
+    /// Associates a file or socket handle with the driver's I/O mechanism.
     ///
-    /// This must be called before issuing any overlapped I/O on the handle.
+    /// On Windows (IOCP), this calls `CreateIoCompletionPort` and sets
+    /// `SetFileCompletionNotificationModes` for optimal performance. On
+    /// Linux (io-uring) / macOS (kqueue), this is a no-op.
     #[cfg(windows)]
     pub(crate) fn attach(&self, handle: RawHandle) -> io::Result<()> {
-        self.backend.borrow().add_handle(handle, 0)
+        self.backend.borrow().attach(handle)
+    }
+
+    /// Associates a file descriptor with the driver's I/O mechanism.
+    ///
+    /// On Linux (io-uring) / macOS (kqueue), this is a no-op.
+    #[cfg(unix)]
+    pub(crate) fn attach(&self, fd: RawFd) -> io::Result<()> {
+        self.backend.borrow().attach(fd)
     }
 }
 

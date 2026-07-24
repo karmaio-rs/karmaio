@@ -409,6 +409,11 @@ impl DriverBackend for KqueueBackend {
             let _ = unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
         })
     }
+
+    fn attach(&self, _fd: RawFd) -> Result<()> {
+        // No-op on kqueue: handles don't need explicit registration.
+        Ok(())
+    }
 }
 
 impl AsRawFd for KqueueBackend {

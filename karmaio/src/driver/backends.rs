@@ -4,6 +4,11 @@ use std::{
     time::Duration,
 };
 
+#[cfg(unix)]
+use std::os::fd::RawFd;
+#[cfg(windows)]
+use std::os::windows::io::RawHandle;
+
 #[cfg(target_os = "windows")]
 pub(crate) mod iocp;
 #[cfg(target_os = "linux")]
@@ -78,4 +83,18 @@ pub(crate) trait DriverBackend {
     /// Create a `Wakeup` token that can be used from other threads to wake
     /// a currently blocked `wait*` call on this driver.
     fn create_wakeup(&self) -> crate::driver::Wakeup;
+
+    /// Associate a file or socket handle with the driver's I/O mechanism.
+    ///
+    /// On Windows (IOCP), this calls `CreateIoCompletionPort` and sets
+    /// `SetFileCompletionNotificationModes` for optimal performance. On
+    /// Linux (io-uring) / macOS (kqueue), this is a no-op.
+    #[cfg(windows)]
+    fn attach(&self, handle: RawHandle) -> Result<()>;
+
+    /// Associate a file descriptor with the driver's I/O mechanism.
+    ///
+    /// On Linux (io-uring) / macOS (kqueue), this is a no-op.
+    #[cfg(unix)]
+    fn attach(&self, fd: RawFd) -> Result<()>;
 }

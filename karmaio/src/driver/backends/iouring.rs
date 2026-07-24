@@ -273,6 +273,11 @@ impl DriverBackend for IoUringBackend {
             };
         })
     }
+
+    fn attach(&self, _fd: RawFd) -> Result<()> {
+        // No-op on io_uring: handles don't need explicit registration.
+        Ok(())
+    }
 }
 
 impl AsRawFd for IoUringBackend {

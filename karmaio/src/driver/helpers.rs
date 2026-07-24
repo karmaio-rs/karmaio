@@ -2,6 +2,9 @@
 #[cfg(feature = "fs")]
 pub(crate) mod cstr;
 
+// Handle associated with the I/O driver (IOCP-specific behavior).
+pub(crate) mod attached_handle;
+
 // Typed shared OS-resource handle (`SharedIoHandle<T>`); always required by the driver.
 pub(crate) mod io_handle;
 

@@ -8,7 +8,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket};
 
 use crate::buf::{BoundedIoBuf, BoundedIoBufMut, BufResult};
-use crate::driver::helpers::io_handle::SharedIoHandle;
+use crate::driver::helpers::attached_handle::AttachedHandle;
 use crate::driver::ops::Op;
 
 // This is an internal wrapper around socket operations for the runtime.
@@ -16,10 +16,10 @@ use crate::driver::ops::Op;
 // presenting a clean, reusable api for the top level socket modules.
 //
 // The owned resource is a `socket2::Socket` so control-plane APIs (listen, nodelay,
-// etc.) go through `SharedIoHandle`/`Deref` without reconverting through raw FDs.
+// etc.) go through `AttachedHandle`/`Deref` without reconverting through raw FDs.
 #[derive(Clone)]
 pub(crate) struct Socket {
-    pub(crate) handle: SharedIoHandle<socket2::Socket>,
+    pub(crate) handle: AttachedHandle<socket2::Socket>,
 }
 
 /// Configure a socket for async use on the current platform.
@@ -48,7 +48,9 @@ impl Socket {
         configure_async_socket(&socket)?;
 
         Ok(Self {
-            handle: SharedIoHandle::new(socket),
+            // SAFETY: We're creating an AttachedHandle that will associate with
+            // the driver on first use.
+            handle: unsafe { AttachedHandle::new_unchecked(socket) },
         })
     }
 
@@ -59,7 +61,9 @@ impl Socket {
         configure_async_socket(&socket)?;
 
         Ok(Self {
-            handle: SharedIoHandle::new(socket),
+            // SAFETY: We're creating an AttachedHandle that will associate with
+            // the driver on first use.
+            handle: unsafe { AttachedHandle::new_unchecked(socket) },
         })
     }
 
@@ -95,7 +99,9 @@ impl Socket {
         socket.bind(&socket_addr)?;
 
         Ok(Self {
-            handle: SharedIoHandle::new(socket),
+            // SAFETY: We're creating an AttachedHandle that will associate with
+            // the driver on first use.
+            handle: unsafe { AttachedHandle::new_unchecked(socket) },
         })
     }
 
@@ -136,7 +142,7 @@ impl Socket {
     /// Prefer this over dropping when close errors must be observed. Drop still
     /// closes the handle synchronously when the last reference is dropped.
     pub(crate) async fn close(self) -> Result<()> {
-        self.handle.close().await
+        self.handle.into_inner().close().await
     }
 
     /// Set the value of the `TCP_NODELAY` option on this socket.
@@ -229,8 +235,8 @@ impl AsRawSocket for Socket {
     }
 }
 
-impl From<SharedIoHandle<socket2::Socket>> for Socket {
-    fn from(value: SharedIoHandle<socket2::Socket>) -> Self {
+impl From<AttachedHandle<socket2::Socket>> for Socket {
+    fn from(value: AttachedHandle<socket2::Socket>) -> Self {
         Self { handle: value }
     }
 }
@@ -238,7 +244,9 @@ impl From<SharedIoHandle<socket2::Socket>> for Socket {
 impl From<socket2::Socket> for Socket {
     fn from(socket: socket2::Socket) -> Self {
         Self {
-            handle: SharedIoHandle::new(socket),
+            // SAFETY: We're creating an AttachedHandle that will associate with
+            // the driver on first use.
+            handle: unsafe { AttachedHandle::new_unchecked(socket) },
         }
     }
 }

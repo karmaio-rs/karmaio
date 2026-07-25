@@ -2,10 +2,12 @@ mod bounded_buf;
 mod bounded_buf_mut;
 mod io_buf;
 mod io_buf_mut;
+mod io_buf_mut_ext;
 mod slice;
 
 pub use io_buf::IoBuf;
 pub use io_buf_mut::IoBufMut;
+pub use io_buf_mut_ext::IoBufMutExt;
 
 pub use bounded_buf::BoundedIoBuf;
 pub use bounded_buf_mut::BoundedIoBufMut;

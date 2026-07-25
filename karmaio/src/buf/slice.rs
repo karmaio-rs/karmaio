@@ -137,9 +137,10 @@ impl<T: IoBuf> BoundedIoBuf for Slice<T> {
     }
 
     fn stable_read_ptr(&self) -> *const u8 {
-        // Safety: the `IoBuf` trait is marked as unsafe and is expected to be implemented correctly.
-        let buf_bytes = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
-        buf_bytes[self.start..].as_ptr()
+        // Safety: `start` is within the underlying buffer capacity. Callers that
+        // read via this pointer must only access initialized bytes
+        // (`bytes_init` of the view).
+        unsafe { self.buf.stable_read_ptr().add(self.start) }
     }
 
     #[inline]
@@ -171,13 +172,18 @@ impl<T: IoBufMut> BoundedIoBufMut for Slice<T> {
     }
 
     fn stable_write_ptr(&mut self) -> *mut u8 {
-        // Safety: the `IoBufMut` trait is marked as unsafe and is expected to be implemented correct.
-        let buf_bytes = unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_init()) };
-        buf_bytes[self.start..].as_mut_ptr()
+        // Point at the slice start even when it lies at/after the initialized
+        // watermark so completion reads can fill the uninitialized tail
+        // (`start == bytes_init()`, `end == bytes_total()`).
+        //
+        // Safety: `start` is within the underlying buffer's capacity
+        // (`bytes_total`); the pointer may reference uninitialized memory.
+        unsafe { self.buf.stable_write_ptr().add(self.start) }
     }
 
     #[inline]
     unsafe fn set_init(&mut self, pos: usize) {
+        // `pos` is relative to this view's start. Absolute init becomes start + pos.
         self.buf.set_init(self.start + pos);
     }
 }

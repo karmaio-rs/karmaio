@@ -72,6 +72,10 @@ windows-sys = { version = "0.61", features = [
 name = "test_attr"
 required-features = ["macros"]
 
+[[test]]
+name = "framed_tcp"
+required-features = ["macros", "net"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

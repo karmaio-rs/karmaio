@@ -28,6 +28,11 @@ path = "echo_tcp.rs"
 required-features = ["macros", "net"]
 
 [[example]]
+name = "framed_echo"
+path = "framed_echo.rs"
+required-features = ["macros", "net"]
+
+[[example]]
 name = "udp_echo"
 path = "udp_echo.rs"
 required-features = ["macros", "net"]

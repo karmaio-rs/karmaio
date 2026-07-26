@@ -1,5 +1,5 @@
 use crate::{
-    buf::{BufResult, IoBufMut, Slice},
+    buf::{BoundedIoBuf, BufResult, IoBufMut, Slice},
     io::AsyncRead,
 };
 
@@ -38,6 +38,12 @@ macro_rules! reader_trait_impl {
 pub trait AsyncReadExt: AsyncRead {
     // Read until buf capacity is fulfilled
     async fn read_exact<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B>;
+
+    // Reads into the uninitialized tail of `buf` (appends to initialized data).
+    //
+    // Equivalent to reading into `buf.slice(bytes_init()..bytes_total())` and
+    // restoring the full buffer. Useful when growing a framing buffer.
+    async fn append<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B>;
 
     reader_trait_impl! {
         u8   => read_u8,   read_u8_le,
@@ -85,5 +91,16 @@ impl<T: AsyncRead + ?Sized> AsyncReadExt for T {
         }
 
         (Ok(bytes_read), buf)
+    }
+
+    async fn append<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B> {
+        let init = buf.bytes_init();
+        let total = buf.bytes_total();
+        if init >= total {
+            return (Ok(0), buf);
+        }
+        let slice = buf.slice(init..total);
+        let (res, slice) = self.read(slice).await;
+        (res, slice.into_inner())
     }
 }

@@ -38,12 +38,12 @@ pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
 
     // Stable WSABUF allocation for Windows overlapped I/O.
     #[cfg(windows)]
-    wsa_buf: windows_sys::Win32::Networking::WinSock::WSABUF,
+    wsa_buf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
 
     // Stable memory for the address length pointer passed to WSARecvFrom.
     // The kernel writes to this asynchronously via the overlapped I/O path.
     #[cfg(windows)]
-    socket_addr_len: i32,
+    socket_addr_len: Box<i32>,
 }
 
 impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
@@ -61,7 +61,7 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
             msghdr.msg_iov = io_slices.as_mut_ptr().cast();
             msghdr.msg_iovlen = io_slices.len() as _;
             msghdr.msg_name = socket_addr.as_ptr() as *mut libc::c_void;
-            msghdr.msg_namelen = socket_addr.len() as u32;
+            msghdr.msg_namelen = socket_addr.len();
 
             (io_slices, msghdr)
         };
@@ -81,9 +81,9 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
             #[cfg(target_os = "linux")]
             msghdr,
             #[cfg(windows)]
-            wsa_buf,
+            wsa_buf: Box::new(wsa_buf),
             #[cfg(windows)]
-            socket_addr_len: 0,
+            socket_addr_len: Box::new(0),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -141,17 +141,17 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
         let mut bytes_recv = 0u32;
 
         // Must reside in stable memory for the overlapped I/O path.
-        self.socket_addr_len = self.socket_addr.len() as i32;
+        *self.socket_addr_len = self.socket_addr.len() as i32;
 
         windows_syscall_submit_overlapped!(interest, socket, {
             WSARecvFrom(
                 socket as _,
-                &mut self.wsa_buf,
+                self.wsa_buf.as_mut(),
                 1,
                 &mut bytes_recv,
                 &mut flags,
                 self.socket_addr.as_ptr() as *mut _,
-                &mut self.socket_addr_len,
+                self.socket_addr_len.as_mut(),
                 interest.as_mut_ptr(),
                 None,
             )
@@ -169,23 +169,37 @@ impl<B: BoundedIoBufMut> BackendComplete for RecvFrom<B> {
         let mut buf = self.buf;
 
         #[cfg(windows)]
-        unsafe {
+        {
+            let address_len = match usize::try_from(*self.socket_addr_len) {
+                Ok(length) if length <= self.socket_addr.len() as usize => length,
+                _ => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid socket address length",
+                        )),
+                        buf,
+                    );
+                }
+            };
             // Sync the address length that the kernel wrote through the
             // stable `lpFromlen` pointer during the overlapped operation.
-            self.socket_addr.set_length(self.socket_addr_len as _);
+            unsafe {
+                self.socket_addr.set_length(address_len as _);
+            }
         }
 
-        let socket_addr = (*self.socket_addr).as_socket();
-
-        let res = res.map(|bytes_written| {
-            let socket_addr: SocketAddr = socket_addr.unwrap();
+        let res = res.and_then(|bytes_written| {
+            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "kernel returned an invalid socket address")
+            })?;
 
             // The kernel wrote `bytes_written` bytes to the buffer.
             unsafe {
                 buf.set_init(bytes_written);
             }
 
-            (bytes_written, socket_addr)
+            Ok((bytes_written, socket_addr))
         });
 
         (res, buf)

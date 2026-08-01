@@ -11,7 +11,8 @@ macro_rules! macos_syscall {
         if res < 0 {
             Err(std::io::Error::last_os_error())
         } else {
-            Ok(res as u32)
+            u32::try_from(res)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "system call result exceeds u32"))
         }
     }};
 }

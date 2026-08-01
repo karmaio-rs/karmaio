@@ -1,13 +1,13 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     io::{Error, Result},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
+    panic::{self, AssertUnwindSafe},
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
-use slab::Slab;
 use windows_sys::Win32::{
     Foundation::{ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, WAIT_TIMEOUT},
     Storage::FileSystem::SetFileCompletionNotificationModes,
@@ -15,9 +15,10 @@ use windows_sys::Win32::{
         CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
         PostQueuedCompletionStatus,
     },
-    System::WindowsProgramming::{FILE_SKIP_COMPLETION_PORT_ON_SUCCESS, FILE_SKIP_SET_EVENT_ON_HANDLE},
+    System::WindowsProgramming::FILE_SKIP_SET_EVENT_ON_HANDLE,
 };
 
+use crate::driver::ops::{OpKey, OpTable};
 use crate::driver::{
     Handle, Wakeup,
     ops::{BlockingJob, Completion, Op},
@@ -31,7 +32,7 @@ use crate::runtime::blocking::BlockingPoolHandle;
 #[repr(C)]
 struct OverlappedHeader {
     raw: OVERLAPPED,
-    index: usize,
+    key: OpKey,
 }
 
 // Owned OVERLAPPED state for a submitted IOCP operation.
@@ -51,7 +52,7 @@ impl Interest {
         Self {
             overlapped: Box::new(OverlappedHeader {
                 raw: OVERLAPPED::default(),
-                index: usize::MAX,
+                key: OpKey::INVALID,
             }),
             handle: handle as HANDLE,
         }
@@ -74,16 +75,16 @@ impl Interest {
     }
 
     #[inline]
-    fn set_index(&mut self, index: usize) {
-        self.overlapped.index = index;
+    fn set_key(&mut self, key: OpKey) {
+        self.overlapped.key = key;
     }
 
     #[inline]
-    unsafe fn index_from_raw(overlapped: *mut OVERLAPPED) -> usize {
+    unsafe fn key_from_raw(overlapped: *mut OVERLAPPED) -> OpKey {
         // SAFETY: `Interest::as_mut_ptr` returns a pointer to the first field of
         // `OverlappedHeader`, and that boxed header is kept alive in the slab
         // until the completion packet has been processed.
-        unsafe { (*(overlapped as *mut OverlappedHeader)).index }
+        unsafe { (*(overlapped as *mut OverlappedHeader)).key }
     }
 }
 
@@ -94,6 +95,10 @@ pub(crate) enum IocpSubmission {
     Blocking(BlockingJob),
 }
 
+/// Build a normal one-shot IOCP submission.
+///
+/// Implementations must keep every buffer, length field, and other memory
+/// referenced by the returned overlapped request alive until completion.
 pub(crate) trait IocpSubmit {
     fn submit(&mut self) -> IocpSubmission;
 }
@@ -105,25 +110,15 @@ pub(crate) trait IocpComplete {
 }
 
 /// Backend-local IOCP operation protocol.
-pub(crate) trait IocpOperation: IocpSubmit + IocpComplete {
+///
+/// Implementations must keep all memory referenced by the returned overlapped
+/// request valid until Windows delivers its terminal completion packet.
+pub(crate) trait IocpOperation: IocpSubmit + IocpComplete<Result = Self::Output> {
     type Output;
-
-    fn submit(&mut self) -> IocpSubmission;
-    fn complete(self, completion: Completion) -> Self::Output;
 }
 
 impl<T: IocpSubmit + IocpComplete> IocpOperation for T {
     type Output = T::Result;
-
-    #[inline]
-    fn submit(&mut self) -> IocpSubmission {
-        IocpSubmit::submit(self)
-    }
-
-    #[inline]
-    fn complete(self, completion: Completion) -> Self::Output {
-        IocpComplete::complete(self, completion)
-    }
 }
 
 enum State {
@@ -139,7 +134,7 @@ trait IgnoredOp: 'static {
 
 impl<T: IocpOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(IocpOperation::complete(*self, completion));
+        drop(IocpComplete::complete(*self, completion));
     }
 }
 
@@ -150,26 +145,28 @@ impl IgnoredOp for Detached {
 }
 
 impl State {
-    fn complete(&mut self, completion: Completion) -> bool {
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>) {
         match self {
             State::Submitted => {
                 *self = State::Completed(completion);
-                false
+                (false, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    waker.wake();
+                    return (false, Some(waker));
                 }
-                false
+                (false, None)
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
                     payload.cleanup(completion);
                 }
-                true
+                (true, None)
             }
-            State::Completed(..) => unreachable!("completion delivered twice"),
+            // Ignore duplicate terminal packets. The first completion remains
+            // available for the future to consume.
+            State::Completed(..) => (false, None),
         }
     }
 }
@@ -257,11 +254,36 @@ impl AsRawHandle for CompletionPort {
     }
 }
 
+/// Shared completion-port wakeup state. The port remains owned by this Arc
+/// while remote wakeup closures are still alive, and the closed flag prevents
+/// writes after backend shutdown.
+struct IocpWakeup {
+    port: Arc<CompletionPort>,
+    closed: std::sync::atomic::AtomicBool,
+}
+
+impl IocpWakeup {
+    fn close(&self) {
+        self.closed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn wake(&self) {
+        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+
+        let _ = unsafe { PostQueuedCompletionStatus(self.port.as_raw_handle() as HANDLE, 0, 0, std::ptr::null_mut()) };
+    }
+}
+
 pub(crate) struct IocpBackend {
     // Completion port shared by all handles registered with this backend.
-    port: CompletionPort,
-    // Per-op state keyed by slab index.
-    ops: Slab<Slot>,
+    port: Arc<CompletionPort>,
+    wakeup: Arc<IocpWakeup>,
+    // Per-op state keyed by a generational operation identity.
+    ops: OpTable<Slot>,
+    // Validate completion pointers before reading the embedded operation key.
+    pending_by_overlapped: HashMap<usize, OpKey>,
     // Reused batch buffer for completion packets.
     // Since this is a buffer that is filled by the kernel over ffi, we need to be follow some rules -
     // 1. We will not resize this vec after initialization
@@ -270,45 +292,54 @@ pub(crate) struct IocpBackend {
     //    b. Processing completions
     entries: Vec<OVERLAPPED_ENTRY>,
     /// Completions produced by blocking-pool workers (index, result).
-    blocking_done: Arc<Mutex<VecDeque<(usize, Completion)>>>,
+    blocking_done: Arc<Mutex<VecDeque<(OpKey, Completion)>>>,
 }
 
 impl IocpBackend {
     pub(crate) fn new(capacity: usize) -> Result<Self> {
+        let port = Arc::new(CompletionPort::new()?);
+        let wakeup = Arc::new(IocpWakeup {
+            port: Arc::clone(&port),
+            closed: std::sync::atomic::AtomicBool::new(false),
+        });
         Ok(Self {
-            port: CompletionPort::new()?,
-            ops: Slab::with_capacity(capacity),
+            port,
+            wakeup,
+            ops: OpTable::new(capacity)?,
+            pending_by_overlapped: HashMap::with_capacity(capacity),
             entries: vec![unsafe { std::mem::zeroed() }; capacity],
             blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         })
     }
 
-    fn push_blocking(&self, index: usize, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) {
+    fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
         let done = Arc::clone(&self.blocking_done);
         let wakeup = wakeup.clone();
-        pool.dispatch(move || {
-            let completion = job.run();
+        pool.try_dispatch(Box::new(move || {
+            let completion = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
+                result: Err(Error::other("blocking operation panicked")),
+            });
             done.lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push_back((index, completion));
+                .push_back((key, completion));
             wakeup.wake();
-        });
+        }))
     }
 }
 
 impl IocpBackend {
     pub(crate) fn submit_op<T: IocpOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
-        let index = self.ops.insert(Slot {
+        let key = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
             blocking_job: None,
-        });
+        })?;
 
-        match IocpOperation::submit(&mut data) {
+        match IocpSubmit::submit(&mut data) {
             IocpSubmission::Ready(completion) => {
                 // The operation finished before it needed IOCP. Store the
                 // completion so the first poll resolves the future.
-                self.ops[index].state = State::Completed(completion);
+                self.ops.get_mut(key).expect("inserted IOCP operation missing").state = State::Completed(completion);
             }
             IocpSubmission::Pending(mut interest) => {
                 // The handle must be attached to the IOCP before submitting.
@@ -316,21 +347,32 @@ impl IocpBackend {
                 //
                 // The kernel owns this OVERLAPPED until completion. Stamp the
                 // slab index into the stable allocation before storing it.
-                interest.set_index(index);
-                self.ops[index].interest = Some(interest);
+                interest.set_key(key);
+                let address = interest.as_ptr() as usize;
+                if self.pending_by_overlapped.insert(address, key).is_some() {
+                    let _ = self.ops.remove(key);
+                    return Err(Error::new(
+                        std::io::ErrorKind::Other,
+                        "duplicate IOCP OVERLAPPED address",
+                    ));
+                }
+                self.ops.get_mut(key).expect("inserted IOCP operation missing").interest = Some(interest);
             }
             IocpSubmission::Blocking(job) => {
                 // Dispatch on first poll when waker + pool/wakeup are available.
-                self.ops[index].blocking_job = Some(job);
+                self.ops
+                    .get_mut(key)
+                    .expect("inserted IOCP operation missing")
+                    .blocking_job = Some(job);
             }
         }
 
-        Ok(Op::<T>::new(index, data, handle))
+        Ok(Op::<T>::new(key, data, handle))
     }
 
     pub(crate) fn remove_op<T: IocpOperation + 'static>(&mut self, op: &mut Op<T>) {
-        let index = op.index();
-        let Some(slot) = self.ops.get_mut(index) else {
+        let key = op.key();
+        let Some(slot) = self.ops.get_mut(key) else {
             // Op already dropped or removed.
             return;
         };
@@ -339,7 +381,7 @@ impl IocpBackend {
             State::Submitted | State::Waiting(..) => {
                 // Blocking job not yet handed to the pool — free immediately.
                 if slot.blocking_job.take().is_some() {
-                    self.ops.remove(index);
+                    self.ops.remove(key);
                     let _ = op.take_data();
                     return;
                 }
@@ -366,10 +408,10 @@ impl IocpBackend {
                 // Completion already dequeued but never polled — cleanup now.
                 // (Also covers Accept Drop closing pre-allocated sockets when
                 // complete moves them out; errors leave Drop as the backstop.)
-                let slot = self.ops.remove(index);
+                let slot = self.ops.remove(key).expect("completed operation disappeared");
                 if let State::Completed(completion) = slot.state {
                     if let Some(data) = op.take_data() {
-                        drop(IocpOperation::complete(data, completion));
+                        drop(IocpComplete::complete(data, completion));
                     }
                 }
             }
@@ -384,17 +426,21 @@ impl IocpBackend {
         blocking: &BlockingPoolHandle,
         wakeup: &Wakeup,
     ) -> Poll<T::Output> {
-        let index = op.index();
-        let slot = self.ops.get_mut(index).expect("invalid internal state");
+        let key = op.key();
+        let slot = self.ops.get_mut(key).expect("invalid internal state");
 
         // First poll of a Blocking submission: hand off to the pool.
         if let Some(job) = slot.blocking_job.take() {
             slot.state = State::Waiting(cx.waker().clone());
-            self.push_blocking(index, job, blocking, wakeup);
+            if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
+                let data = op.take_data().expect("Op data consumed");
+                self.ops.remove(key);
+                return Poll::Ready(IocpComplete::complete(data, Completion { result: Err(error) }));
+            }
             return Poll::Pending;
         }
 
-        let state = &mut self.ops.get_mut(index).expect("invalid internal state").state;
+        let state = &mut self.ops.get_mut(key).expect("invalid internal state").state;
 
         match state {
             State::Submitted => {
@@ -411,11 +457,16 @@ impl IocpBackend {
                 }
                 Poll::Pending
             }
-            State::Completed(_) => match self.ops.remove(op.index()).state {
+            State::Completed(_) => match self
+                .ops
+                .remove(op.key())
+                .expect("completed operation disappeared")
+                .state
+            {
                 // Completion was already dispatched. Consume op data exactly
                 // once and let the op-specific code decode the CQ result.
                 State::Completed(completion) => {
-                    Poll::Ready(IocpOperation::complete(op.take_data().unwrap(), completion))
+                    Poll::Ready(IocpComplete::complete(op.take_data().unwrap(), completion))
                 }
                 _ => unreachable!("invalid operation"),
             },
@@ -443,18 +494,29 @@ impl IocpBackend {
 
     pub(crate) fn drain_blocking_completions(&mut self) {
         // Called by the runtime after wait* (see Runtime::block_on).
-        let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some((index, completion)) = pending.pop_front() {
-            if let Some(slot) = self.ops.get_mut(index) {
-                let should_drop = slot.state.complete(completion);
+        let completions: Vec<_> = {
+            let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
+            pending.drain(..).collect()
+        };
+        let mut wakeups = Vec::new();
+        for (key, completion) in completions {
+            if let Some(slot) = self.ops.get_mut(key) {
+                let (should_drop, waker) = slot.state.complete(completion);
+                if let Some(waker) = waker {
+                    wakeups.push(waker);
+                }
                 if should_drop {
-                    self.ops.remove(index);
+                    self.ops.remove(key);
                 }
             }
         }
+        for waker in wakeups {
+            waker.wake();
+        }
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
+    pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
+        let mut wakeups = Vec::new();
         for entry in &self.entries {
             let overlapped = entry.lpOverlapped;
 
@@ -465,7 +527,18 @@ impl IocpBackend {
                 continue;
             }
 
-            let index = unsafe { Interest::index_from_raw(overlapped) };
+            let address = overlapped as usize;
+            let Some(expected_key) = self.pending_by_overlapped.remove(&address) else {
+                // Ignore foreign or duplicate packets without dereferencing an
+                // untrusted OVERLAPPED pointer.
+                continue;
+            };
+            let key = unsafe { Interest::key_from_raw(overlapped) };
+            if key != expected_key {
+                self.pending_by_overlapped.insert(address, expected_key);
+                debug_assert_eq!(key, expected_key, "IOCP operation key changed while pending");
+                continue;
+            }
             let status = (entry.Internal as u32) as i32;
             let result = if status >= 0 {
                 Ok(entry.dwNumberOfBytesTransferred)
@@ -474,44 +547,47 @@ impl IocpBackend {
                 Err(Error::from_raw_os_error(err as i32))
             };
 
-            if let Some(slot) = self.ops.get_mut(index) {
+            if let Some(slot) = self.ops.get_mut(key) {
                 // Once the packet is dequeued, Windows no longer references
                 // the OVERLAPPED allocation.
                 slot.interest = None;
 
                 // `State::complete` handles both waking a live waiter and
                 // reporting whether an ignored op can now be dropped.
-                let should_drop = slot.state.complete(Completion { result });
+                let (should_drop, waker) = slot.state.complete(Completion { result });
+                if let Some(waker) = waker {
+                    wakeups.push(waker);
+                }
 
                 if should_drop {
-                    self.ops.remove(index);
+                    self.ops.remove(key);
                 }
             }
+        }
+
+        for waker in wakeups {
+            waker.wake();
         }
 
         // All entires have been processed, so we clear the vec for the next round
         // Note: This does not deallocate the vec, so we still have the existing capacity
         self.entries.clear();
+        Ok(())
     }
 
     pub(crate) fn create_wakeup(&self) -> Wakeup {
-        // Cast to isize so the captured handle is Send + Sync (RawHandle is *mut c_void).
-        let port_handle = self.port.as_raw_handle() as isize;
-        crate::driver::Wakeup::new(move || unsafe {
-            PostQueuedCompletionStatus(port_handle as HANDLE, 0, 0, std::ptr::null_mut());
-        })
+        let wakeup = Arc::clone(&self.wakeup);
+        crate::driver::Wakeup::new(move || wakeup.wake())
     }
 
     pub(crate) fn attach(&self, handle: RawHandle) -> Result<()> {
         self.port.add_handle(handle, 0)?;
 
-        // Optimization: skip completion port notifications for synchronous completions.
-        // This reduces unnecessary I/O wake-ups when operations complete immediately.
+        // Avoid event objects, but retain completion-port packets for synchronous
+        // overlapped success. The operation protocol represents such requests as
+        // `Pending` and therefore relies on the packet being delivered.
         unsafe {
-            SetFileCompletionNotificationModes(
-                handle as HANDLE,
-                (FILE_SKIP_COMPLETION_PORT_ON_SUCCESS | FILE_SKIP_SET_EVENT_ON_HANDLE) as u8,
-            );
+            let _ = SetFileCompletionNotificationModes(handle as HANDLE, FILE_SKIP_SET_EVENT_ON_HANDLE as u8);
         }
 
         Ok(())
@@ -520,6 +596,7 @@ impl IocpBackend {
 
 impl Drop for IocpBackend {
     fn drop(&mut self) {
+        self.wakeup.close();
         for (_, slot) in self.ops.iter_mut() {
             match slot.state {
                 State::Submitted | State::Waiting(..) => {
@@ -555,7 +632,8 @@ impl Drop for IocpBackend {
             }
 
             self.drain_blocking_completions();
-            self.dispatch_completions();
+            self.dispatch_completions()
+                .expect("internal error while draining IOCP completions");
         }
 
         self.ops.clear();
@@ -613,7 +691,7 @@ mod tests {
     #[test]
     fn completion_before_first_poll_is_retained() {
         let mut state = State::Submitted;
-        assert!(!state.complete(Completion { result: Ok(7) }));
+        assert!(!state.complete(Completion { result: Ok(7) }).0);
         assert!(matches!(state, State::Completed(..)));
     }
 
@@ -622,7 +700,7 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
 
-        assert!(state.complete(Completion { result: Ok(0) }));
+        assert!(state.complete(Completion { result: Ok(0) }).0);
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
@@ -632,7 +710,7 @@ mod tests {
         let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
         let mut state = State::Waiting(waker);
 
-        assert!(!state.complete(Completion { result: Ok(0) }));
+        assert!(!state.complete(Completion { result: Ok(0) }).0);
         assert!(woken.load(Ordering::SeqCst));
     }
 }

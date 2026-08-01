@@ -32,8 +32,7 @@ use crate::runtime::local::CURRENT_DRIVER;
 ///
 /// # Platform-specific behavior
 /// - **Windows (IOCP):** Calls `CreateIoCompletionPort` to associate the handle
-///   with the completion port, then sets `FILE_SKIP_COMPLETION_PORT_ON_SUCCESS`
-///   and `FILE_SKIP_SET_EVENT_ON_HANDLE` for optimal performance.
+///   with the completion port and disables per-handle event objects.
 /// - **Linux (io-uring) / macOS (kqueue):** No-op (returns `Ok(())`).
 pub(crate) struct AttachedHandle<T> {
     source: SharedIoHandle<T>,

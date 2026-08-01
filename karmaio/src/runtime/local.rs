@@ -161,7 +161,9 @@ impl Runtime {
                         // Runtime owns the blocking pool: drain its completions
                         // as an explicit phase, then platform I/O completions.
                         self.driver.drain_blocking_completions();
-                        self.driver.dispatch_completions();
+                        self.driver
+                            .dispatch_completions()
+                            .expect("Failed to dispatch I/O completions");
                         self.timer.borrow_mut().wake();
                         // Note: we do *not* drain the remote task queue here. The
                         // next iteration of the inner loop drains at tick start.

@@ -166,8 +166,9 @@ impl PoolInner {
         let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
 
         if shared.shutdown {
-            // Drop the job; callers awaiting oneshots will see cancellation.
-            return Ok(());
+            // Tell the caller immediately. Silently dropping a driver-owned
+            // completion job would leave its operation registered forever.
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "blocking pool is shut down"));
         }
 
         shared.queue.push_back(job);
@@ -410,6 +411,16 @@ mod tests {
             tx.send(42).unwrap();
         });
         assert_eq!(rx.recv_timeout(Duration::from_secs(2)).unwrap(), 42);
+    }
+
+    #[test]
+    fn dispatch_after_shutdown_returns_an_error() {
+        let pool = BlockingPool::new(1, Duration::from_secs(1));
+        let handle = pool.handle();
+        drop(pool);
+
+        let result = handle.try_dispatch(Box::new(|| {}));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }
 
     #[test]

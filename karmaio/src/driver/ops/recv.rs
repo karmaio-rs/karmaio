@@ -17,7 +17,7 @@ pub(crate) struct Recv<B: BoundedIoBufMut> {
 
     // Stable WSABUF allocation for Windows overlapped I/O.
     #[cfg(windows)]
-    wsa_buf: windows_sys::Win32::Networking::WinSock::WSABUF,
+    wsa_buf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
 }
 
 impl<B: BoundedIoBufMut> Op<Recv<B>> {
@@ -34,7 +34,7 @@ impl<B: BoundedIoBufMut> Op<Recv<B>> {
             io_handle: io_handle.clone(),
             buf,
             #[cfg(windows)]
-            wsa_buf,
+            wsa_buf: Box::new(wsa_buf),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -82,7 +82,7 @@ impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
         windows_syscall_submit_overlapped!(interest, socket, {
             WSARecv(
                 socket as _,
-                &mut self.wsa_buf,
+                self.wsa_buf.as_mut(),
                 1,
                 &mut bytes_recv,
                 &mut flags,

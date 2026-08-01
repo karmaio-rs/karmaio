@@ -1,6 +1,11 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{
     io::Result,
+    pin::Pin,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -8,14 +13,17 @@ use std::{
 use io_uring::opcode::AsyncCancel;
 use io_uring::{IoUring, squeue};
 
-use slab::Slab;
-
 use crate::driver::ops::{Completion, Op};
+use crate::driver::ops::{OpKey, OpTable};
 use crate::driver::{Handle, Wakeup};
 
 pub(crate) type Submission = squeue::Entry;
 
-/// Build and consume a normal one-shot io_uring operation.
+/// Build a normal one-shot io_uring submission.
+///
+/// Implementations are internal to the crate and must ensure that every raw
+/// pointer stored in the returned SQE points to memory that remains valid until
+/// the operation's terminal CQE.
 pub(crate) trait UringSubmit {
     fn submit(&mut self) -> Submission;
 }
@@ -27,25 +35,16 @@ pub(crate) trait UringComplete {
 }
 
 /// Backend-local operation protocol used by the typed io_uring future.
-pub(crate) trait UringOperation: UringSubmit + UringComplete {
+///
+/// Implementations must keep every pointer embedded in the returned SQE valid
+/// until the terminal CQE is dispatched. Kernel-visible control structures
+/// therefore need stable ownership, typically through a `Box`-owned field.
+pub(crate) trait UringOperation: UringSubmit + UringComplete<Result = Self::Output> {
     type Output;
-
-    fn submit(&mut self) -> Submission;
-    fn complete(self, completion: Completion) -> Self::Output;
 }
 
 impl<T: UringSubmit + UringComplete> UringOperation for T {
     type Output = T::Result;
-
-    #[inline]
-    fn submit(&mut self) -> Submission {
-        UringSubmit::submit(self)
-    }
-
-    #[inline]
-    fn complete(self, completion: Completion) -> Self::Output {
-        UringComplete::complete(self, completion)
-    }
 }
 
 enum State {
@@ -61,7 +60,7 @@ trait IgnoredOp: 'static {
 
 impl<T: UringOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(UringOperation::complete(*self, completion));
+        drop(UringComplete::complete(*self, completion));
     }
 }
 
@@ -72,44 +71,74 @@ impl IgnoredOp for Detached {
 }
 
 impl State {
-    fn complete(&mut self, completion: Completion) -> bool {
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>) {
         match self {
             State::Submitted => {
                 *self = State::Completed(completion);
-                false
+                (false, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    waker.wake();
+                    return (false, Some(waker));
                 }
-                false
+                (false, None)
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
                     payload.cleanup(completion);
                 }
-                true
+                (true, None)
             }
-            State::Completed(..) => unreachable!("completion delivered twice"),
+            // A duplicate CQE is stale input. Keep the first terminal result
+            // and let the future consume it normally.
+            State::Completed(..) => (false, None),
         }
+    }
+}
+
+struct EventFdWakeup {
+    fd: OwnedFd,
+    closed: AtomicBool,
+}
+
+impl EventFdWakeup {
+    fn wake(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let val: u64 = 1;
+        let _ = unsafe {
+            libc::write(
+                self.fd.as_raw_fd(),
+                &val as *const u64 as *const libc::c_void,
+                std::mem::size_of::<u64>(),
+            )
+        };
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
     }
 }
 
 pub(crate) struct IoUringBackend {
     // List of ops tracked by the driver
-    ops: Slab<State>,
+    ops: OpTable<State>,
 
     // IoUring bindings
     uring: IoUring,
 
     /// eventfd used for cross-thread wakeups. We keep a read armed on it
     /// so that writes from other threads produce a CQE and wake submit_and_wait.
-    eventfd: std::os::fd::OwnedFd,
+    eventfd: Arc<EventFdWakeup>,
 
     /// Persistent buffer for the armed wakeup read. The kernel writes the eventfd
     /// counter here while the read is in flight. We reuse the same allocation.
-    wakeup_buf: *mut [u8; 8],
+    wakeup_buf: Pin<Box<[u8; 8]>>,
+    wakeup_read_armed: bool,
+    shutting_down: bool,
 }
 
 impl IoUringBackend {
@@ -119,69 +148,80 @@ impl IoUringBackend {
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
-            OwnedFd::from_raw_fd(fd)
+            Arc::new(EventFdWakeup {
+                fd: OwnedFd::from_raw_fd(fd),
+                closed: AtomicBool::new(false),
+            })
         };
 
-        let wakeup_buf = Box::into_raw(Box::new([0u8; 8]));
+        let wakeup_buf = Box::pin([0u8; 8]);
 
         let mut backend = Self {
             // `capacity` is configurable via the runtime builder's driver capacity.
-            ops: Slab::with_capacity(capacity),
+            ops: OpTable::new(capacity)?,
             uring: IoUring::builder().build(capacity as u32)?,
             eventfd,
             wakeup_buf,
+            wakeup_read_armed: false,
+            shutting_down: false,
         };
 
         // Arm the initial read on the eventfd so that a write from another
         // thread will complete and wake any blocked submit_and_wait.
-        backend.arm_wakeup_read();
+        backend.arm_wakeup_read()?;
 
         Ok(backend)
     }
 
     /// Submit (or re-arm) an async read on the eventfd using a special user_data.
     /// We bypass the normal Op machinery for the wakeup eventfd.
-    fn arm_wakeup_read(&mut self) {
+    fn arm_wakeup_read(&mut self) -> Result<()> {
         use io_uring::opcode;
 
         // Use a special user_data that we recognize in dispatch.
         // u64::MAX-1 to avoid conflict with cancel (u64::MAX).
         const WAKE_USERDATA: u64 = u64::MAX - 1;
 
-        let buf_ptr = self.wakeup_buf as *mut u8;
+        let buf_ptr = self.wakeup_buf.as_mut().get_mut().as_mut_ptr();
 
-        let read_e = opcode::Read::new(io_uring::types::Fd(self.eventfd.as_raw_fd()), buf_ptr, 8)
+        let read_e = opcode::Read::new(io_uring::types::Fd(self.eventfd.fd.as_raw_fd()), buf_ptr, 8)
             .build()
             .user_data(WAKE_USERDATA);
 
         // Best effort push; if full we submit first.
         while unsafe { self.uring.submission().push(&read_e).is_err() } {
-            let _ = self.submit();
+            self.submit()?;
         }
+
+        self.wakeup_read_armed = true;
+        Ok(())
     }
 }
 
 impl IoUringBackend {
     pub(crate) fn submit_op<T: UringOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
         // Allocate a new entry in the driver
-        let index = self.ops.insert(State::Submitted);
+        let key = self.ops.insert(State::Submitted)?;
 
         // Submit the new operation to the kernel
-        let entry = UringOperation::submit(&mut data).user_data(index as _);
+        let entry = UringSubmit::submit(&mut data).user_data(key.as_u64());
 
         while unsafe { self.uring.submission().push(&entry).is_err() } {
             // If the submission queue is full, flush it to the kernel
-            self.submit()?;
+            if let Err(error) = self.submit() {
+                let _ = self.ops.remove(key);
+                return Err(error);
+            }
         }
 
         // Create a new operation and assign the driver entry
-        Ok(Op::<T>::new(index, data, handle))
+        Ok(Op::<T>::new(key, data, handle))
     }
 
     pub(crate) fn remove_op<T: UringOperation + 'static>(&mut self, op: &mut Op<T>) {
-        let index = op.index();
+        let key = op.key();
         // Get the op state from the driver
-        let state = match self.ops.get_mut(index) {
+        let state = match self.ops.get_mut(key) {
             Some(val) => val,
             None => {
                 // Op already dropped or removed
@@ -200,9 +240,9 @@ impl IoUringBackend {
             State::Completed(_) => {
                 // Completion already arrived but the future never polled it.
                 // Run complete so orphan accept/open FDs are closed.
-                if let State::Completed(completion) = self.ops.remove(index) {
+                if let Some(State::Completed(completion)) = self.ops.remove(key) {
                     if let Some(data) = op.take_data() {
-                        drop(UringOperation::complete(data, completion));
+                        drop(UringComplete::complete(data, completion));
                     }
                 }
             }
@@ -216,7 +256,7 @@ impl IoUringBackend {
         cx: &mut Context<'_>,
     ) -> Poll<T::Output> {
         // Get the op state from the driver
-        let state = self.ops.get_mut(op.index()).expect("invalid internal state");
+        let state = self.ops.get_mut(op.key()).expect("invalid internal state");
 
         match state {
             // Op has been submitted to the kernel. Assign the waker for completion
@@ -233,9 +273,9 @@ impl IoUringBackend {
                 Poll::Pending
             }
             // The kernel has completed the op. Resolve the future with the result
-            State::Completed(_) => match self.ops.remove(op.index()) {
-                State::Completed(completion) => {
-                    Poll::Ready(UringOperation::complete(op.take_data().unwrap(), completion))
+            State::Completed(_) => match self.ops.remove(op.key()) {
+                Some(State::Completed(completion)) => {
+                    Poll::Ready(UringComplete::complete(op.take_data().unwrap(), completion))
                 }
                 _ => unreachable!("invalid operation"),
             },
@@ -254,7 +294,7 @@ impl IoUringBackend {
                     return Ok(());
                 }
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.dispatch_completions();
+                    self.dispatch_completions()?;
                 }
                 Err(e) if e.raw_os_error() != Some(libc::EINTR) => {
                     return Err(e);
@@ -286,15 +326,15 @@ impl IoUringBackend {
         }
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
+    pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
         let mut completion_queue = self.uring.completion();
 
         completion_queue.sync();
 
         // Re-arm the eventfd read after the completion queue borrow is released,
         // since `arm_wakeup_read` needs a mutable borrow of `self`.
-        // TODD: Come back to see if there is a better approach for this
         let mut rearm_wakeup = false;
+        let mut wakeups = Vec::new();
 
         for completion in completion_queue {
             if completion.user_data() == u64::MAX {
@@ -308,11 +348,14 @@ impl IoUringBackend {
             if completion.user_data() == WAKE_USERDATA {
                 // Wakeup from the eventfd. Re-arm another read so future wakes work.
                 // The written counter bytes in wakeup_buf can be ignored.
-                rearm_wakeup = true;
+                self.wakeup_read_armed = false;
+                rearm_wakeup = !self.shutting_down;
                 continue;
             }
 
-            let index = completion.user_data() as usize;
+            let Some(key) = OpKey::from_raw(completion.user_data() as usize) else {
+                continue;
+            };
             let res = completion.result();
             let result = if res >= 0 {
                 Ok(res as u32)
@@ -320,28 +363,31 @@ impl IoUringBackend {
                 Err(std::io::Error::from_raw_os_error(-res))
             };
 
-            if self.ops[index].complete(Completion { result }) {
-                self.ops.remove(index);
+            if let Some(state) = self.ops.get_mut(key) {
+                let (remove, waker) = state.complete(Completion { result });
+                if let Some(waker) = waker {
+                    wakeups.push(waker);
+                }
+                if remove {
+                    self.ops.remove(key);
+                }
             }
         }
 
         if rearm_wakeup {
-            self.arm_wakeup_read();
+            self.arm_wakeup_read()?;
         }
+
+        for waker in wakeups {
+            waker.wake();
+        }
+
+        Ok(())
     }
 
     pub(crate) fn create_wakeup(&self) -> Wakeup {
-        let fd = self.eventfd.as_raw_fd();
-        crate::driver::Wakeup::new(move || {
-            let val: u64 = 1;
-            let _ = unsafe {
-                libc::write(
-                    fd,
-                    &val as *const u64 as *const libc::c_void,
-                    std::mem::size_of::<u64>(),
-                )
-            };
-        })
+        let wakeup = Arc::clone(&self.eventfd);
+        crate::driver::Wakeup::new(move || wakeup.wake())
     }
 
     pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
@@ -368,6 +414,9 @@ impl AsRawFd for IoUringBackend {
 // This depends on us knowing when ops are completed and done firing.
 impl Drop for IoUringBackend {
     fn drop(&mut self) {
+        self.shutting_down = true;
+        self.eventfd.close();
+
         // get all ops in flight for cancellation
         while !self.uring.submission().is_empty() {
             self.submit().expect("Internal error when dropping driver");
@@ -394,27 +443,52 @@ impl Drop for IoUringBackend {
         }
 
         // Submit cancellation for all ops marked Ignored
-        for (index, state) in self.ops.iter_mut() {
-            if let State::Ignored(..) = state {
-                unsafe {
-                    while self
-                        .uring
-                        .submission()
-                        .push(&AsyncCancel::new(index as u64).build().user_data(u64::MAX))
-                        .is_err()
-                    {
-                        self.uring
-                            .submit_and_wait(1)
-                            .expect("Internal error when dropping driver");
-                    }
+        let cancelled: Vec<OpKey> = self
+            .ops
+            .iter()
+            .filter_map(|(key, state)| matches!(state, State::Ignored(..)).then_some(key))
+            .collect();
+        for key in cancelled {
+            unsafe {
+                while self
+                    .uring
+                    .submission()
+                    .push(&AsyncCancel::new(key.as_u64()).build().user_data(u64::MAX))
+                    .is_err()
+                {
+                    self.uring
+                        .submit_and_wait(1)
+                        .expect("Internal error when dropping driver");
                 }
+            }
+        }
+
+        // The wakeup read owns the pinned buffer until its CQE arrives. Cancel
+        // it before the io_uring and buffer fields are dropped.
+        if self.wakeup_read_armed {
+            unsafe {
+                while self
+                    .uring
+                    .submission()
+                    .push(&AsyncCancel::new((u64::MAX - 1) as u64).build().user_data(u64::MAX))
+                    .is_err()
+                {
+                    self.uring
+                        .submit_and_wait(1)
+                        .expect("Internal error when cancelling wakeup read");
+                }
+            }
+            self.submit().expect("Internal error when cancelling wakeup read");
+            while self.wakeup_read_armed {
+                self.wait().expect("Internal error when draining wakeup read");
+                self.dispatch_completions()
+                    .expect("Internal error when draining wakeup read");
             }
         }
 
         // Wait until all ops have been removed from the slab.
         // Ignored entries will be removed from the slab by the complete logic called by `tick()`
         // Completed Entries are removed here directly
-        let mut index = 0;
         loop {
             if self.ops.is_empty() {
                 // All ops are drained. We can shutdown
@@ -423,33 +497,26 @@ impl Drop for IoUringBackend {
 
             // States are either all ignored or complete
             // If there is at least one Ignored still to process, call wait
-            match self.ops.get(index) {
-                Some(State::Ignored(..)) => {
+            let Some((key, state)) = self.ops.iter().next() else {
+                break;
+            };
+            match state {
+                State::Ignored(..) => {
                     // If waiting fails, ignore the error.
                     // The wait will be attempted again on the next loop.
                     let _ = self.wait();
-                    self.dispatch_completions();
+                    self.dispatch_completions()
+                        .expect("Internal error when dropping driver");
                 }
-                Some(_) => {
+                _ => {
                     // Remove completed ops
-                    let _ = self.ops.remove(index);
-                    index += 1;
-                }
-                None => {
-                    index += 1;
+                    let _ = self.ops.remove(key);
                 }
             }
         }
 
         // Final sanity check, any ops must be in complete state
         assert!(self.ops.iter().all(|(_, state)| matches!(state, State::Completed(..))));
-
-        // Free the wakeup buffer (one persistent allocation for the lifetime of the backend).
-        if !self.wakeup_buf.is_null() {
-            unsafe {
-                drop(Box::from_raw(self.wakeup_buf));
-            }
-        }
     }
 }
 
@@ -489,7 +556,7 @@ mod tests {
     #[test]
     fn completion_before_first_poll_is_retained() {
         let mut state = State::Submitted;
-        assert!(!state.complete(Completion { result: Ok(7) }));
+        assert!(!state.complete(Completion { result: Ok(7) }).0);
         assert!(matches!(state, State::Completed(..)));
     }
 
@@ -498,7 +565,7 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
 
-        assert!(state.complete(Completion { result: Ok(0) }));
+        assert!(state.complete(Completion { result: Ok(0) }).0);
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
@@ -508,7 +575,7 @@ mod tests {
         let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
         let mut state = State::Waiting(waker);
 
-        assert!(!state.complete(Completion { result: Ok(0) }));
+        assert!(!state.complete(Completion { result: Ok(0) }).0);
         assert!(woken.load(Ordering::SeqCst));
     }
 }

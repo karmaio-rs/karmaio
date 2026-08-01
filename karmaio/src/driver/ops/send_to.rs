@@ -41,7 +41,7 @@ pub(crate) struct SendTo<B: BoundedIoBuf> {
 
     // Stable WSABUF allocation for Windows overlapped I/O.
     #[cfg(windows)]
-    wsa_buf: windows_sys::Win32::Networking::WinSock::WSABUF,
+    wsa_buf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
 }
 
 impl<B: BoundedIoBuf> Op<SendTo<B>> {
@@ -83,7 +83,7 @@ impl<B: BoundedIoBuf> Op<SendTo<B>> {
             #[cfg(target_os = "linux")]
             msghdr,
             #[cfg(windows)]
-            wsa_buf,
+            wsa_buf: Box::new(wsa_buf),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -137,7 +137,7 @@ impl<B: BoundedIoBuf> BackendSubmit for SendTo<B> {
         windows_syscall_submit_overlapped!(interest, socket, {
             WSASendTo(
                 socket as _,
-                &mut self.wsa_buf,
+                self.wsa_buf.as_mut(),
                 1,
                 &mut bytes_sent,
                 0,

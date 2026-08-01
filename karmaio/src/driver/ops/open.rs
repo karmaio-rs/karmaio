@@ -60,10 +60,11 @@ impl Op<Open> {
         if let Some(open) = op.data_ref() {
             if let Some(handle) = open.handle {
                 CURRENT_DRIVER.with(|driver| {
-                    if let Some(driver) = driver.upgrade() {
-                        let _ = driver.attach(handle);
-                    }
-                });
+                    let driver = driver.upgrade().ok_or_else(|| {
+                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "runtime is shutting down")
+                    })?;
+                    driver.attach(handle)
+                })?;
             }
         }
 

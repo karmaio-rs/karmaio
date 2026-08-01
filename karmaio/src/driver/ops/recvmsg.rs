@@ -35,7 +35,7 @@ pub(crate) struct RecvMsg<B: BoundedIoBufMut> {
 
     // Stable memory for `lpFromlen` passed to WSARecvFrom (Windows only).
     #[cfg(windows)]
-    socket_addr_len: i32,
+    socket_addr_len: Box<i32>,
 }
 
 impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
@@ -58,7 +58,7 @@ impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
             msghdr.msg_iov = io_slices.as_mut_ptr().cast();
             msghdr.msg_iovlen = io_slices.len() as _;
             msghdr.msg_name = socket_addr.as_ptr() as *mut libc::c_void;
-            msghdr.msg_namelen = socket_addr.len() as u32;
+            msghdr.msg_namelen = socket_addr.len();
             msghdr
         };
 
@@ -81,7 +81,7 @@ impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
             #[cfg(windows)]
             wsa_bufs,
             #[cfg(windows)]
-            socket_addr_len: 0,
+            socket_addr_len: Box::new(0),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -122,7 +122,7 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
         let mut bytes_recv = 0u32;
         let mut flags = 0u32;
 
-        self.socket_addr_len = self.socket_addr.len() as i32;
+        *self.socket_addr_len = self.socket_addr.len() as i32;
 
         windows_syscall_submit_overlapped!(interest, socket, {
             WSARecvFrom(
@@ -132,7 +132,7 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
                 &mut bytes_recv,
                 &mut flags,
                 self.socket_addr.as_ptr() as *mut _,
-                &mut self.socket_addr_len,
+                self.socket_addr_len.as_mut(),
                 interest.as_mut_ptr(),
                 None,
             )
@@ -150,14 +150,31 @@ impl<B: BoundedIoBufMut> BackendComplete for RecvMsg<B> {
         let mut bufs = self.bufs;
 
         #[cfg(windows)]
-        unsafe {
-            self.socket_addr.set_length(self.socket_addr_len as _);
+        {
+            let address_len = match usize::try_from(*self.socket_addr_len) {
+                Ok(length) if length <= self.socket_addr.len() as usize => length,
+                _ => {
+                    return (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid socket address length",
+                        )),
+                        bufs,
+                    );
+                }
+            };
+            unsafe {
+                self.socket_addr.set_length(address_len as _);
+            }
         }
 
-        let socket_addr = (*self.socket_addr).as_socket();
-
-        let res = res.map(|total_bytes_written| {
-            let socket_addr: SocketAddr = socket_addr.unwrap();
+        let res = res.and_then(|total_bytes_written| {
+            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "kernel returned an invalid socket address",
+                )
+            })?;
 
             // The kernel wrote `total_bytes_written` bytes to the buffers.
             // The kernel fills buffers to their capacity one after the other
@@ -182,7 +199,7 @@ impl<B: BoundedIoBufMut> BackendComplete for RecvMsg<B> {
                 }
             }
 
-            (total_bytes_written, socket_addr)
+            Ok((total_bytes_written, socket_addr))
         });
 
         (res, bufs)

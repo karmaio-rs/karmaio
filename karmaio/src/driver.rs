@@ -103,8 +103,8 @@ impl Driver {
     }
 
     /// Apply platform I/O completions (kevent / IOCP / io_uring CQEs).
-    pub(crate) fn dispatch_completions(&self) {
-        self.backend.borrow_mut().dispatch_completions();
+    pub(crate) fn dispatch_completions(&self) -> io::Result<()> {
+        self.backend.borrow_mut().dispatch_completions()
     }
 
     /// Returns a cloneable token that can wake the driver from any thread.
@@ -119,9 +119,9 @@ impl Driver {
 
     /// Associates a file or socket handle with the driver's I/O mechanism.
     ///
-    /// On Windows (IOCP), this calls `CreateIoCompletionPort` and sets
-    /// `SetFileCompletionNotificationModes` for optimal performance. On
-    /// Linux (io-uring) / macOS (kqueue), this is a no-op.
+    /// On Windows (IOCP), this calls `CreateIoCompletionPort` and configures
+    /// completion notification behavior. On Linux (io-uring) / macOS
+    /// (kqueue), this is a no-op.
     #[cfg(windows)]
     pub(crate) fn attach(&self, handle: RawHandle) -> io::Result<()> {
         self.backend.borrow().attach(handle)

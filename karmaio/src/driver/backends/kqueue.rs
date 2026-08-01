@@ -2,14 +2,16 @@ use std::{
     collections::VecDeque,
     io::{Error, Result},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
 
-use slab::Slab;
-
 use crate::driver::ops::{BlockingJob, Completion, Op};
+use crate::driver::ops::{OpKey, OpTable};
 use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
 
@@ -63,6 +65,7 @@ pub(crate) enum PollAttempt {
     Blocking(BlockingJob),
 }
 
+/// Attempt a readiness-backed operation or produce a blocking-pool job.
 pub(crate) trait PollSubmit {
     fn submit(&mut self) -> PollAttempt;
 }
@@ -74,25 +77,15 @@ pub(crate) trait PollComplete {
 }
 
 /// Backend-local readiness operation protocol.
-pub(crate) trait PollOperation: PollSubmit + PollComplete {
+///
+/// A readiness operation must only retain resources that are safe to retry
+/// after the registered descriptor/filter becomes ready.
+pub(crate) trait PollOperation: PollSubmit + PollComplete<Result = Self::Output> {
     type Output;
-
-    fn attempt(&mut self) -> PollAttempt;
-    fn complete(self, completion: Completion) -> Self::Output;
 }
 
 impl<T: PollSubmit + PollComplete> PollOperation for T {
     type Output = T::Result;
-
-    #[inline]
-    fn attempt(&mut self) -> PollAttempt {
-        PollSubmit::submit(self)
-    }
-
-    #[inline]
-    fn complete(self, completion: Completion) -> Self::Output {
-        PollComplete::complete(self, completion)
-    }
 }
 
 enum State {
@@ -109,49 +102,51 @@ trait IgnoredOp: 'static {
 
 impl<T: PollOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(PollOperation::complete(*self, completion));
+        drop(PollComplete::complete(*self, completion));
     }
 }
 
 impl State {
-    fn complete(&mut self, completion: Completion) -> bool {
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>) {
         match self {
             State::Submitted | State::Ready => {
                 *self = State::Completed(completion);
-                false
+                (false, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    waker.wake();
+                    return (false, Some(waker));
                 }
-                false
+                (false, None)
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
                     payload.cleanup(completion);
                 }
-                true
+                (true, None)
             }
-            State::Completed(..) => unreachable!("completion delivered twice"),
+            // Ignore duplicate readiness/completion notifications. The first
+            // terminal result remains available for the future to consume.
+            State::Completed(..) => (false, None),
         }
     }
 
-    fn ready(&mut self) -> bool {
+    fn ready(&mut self) -> (bool, Option<Waker>) {
         match self {
             State::Submitted => {
                 *self = State::Ready;
-                false
+                (false, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Ready);
                 if let State::Waiting(waker) = old {
-                    waker.wake();
+                    return (false, Some(waker));
                 }
-                false
+                (false, None)
             }
-            State::Ignored(..) => true,
-            State::Ready | State::Completed(..) => false,
+            State::Ignored(..) => (true, None),
+            State::Ready | State::Completed(..) => (false, None),
         }
     }
 }
@@ -162,17 +157,46 @@ struct Slot {
 }
 
 pub(crate) struct KqueueBackend {
-    kqueue: OwnedFd,
-    ops: Slab<Slot>,
+    kqueue: Arc<KqueueWakeup>,
+    ops: OpTable<Slot>,
     events: Vec<libc::kevent>,
     /// Completions produced by blocking-pool workers (index, result).
-    blocking_done: Arc<Mutex<VecDeque<(usize, Completion)>>>,
+    blocking_done: Arc<Mutex<VecDeque<(OpKey, Completion)>>>,
 }
 
 /// Special ident/udata used for cross-thread wakeups via EVFILT_USER.
 /// Chosen to not collide with slab indices (which start small).
 const WAKEUP_IDENT: libc::uintptr_t = libc::uintptr_t::MAX;
 const WAKEUP_UDATA: *mut libc::c_void = libc::uintptr_t::MAX as *mut libc::c_void;
+
+struct KqueueWakeup {
+    fd: OwnedFd,
+    closed: AtomicBool,
+}
+
+impl AsRawFd for KqueueWakeup {
+    fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+impl KqueueWakeup {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn wake(&self) {
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+
+        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
+        ev.ident = WAKEUP_IDENT;
+        ev.filter = libc::EVFILT_USER;
+        ev.fflags = libc::NOTE_TRIGGER;
+        let _ = unsafe { libc::kevent(self.fd.as_raw_fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    }
+}
 
 impl KqueueBackend {
     pub(crate) fn new(capacity: usize) -> Result<Self> {
@@ -182,9 +206,12 @@ impl KqueueBackend {
         }
 
         let backend = Self {
-            kqueue: unsafe { OwnedFd::from_raw_fd(raw_kqueue) },
+            kqueue: Arc::new(KqueueWakeup {
+                fd: unsafe { OwnedFd::from_raw_fd(raw_kqueue) },
+                closed: AtomicBool::new(false),
+            }),
             // `capacity` is configurable via the runtime builder's driver capacity.
-            ops: Slab::with_capacity(capacity),
+            ops: OpTable::new(capacity)?,
             events: vec![unsafe { std::mem::zeroed() }; capacity],
             blocking_done: Arc::new(Mutex::new(VecDeque::new())),
         };
@@ -200,7 +227,10 @@ impl KqueueBackend {
             data: 0,
             udata: WAKEUP_UDATA,
         };
-        let _ = unsafe { libc::kevent(raw_kqueue, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        let result = unsafe { libc::kevent(raw_kqueue, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if result < 0 {
+            return Err(Error::last_os_error());
+        }
 
         Ok(backend)
     }
@@ -213,32 +243,35 @@ impl KqueueBackend {
         let _ = unsafe { libc::kevent(kqueue, kevent.as_ptr(), 1, std::ptr::null_mut(), 0, std::ptr::null()) };
     }
 
-    fn push_blocking(&self, index: usize, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) {
+    fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
         let done = Arc::clone(&self.blocking_done);
         let wakeup = wakeup.clone();
-        pool.dispatch(move || {
-            let completion = job.run();
+        pool.try_dispatch(Box::new(move || {
+            let completion =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
+                    result: Err(Error::other("blocking operation panicked")),
+                });
             done.lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push_back((index, completion));
+                .push_back((key, completion));
             wakeup.wake();
-        });
+        }))
     }
 }
 
 impl KqueueBackend {
     pub(crate) fn submit_op<T: PollOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
-        let index = self.ops.insert(Slot {
+        let key = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
-        });
+        })?;
 
-        Ok(Op::<T>::new(index, data, handle))
+        Ok(Op::<T>::new(key, data, handle))
     }
 
     pub(crate) fn remove_op<T: PollOperation + 'static>(&mut self, op: &mut Op<T>) {
-        let index = op.index();
-        let slot = match self.ops.get_mut(index) {
+        let key = op.key();
+        let slot = match self.ops.get_mut(key) {
             Some(val) => val,
             None => {
                 // Op already dropped or removed
@@ -249,7 +282,7 @@ impl KqueueBackend {
         match &slot.state {
             State::Submitted => {
                 // Never polled — no in-flight work and no produced resource.
-                self.ops.remove(index);
+                self.ops.remove(key);
                 let _ = op.take_data();
             }
             State::Waiting(..) => {
@@ -257,7 +290,7 @@ impl KqueueBackend {
                     // Register-path cancel: EV_DELETE is synchronous. The
                     // non-blocking syscall has not produced a resource yet.
                     Self::delete_interest(self.kqueue.as_raw_fd(), interest);
-                    self.ops.remove(index);
+                    self.ops.remove(key);
                     let _ = op.take_data();
                 } else {
                     // Blocking-pool job still running. Keep payload so a late
@@ -268,16 +301,16 @@ impl KqueueBackend {
             }
             State::Completed(_) => {
                 // Completion already stored but never polled — cleanup now.
-                let slot = self.ops.remove(index);
+                let slot = self.ops.remove(key).expect("completed operation disappeared");
                 if let State::Completed(completion) = slot.state
                     && let Some(data) = op.take_data()
                 {
-                    drop(PollOperation::complete(data, completion));
+                    drop(PollComplete::complete(data, completion));
                 }
             }
             State::Ready => {
                 // Ready to re-issue syscall; nothing produced yet.
-                self.ops.remove(index);
+                self.ops.remove(key);
                 let _ = op.take_data();
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
@@ -291,9 +324,9 @@ impl KqueueBackend {
         blocking: &BlockingPoolHandle,
         wakeup: &Wakeup,
     ) -> Poll<T::Output> {
-        let index = op.index();
+        let key = op.key();
 
-        let Some(slot) = self.ops.get_mut(index) else {
+        let Some(slot) = self.ops.get_mut(key) else {
             // This means the op has already being removed. Should not happen in normal circumstances
             unreachable!("invalid operation state")
         };
@@ -305,8 +338,8 @@ impl KqueueBackend {
         match current_state {
             State::Completed(completion) => {
                 let data = op.take_data().expect("Op data consumed");
-                let result = PollOperation::complete(data, completion);
-                self.ops.remove(index);
+                let result = PollComplete::complete(data, completion);
+                self.ops.remove(key);
                 Poll::Ready(result)
             }
             State::Ready | State::Submitted => {
@@ -314,18 +347,18 @@ impl KqueueBackend {
                 // or dispatch blocking work to the pool.
                 let data = op.data_mut().expect("Op data consumed");
 
-                match data.attempt() {
+                match PollSubmit::submit(data) {
                     PollAttempt::Ready(completion) => {
                         // Synchronous completion
                         let data = op.take_data().expect("Op data consumed");
-                        let result = PollOperation::complete(data, completion);
-                        self.ops.remove(index);
+                        let result = PollComplete::complete(data, completion);
+                        self.ops.remove(key);
                         Poll::Ready(result)
                     }
 
                     PollAttempt::Register(mut interest) => {
                         // Would-block → register and park
-                        interest.as_kevent_mut().udata = index as *mut libc::c_void;
+                        interest.as_kevent_mut().udata = key.raw() as *mut libc::c_void;
 
                         let kevent = [interest.0];
                         let res = unsafe {
@@ -344,8 +377,8 @@ impl KqueueBackend {
                         if res < 0 {
                             let err = std::io::Error::last_os_error();
                             let data = op.take_data().expect("Op data consumed");
-                            let result = PollOperation::complete(data, Completion { result: Err(err) });
-                            self.ops.remove(index);
+                            let result = PollComplete::complete(data, Completion { result: Err(err) });
+                            self.ops.remove(key);
                             return Poll::Ready(result);
                         }
 
@@ -356,8 +389,13 @@ impl KqueueBackend {
 
                     PollAttempt::Blocking(job) => {
                         slot.state = State::Waiting(cx.waker().clone());
-                        self.push_blocking(index, job, blocking, wakeup);
-                        Poll::Pending
+                        if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
+                            let data = op.take_data().expect("Op data consumed");
+                            self.ops.remove(key);
+                            Poll::Ready(PollComplete::complete(data, Completion { result: Err(error) }))
+                        } else {
+                            Poll::Pending
+                        }
                     }
                 }
             }
@@ -448,27 +486,40 @@ impl KqueueBackend {
 
     pub(crate) fn drain_blocking_completions(&mut self) {
         // Called by the runtime after wait* (see Runtime::block_on).
-        let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
-        while let Some((index, completion)) = pending.pop_front() {
-            if let Some(slot) = self.ops.get_mut(index) {
-                let should_drop = slot.state.complete(completion);
+        let completions: Vec<_> = {
+            let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
+            pending.drain(..).collect()
+        };
+        let mut wakeups = Vec::new();
+        for (key, completion) in completions {
+            if let Some(slot) = self.ops.get_mut(key) {
+                let (should_drop, waker) = slot.state.complete(completion);
+                if let Some(waker) = waker {
+                    wakeups.push(waker);
+                }
                 if should_drop {
-                    self.ops.remove(index);
+                    self.ops.remove(key);
                 }
             }
         }
+        for waker in wakeups {
+            waker.wake();
+        }
     }
 
-    pub(crate) fn dispatch_completions(&mut self) {
+    pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
+        let mut wakeups = Vec::new();
         for event in &self.events {
             // Cross-thread wakeup (EVFILT_USER) — not an I/O op.
             if event.filter == libc::EVFILT_USER {
                 continue;
             }
 
-            let index = event.udata as usize;
+            let Some(key) = OpKey::from_raw(event.udata as usize) else {
+                continue;
+            };
 
-            if let Some(slot) = self.ops.get_mut(index) {
+            if let Some(slot) = self.ops.get_mut(key) {
                 // Only Register-path ops install interest. Blocking-pool ops leave
                 // interest as None; a wake packet must never call `ready()` on them
                 // (especially after they are already `Completed`).
@@ -484,9 +535,12 @@ impl KqueueBackend {
                 }
                 let _ = slot.interest.take();
 
-                let should_drop = slot.state.ready();
+                let (should_drop, waker) = slot.state.ready();
+                if let Some(waker) = waker {
+                    wakeups.push(waker);
+                }
                 if should_drop {
-                    self.ops.remove(index);
+                    self.ops.remove(key);
                 }
             }
             // else: event belongs to a canceled op → ignore (safe)
@@ -495,19 +549,15 @@ impl KqueueBackend {
         // All completions have been processed, so we clear the vec for the next round
         // Note: This does not deallocate the vec, so we still have the existing capacity
         self.events.clear();
+        for waker in wakeups {
+            waker.wake();
+        }
+        Ok(())
     }
 
     pub(crate) fn create_wakeup(&self) -> Wakeup {
-        let kq = self.kqueue.as_raw_fd();
-        crate::driver::Wakeup::new(move || {
-            // Perform the EVFILT_USER trigger using the captured raw fd.
-            // This is safe to call from any thread.
-            let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
-            ev.ident = WAKEUP_IDENT;
-            ev.filter = libc::EVFILT_USER;
-            ev.fflags = libc::NOTE_TRIGGER;
-            let _ = unsafe { libc::kevent(kq, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-        })
+        let wakeup = Arc::clone(&self.kqueue);
+        crate::driver::Wakeup::new(move || wakeup.wake())
     }
 
     pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
@@ -524,6 +574,7 @@ impl AsRawFd for KqueueBackend {
 
 impl Drop for KqueueBackend {
     fn drop(&mut self) {
+        self.kqueue.close();
         // Cancel any still-registered interests synchronously.
         // This is the kqueue equivalent of submitting `AsyncCancel` in io_uring.
         // (EV_DELETE is immediate and safe even if the event has already fired.)
@@ -585,7 +636,7 @@ mod tests {
     #[test]
     fn completion_before_first_poll_is_retained() {
         let mut state = State::Submitted;
-        assert!(!state.complete(Completion { result: Ok(7) }));
+        assert!(!state.complete(Completion { result: Ok(7) }).0);
         assert!(matches!(state, State::Completed(..)));
     }
 
@@ -594,7 +645,7 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
 
-        assert!(state.complete(Completion { result: Ok(0) }));
+        assert!(state.complete(Completion { result: Ok(0) }).0);
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
@@ -604,7 +655,9 @@ mod tests {
         let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
         let mut state = State::Waiting(waker);
 
-        assert!(!state.ready());
+        let (removed, waker) = state.ready();
+        assert!(!removed);
+        waker.expect("waiting state should return its waker").wake();
         assert!(woken.load(Ordering::SeqCst));
         assert!(matches!(state, State::Ready));
     }

@@ -1,9 +1,13 @@
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
-    driver::{
-        helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
-    },
+    driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
@@ -42,8 +46,9 @@ impl<B: BoundedIoBufMut> Op<Recv<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> UringOperation for Recv<B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         // Get raw buffer info
@@ -52,11 +57,29 @@ impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
 
         opcode::Recv::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+        // Recover the buffer
+        let mut buf = self.buf;
+
+        // If the operation was successful, advance the initialized cursor.
+        if let Ok(n) = res {
+            // Safety: the kernel wrote `n` bytes to the buffer.
+            unsafe {
+                buf.set_init(n);
+            }
+        }
+
+        (res, buf)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBufMut> PollOperation for Recv<B> {
+    type Output = BufResult<usize, B>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr();
             let len = self.buf.bytes_total();
@@ -65,11 +88,29 @@ impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
             macos_syscall!(libc::recv(self.io_handle.raw_fd(), ptr as *mut libc::c_void, len, 0))
         })
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+        // Recover the buffer
+        let mut buf = self.buf;
+
+        // If the operation was successful, advance the initialized cursor.
+        if let Ok(n) = res {
+            // Safety: the kernel wrote `n` bytes to the buffer.
+            unsafe {
+                buf.set_init(n);
+            }
+        }
+
+        (res, buf)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> IocpOperation for Recv<B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecv;
 
@@ -91,12 +132,8 @@ impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
             )
         })
     }
-}
 
-impl<B: BoundedIoBufMut> BackendComplete for Recv<B> {
-    type Result = BufResult<usize, B>;
-
-    fn complete(self, completion_entry: super::Completion) -> Self::Result {
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
         // Convert the operation result to `usize`
         let res = completion_entry.result.map(|v| v as usize);
         // Recover the buffer

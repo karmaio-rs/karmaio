@@ -1,7 +1,14 @@
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -33,8 +40,9 @@ impl Op<Sync> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Sync {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Sync {
+    type Output = std::io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let mut op = opcode::Fsync::new(types::Fd(self.handle.raw_fd()));
@@ -45,31 +53,37 @@ impl BackendSubmit for Sync {
 
         op.build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Sync {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Sync {
+    type Output = std::io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         // Capture a raw fd (Send); SharedIoHandle stays on the op for the lifetime of the future.
         let fd = self.handle.raw_fd();
         macos_syscall_blocking!({ macos_syscall!(libc::fsync(fd)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Sync {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Sync {
+    type Output = std::io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
 
         let handle = self.handle.raw_handle() as isize;
         windows_syscall_blocking!({ windows_syscall!(BOOL, FlushFileBuffers(handle as _)) })
     }
-}
 
-impl BackendComplete for Sync {
-    type Result = std::io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
     }
 }

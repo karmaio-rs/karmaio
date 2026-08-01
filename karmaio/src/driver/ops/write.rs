@@ -9,11 +9,18 @@ use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -58,30 +65,47 @@ where
 }
 
 #[cfg(target_os = "linux")]
-impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Write<T, B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> UringOperation for Write<T, B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let ptr = self.buf.stable_read_ptr();
         let len = self.buf.bytes_init();
         opcode::Write::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        match completion.result {
+            Ok(res) => (Ok(res as usize), self.buf),
+            Err(err) => (Err(err), self.buf),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Write<T, B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> PollOperation for Write<T, B> {
+    type Output = BufResult<usize, B>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             let ptr = self.buf.stable_read_ptr() as *const libc::c_void;
             let len = self.buf.bytes_init();
             macos_syscall!(libc::write(self.io_handle.raw_fd(), ptr, len))
         })
     }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        match completion.result {
+            Ok(res) => (Ok(res as usize), self.buf),
+            Err(err) => (Err(err), self.buf),
+        }
+    }
 }
 
 #[cfg(windows)]
-impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Write<T, B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> IocpOperation for Write<T, B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
@@ -94,12 +118,8 @@ impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Writ
             WriteFile(handle as _, ptr, len, std::ptr::null_mut(), interest.as_mut_ptr())
         })
     }
-}
 
-impl<T: 'static, B: BoundedIoBuf + 'static> BackendComplete for Write<T, B> {
-    type Result = BufResult<usize, B>;
-
-    fn complete(self, completion: Completion) -> Self::Result {
+    fn complete(self, completion: Completion) -> Self::Output {
         match completion.result {
             Ok(res) => (Ok(res as usize), self.buf),
             Err(err) => (Err(err), self.buf),

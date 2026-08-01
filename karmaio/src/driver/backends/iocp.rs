@@ -95,30 +95,51 @@ pub(crate) enum IocpSubmission {
     Blocking(BlockingJob),
 }
 
-/// Build a normal one-shot IOCP submission.
-///
-/// Implementations must keep every buffer, length field, and other memory
-/// referenced by the returned overlapped request alive until completion.
-pub(crate) trait IocpSubmit {
-    fn submit(&mut self) -> IocpSubmission;
-}
+fn cancel_pending(interest: &Interest) {
+    let result = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
 
-pub(crate) trait IocpComplete {
-    type Result;
-
-    fn complete(self, completion: Completion) -> Self::Result;
+    if result == 0 {
+        let error = Error::last_os_error();
+        // ERROR_NOT_FOUND means the request has already completed or Windows
+        // has already queued its terminal packet. In both cases the slot must
+        // remain alive until dispatch_completions observes that packet.
+        debug_assert_eq!(
+            error.raw_os_error(),
+            Some(ERROR_NOT_FOUND as i32),
+            "CancelIoEx failed: {error}"
+        );
+    }
 }
 
 /// Backend-local IOCP operation protocol.
 ///
 /// Implementations must keep all memory referenced by the returned overlapped
 /// request valid until Windows delivers its terminal completion packet.
-pub(crate) trait IocpOperation: IocpSubmit + IocpComplete<Result = Self::Output> {
+///
+/// # Safety
+///
+/// Implementations must ensure that the returned pending submission keeps its
+/// `OVERLAPPED`, buffers, lengths, and any other kernel-visible storage valid
+/// until the terminal completion packet is dispatched.
+pub(crate) unsafe trait IocpOperation: 'static {
     type Output;
-}
 
-impl<T: IocpSubmit + IocpComplete> IocpOperation for T {
-    type Output = T::Result;
+    /// Start the operation. A pending submission owns its stable `OVERLAPPED`
+    /// storage until Windows delivers the terminal completion packet.
+    fn submit(&mut self) -> IocpSubmission;
+
+    /// Convert a terminal IOCP packet into the operation's typed result.
+    fn complete(self, completion: Completion) -> Self::Output;
+
+    /// Request cancellation of a pending operation after its future detaches.
+    ///
+    /// The default uses `CancelIoEx`, which is correct for the regular
+    /// overlapped operations in this crate. An operation with additional
+    /// Windows-specific cancellation requirements can override this hook while
+    /// keeping ownership of its payload in the backend's detached slot.
+    fn cancel(&mut self, interest: &Interest) {
+        cancel_pending(interest);
+    }
 }
 
 enum State {
@@ -134,7 +155,7 @@ trait IgnoredOp: 'static {
 
 impl<T: IocpOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(IocpComplete::complete(*self, completion));
+        drop(IocpOperation::complete(*self, completion));
     }
 }
 
@@ -335,7 +356,7 @@ impl IocpBackend {
             blocking_job: None,
         })?;
 
-        match IocpSubmit::submit(&mut data) {
+        match IocpOperation::submit(&mut data) {
             IocpSubmission::Ready(completion) => {
                 // The operation finished before it needed IOCP. Store the
                 // completion so the first poll resolves the future.
@@ -388,20 +409,10 @@ impl IocpBackend {
 
                 // Overlapped path: ask Windows to cancel, keep payload until
                 // the completion packet arrives so we can cleanup accept/open.
+                let mut data = op.take_data().expect("op data missing on detach");
                 if let Some(interest) = slot.interest.as_ref() {
-                    let result = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
-
-                    if result == 0 {
-                        let err = Error::last_os_error();
-                        debug_assert_eq!(
-                            err.raw_os_error(),
-                            Some(ERROR_NOT_FOUND as i32),
-                            "CancelIoEx failed: {err}"
-                        );
-                    }
+                    IocpOperation::cancel(&mut data, interest);
                 }
-
-                let data = op.take_data().expect("op data missing on detach");
                 slot.state = State::Ignored(Box::new(data));
             }
             State::Completed(_) => {
@@ -411,7 +422,7 @@ impl IocpBackend {
                 let slot = self.ops.remove(key).expect("completed operation disappeared");
                 if let State::Completed(completion) = slot.state {
                     if let Some(data) = op.take_data() {
-                        drop(IocpComplete::complete(data, completion));
+                        drop(IocpOperation::complete(data, completion));
                     }
                 }
             }
@@ -435,7 +446,7 @@ impl IocpBackend {
             if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
                 let data = op.take_data().expect("Op data consumed");
                 self.ops.remove(key);
-                return Poll::Ready(IocpComplete::complete(data, Completion { result: Err(error) }));
+                return Poll::Ready(IocpOperation::complete(data, Completion { result: Err(error) }));
             }
             return Poll::Pending;
         }
@@ -466,7 +477,7 @@ impl IocpBackend {
                 // Completion was already dispatched. Consume op data exactly
                 // once and let the op-specific code decode the CQ result.
                 State::Completed(completion) => {
-                    Poll::Ready(IocpComplete::complete(op.take_data().unwrap(), completion))
+                    Poll::Ready(IocpOperation::complete(op.take_data().unwrap(), completion))
                 }
                 _ => unreachable!("invalid operation"),
             },
@@ -666,16 +677,14 @@ mod tests {
 
     struct CleanupMarker(Arc<AtomicBool>);
 
-    impl IocpSubmit for CleanupMarker {
+    unsafe impl IocpOperation for CleanupMarker {
+        type Output = ();
+
         fn submit(&mut self) -> IocpSubmission {
             IocpSubmission::Ready(Completion { result: Ok(0) })
         }
-    }
 
-    impl IocpComplete for CleanupMarker {
-        type Result = ();
-
-        fn complete(self, _completion: Completion) -> Self::Result {
+        fn complete(self, _completion: Completion) -> Self::Output {
             self.0.store(true, Ordering::SeqCst);
         }
     }

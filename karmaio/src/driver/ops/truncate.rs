@@ -1,9 +1,16 @@
 use std::io;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -25,26 +32,37 @@ impl Op<Truncate> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Truncate {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Truncate {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::Ftruncate::new(types::Fd(self.handle.raw_fd()), self.size).build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Truncate {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Truncate {
+    type Output = io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         let fd = self.handle.raw_fd();
         let size = self.size as libc::off_t;
         macos_syscall_blocking!({ macos_syscall!(libc::ftruncate(fd, size)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Truncate {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Truncate {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::{SetEndOfFile, SetFilePointerEx};
 
         let handle = self.handle.raw_handle() as isize;
@@ -65,12 +83,8 @@ impl BackendSubmit for Truncate {
             }
         })
     }
-}
 
-impl BackendComplete for Truncate {
-    type Result = io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
     }
 }

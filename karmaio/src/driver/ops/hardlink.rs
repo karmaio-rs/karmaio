@@ -1,8 +1,15 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
+use crate::driver::ops::{Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Create a hard link on the filesystem.
@@ -23,8 +30,9 @@ impl Op<Hardlink> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Hardlink {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Hardlink {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::LinkAt::new(
@@ -35,20 +43,30 @@ impl BackendSubmit for Hardlink {
         )
         .build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Hardlink {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Hardlink {
+    type Output = io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         let original = self.original.clone();
         let link = self.link.clone();
         macos_syscall_blocking!({ macos_syscall!(libc::link(original.as_c_str().as_ptr(), link.as_c_str().as_ptr(),)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Hardlink {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Hardlink {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::CreateHardLinkW;
 
         let original = self.original.clone();
@@ -60,12 +78,8 @@ impl BackendSubmit for Hardlink {
             )
         })
     }
-}
 
-impl BackendComplete for Hardlink {
-    type Result = io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
     }
 }

@@ -5,12 +5,16 @@ use std::io::IoSlice;
 
 use socket2::SockAddr;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBuf, BufResult},
-    driver::{
-        helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
-    },
+    driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
@@ -116,17 +120,36 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Op<SendMsg<B, C>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBuf, C: BoundedIoBuf> UringOperation for SendMsg<B, C> {
+    type Output = BufResult<(usize, Option<C>), Vec<B>>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::SendMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_ref() as *const _).build()
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+
+        // Recover the buffers
+        let bufs = self.bufs;
+
+        let res = res.map(|bytes_written| {
+            // Recover the ancillary data buffer.
+            let control = self.control;
+
+            (bytes_written, control)
+        });
+
+        (res, bufs)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBuf, C: BoundedIoBuf> PollOperation for SendMsg<B, C> {
+    type Output = BufResult<(usize, Option<C>), Vec<B>>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             macos_syscall!(libc::sendmsg(
                 self.io_handle.raw_fd(),
@@ -135,11 +158,29 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
             ))
         })
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+
+        // Recover the buffers
+        let bufs = self.bufs;
+
+        let res = res.map(|bytes_written| {
+            // Recover the ancillary data buffer.
+            let control = self.control;
+
+            (bytes_written, control)
+        });
+
+        (res, bufs)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBuf, C: BoundedIoBuf> IocpOperation for SendMsg<B, C> {
+    type Output = BufResult<(usize, Option<C>), Vec<B>>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSASendTo;
 
@@ -167,12 +208,8 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
             )
         })
     }
-}
 
-impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendComplete for SendMsg<B, C> {
-    type Result = BufResult<(usize, Option<C>), Vec<B>>;
-
-    fn complete(self, completion_entry: super::Completion) -> Self::Result {
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
         // Convert the operation result to `usize`
         let res = completion_entry.result.map(|v| v as usize);
 

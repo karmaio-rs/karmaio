@@ -1,10 +1,17 @@
 use std::io;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -74,8 +81,9 @@ impl<B: BoundedIoBuf> Op<Writev<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBuf> UringOperation for Writev<B> {
+    type Output = BufResult<usize, Vec<B>>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::Writev::new(
@@ -86,11 +94,22 @@ impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
         .offset(self.offset as _)
         .build()
     }
+
+    fn complete(self, completion_entry: Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+
+        // Recover the buffer
+        let bufs = self.bufs;
+
+        (res, bufs)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBuf> PollOperation for Writev<B> {
+    type Output = BufResult<usize, Vec<B>>;
+    fn attempt(&mut self) -> PollAttempt {
         // Same rationale as WriteAt: kqueue is useless for regular files and
         // pwritev may block. Keep iovecs/buffers alive in the Op while the pool runs.
         let fd = self.io_handle.raw_fd();
@@ -99,11 +118,22 @@ impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
         let offset = self.offset as i64;
         macos_syscall_blocking!({ macos_syscall!(libc::pwritev(fd, iovs as *const libc::iovec, iovcnt, offset)) })
     }
+
+    fn complete(self, completion_entry: Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+
+        // Recover the buffer
+        let bufs = self.bufs;
+
+        (res, bufs)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBuf> IocpOperation for Writev<B> {
+    type Output = BufResult<usize, Vec<B>>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFileGather;
 
@@ -127,12 +157,8 @@ impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
             )
         })
     }
-}
 
-impl<B: BoundedIoBuf> BackendComplete for Writev<B> {
-    type Result = BufResult<usize, Vec<B>>;
-
-    fn complete(self, completion_entry: Completion) -> Self::Result {
+    fn complete(self, completion_entry: Completion) -> Self::Output {
         // Convert the operation result to `usize`
         let res = completion_entry.result.map(|v| v as usize);
 

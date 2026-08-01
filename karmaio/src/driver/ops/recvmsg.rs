@@ -2,11 +2,18 @@ use std::{io::IoSliceMut, net::SocketAddr};
 
 use socket2::SockAddr;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -89,17 +96,81 @@ impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> UringOperation for RecvMsg<B> {
+    type Output = BufResult<(usize, SocketAddr), Vec<B>>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
     }
+
+    // `mut self` is required on Windows (`set_length`); unused on other targets.
+    #[allow(unused_mut)]
+    fn complete(mut self, completion_result: Completion) -> Self::Output {
+        let res = completion_result.result.map(|v| v as usize);
+        let mut bufs = self.bufs;
+
+        #[cfg(windows)]
+        {
+            let address_len = match usize::try_from(*self.socket_addr_len) {
+                Ok(length) if length <= self.socket_addr.len() as usize => length,
+                _ => {
+                    return (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid socket address length",
+                        )),
+                        bufs,
+                    );
+                }
+            };
+            unsafe {
+                self.socket_addr.set_length(address_len as _);
+            }
+        }
+
+        let res = res.and_then(|total_bytes_written| {
+            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "kernel returned an invalid socket address",
+                )
+            })?;
+
+            // The kernel wrote `total_bytes_written` bytes to the buffers.
+            // The kernel fills buffers to their capacity one after the other
+            // So we do a loop to correctly update buffer lengths on our end.
+            let mut remaining = total_bytes_written;
+
+            for buf in &mut bufs {
+                // Grab the filled capacity of the buffer
+                let bytes_written = std::cmp::min(remaining, buf.bytes_total());
+
+                unsafe {
+                    // Set the length of the buffers
+                    buf.set_init(bytes_written);
+                }
+                // Find the remaining bytes
+                remaining -= bytes_written;
+
+                // The current buffer is the last filled buffer.
+                // We can return. The rest of the buffers are empty
+                if remaining == 0 {
+                    break;
+                }
+            }
+
+            Ok((total_bytes_written, socket_addr))
+        });
+
+        (res, bufs)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBufMut> PollOperation for RecvMsg<B> {
+    type Output = BufResult<(usize, SocketAddr), Vec<B>>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             macos_syscall!(libc::recvmsg(
                 self.io_handle.raw_fd(),
@@ -108,11 +179,74 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
             ))
         })
     }
+
+    // `mut self` is required on Windows (`set_length`); unused on other targets.
+    #[allow(unused_mut)]
+    fn complete(mut self, completion_result: Completion) -> Self::Output {
+        let res = completion_result.result.map(|v| v as usize);
+        let mut bufs = self.bufs;
+
+        #[cfg(windows)]
+        {
+            let address_len = match usize::try_from(*self.socket_addr_len) {
+                Ok(length) if length <= self.socket_addr.len() as usize => length,
+                _ => {
+                    return (
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "invalid socket address length",
+                        )),
+                        bufs,
+                    );
+                }
+            };
+            unsafe {
+                self.socket_addr.set_length(address_len as _);
+            }
+        }
+
+        let res = res.and_then(|total_bytes_written| {
+            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "kernel returned an invalid socket address",
+                )
+            })?;
+
+            // The kernel wrote `total_bytes_written` bytes to the buffers.
+            // The kernel fills buffers to their capacity one after the other
+            // So we do a loop to correctly update buffer lengths on our end.
+            let mut remaining = total_bytes_written;
+
+            for buf in &mut bufs {
+                // Grab the filled capacity of the buffer
+                let bytes_written = std::cmp::min(remaining, buf.bytes_total());
+
+                unsafe {
+                    // Set the length of the buffers
+                    buf.set_init(bytes_written);
+                }
+                // Find the remaining bytes
+                remaining -= bytes_written;
+
+                // The current buffer is the last filled buffer.
+                // We can return. The rest of the buffers are empty
+                if remaining == 0 {
+                    break;
+                }
+            }
+
+            Ok((total_bytes_written, socket_addr))
+        });
+
+        (res, bufs)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvMsg<B> {
+    type Output = BufResult<(usize, SocketAddr), Vec<B>>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecvFrom;
 
@@ -138,14 +272,10 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
             )
         })
     }
-}
-
-impl<B: BoundedIoBufMut> BackendComplete for RecvMsg<B> {
-    type Result = BufResult<(usize, SocketAddr), Vec<B>>;
 
     // `mut self` is required on Windows (`set_length`); unused on other targets.
     #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Result {
+    fn complete(mut self, completion_result: Completion) -> Self::Output {
         let res = completion_result.result.map(|v| v as usize);
         let mut bufs = self.bufs;
 

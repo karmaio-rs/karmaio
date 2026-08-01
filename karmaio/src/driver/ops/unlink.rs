@@ -1,8 +1,15 @@
 use std::io;
 use std::path::Path;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
+use crate::driver::ops::{Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Remove a file or directory from the filesystem.
@@ -31,8 +38,9 @@ impl Op<Unlink> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Unlink {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Unlink {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let flags = if self.remove_dir { libc::AT_REMOVEDIR } else { 0 };
@@ -41,11 +49,16 @@ impl BackendSubmit for Unlink {
             .flags(flags)
             .build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Unlink {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Unlink {
+    type Output = io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         let path = self.path.clone();
         let remove_dir = self.remove_dir;
         macos_syscall_blocking!({
@@ -56,11 +69,16 @@ impl BackendSubmit for Unlink {
             })
         })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Unlink {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Unlink {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::{DeleteFileW, RemoveDirectoryW};
 
         let path = self.path.clone();
@@ -73,12 +91,8 @@ impl BackendSubmit for Unlink {
             }
         })
     }
-}
 
-impl BackendComplete for Unlink {
-    type Result = io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
     }
 }

@@ -1,9 +1,13 @@
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBuf, BufResult},
-    driver::{
-        helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
-    },
+    driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
@@ -40,8 +44,9 @@ impl<B: BoundedIoBuf> Op<Send<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBuf> UringOperation for Send<B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let ptr = self.buf.stable_read_ptr();
@@ -49,11 +54,19 @@ impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
 
         opcode::Send::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        let res = completion_entry.result.map(|v| v as usize);
+        let buf = self.buf;
+
+        (res, buf)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBuf> PollOperation for Send<B> {
+    type Output = BufResult<usize, B>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             let ptr = self.buf.stable_read_ptr();
             let len = self.buf.bytes_init();
@@ -61,11 +74,19 @@ impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
             macos_syscall!(libc::send(self.io_handle.raw_fd(), ptr as *const libc::c_void, len, 0,))
         })
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        let res = completion_entry.result.map(|v| v as usize);
+        let buf = self.buf;
+
+        (res, buf)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBuf> IocpOperation for Send<B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSASend;
 
@@ -86,12 +107,8 @@ impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
             )
         })
     }
-}
 
-impl<B: BoundedIoBuf> BackendComplete for Send<B> {
-    type Result = BufResult<usize, B>;
-
-    fn complete(self, completion_entry: super::Completion) -> Self::Result {
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 

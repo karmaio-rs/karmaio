@@ -3,13 +3,20 @@ use std::path::Path;
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::{
             attached_handle::AttachedHandle,
             cstr::{OsPath, cstr},
         },
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     fs::{File, OpenOptions},
     runtime::local::CURRENT_DRIVER,
@@ -73,8 +80,9 @@ impl Op<Open> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Open {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Open {
+    type Output = std::io::Result<File>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let flags = libc::O_CLOEXEC
@@ -89,21 +97,31 @@ impl BackendSubmit for Open {
             .mode(self.options.mode)
             .build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        // Safety: open returned a new open file descriptor; ownership transfers here.
+        let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
+        Ok(File {
+            // SAFETY: The file was just opened and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(file) },
+        })
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Open {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Open {
+    type Output = std::io::Result<File>;
+    fn attempt(&mut self) -> PollAttempt {
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return BackendSubmission::Ready(Completion { result: Err(e) });
+                return PollAttempt::Ready(Completion { result: Err(e) });
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return BackendSubmission::Ready(Completion { result: Err(e) });
+                return PollAttempt::Ready(Completion { result: Err(e) });
             }
         };
 
@@ -113,23 +131,33 @@ impl BackendSubmit for Open {
 
         macos_syscall_blocking!({ macos_syscall!(libc::open(path.as_c_str().as_ptr(), flags, mode)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        // Safety: open returned a new open file descriptor; ownership transfers here.
+        let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
+        Ok(File {
+            // SAFETY: The file was just opened and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(file) },
+        })
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Open {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Open {
+    type Output = std::io::Result<File>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return BackendSubmission::Ready(Completion { result: Err(e) });
+                return IocpSubmission::Ready(Completion { result: Err(e) });
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return BackendSubmission::Ready(Completion { result: Err(e) });
+                return IocpSubmission::Ready(Completion { result: Err(e) });
             }
         };
 
@@ -146,10 +174,21 @@ impl BackendSubmit for Open {
         }) {
             Ok(handle) => {
                 self.handle = Some(handle as _);
-                BackendSubmission::Ready(Completion { result: Ok(0) })
+                IocpSubmission::Ready(Completion { result: Ok(0) })
             }
-            Err(err) => BackendSubmission::Ready(Completion { result: Err(err) }),
+            Err(err) => IocpSubmission::Ready(Completion { result: Err(err) }),
         }
+    }
+
+    fn complete(mut self, cqe: Completion) -> Self::Output {
+        let _ = cqe.result?;
+        let handle = self.handle.take().expect("Open handle not set");
+        // Safety: open produced an open Win32 file handle; ownership transfers here.
+        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        Ok(File {
+            // SAFETY: The file was just opened and will be used within the runtime context.
+            handle: unsafe { AttachedHandle::new_unchecked(file) },
+        })
     }
 }
 
@@ -161,35 +200,5 @@ impl Drop for Open {
                 windows_sys::Win32::Foundation::CloseHandle(handle as _);
             }
         }
-    }
-}
-
-#[cfg(unix)]
-impl BackendComplete for Open {
-    type Result = std::io::Result<File>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
-        // Safety: open returned a new open file descriptor; ownership transfers here.
-        let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
-        Ok(File {
-            // SAFETY: The file was just opened and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(file) },
-        })
-    }
-}
-
-#[cfg(windows)]
-impl BackendComplete for Open {
-    type Result = std::io::Result<File>;
-
-    fn complete(mut self, cqe: Completion) -> Self::Result {
-        let _ = cqe.result?;
-        let handle = self.handle.take().expect("Open handle not set");
-        // Safety: open produced an open Win32 file handle; ownership transfers here.
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
-        Ok(File {
-            // SAFETY: The file was just opened and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(file) },
-        })
     }
 }

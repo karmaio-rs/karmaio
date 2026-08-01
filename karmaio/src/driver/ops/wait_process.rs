@@ -12,7 +12,14 @@ use std::{
     process,
 };
 
-use crate::driver::ops::{BackendSubmission, BackendSubmit, Completion, Op};
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
+use crate::driver::ops::{Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 pub(crate) struct WaitProcess {
@@ -29,18 +36,16 @@ impl Op<WaitProcess> {
     }
 }
 
-impl BackendSubmit for WaitProcess {
-    fn submit(&mut self) -> BackendSubmission {
+#[cfg(target_os = "linux")]
+unsafe impl UringOperation for WaitProcess {
+    type Output = io::Result<process::ExitStatus>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
         // Poll the pidfd for readability; it becomes readable once the child exits.
         opcode::PollAdd::new(types::Fd(self.pidfd.as_raw_fd()), libc::POLLIN as u32).build()
     }
-}
 
-impl crate::driver::ops::BackendComplete for WaitProcess {
-    type Result = io::Result<process::ExitStatus>;
-
-    fn complete(mut self, _completion: Completion) -> Self::Result {
+    fn complete(mut self, _completion: Completion) -> Self::Output {
         // The pidfd fired, so the child has exited; reap it.
         // `self.pidfd` is closed when `WaitProcess` is dropped.
         self.child.wait()

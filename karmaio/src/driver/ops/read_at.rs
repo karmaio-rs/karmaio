@@ -1,9 +1,13 @@
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
-    driver::{
-        helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
-    },
+    driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
@@ -36,8 +40,9 @@ impl<B: BoundedIoBufMut> Op<ReadAt<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> BackendSubmit for ReadAt<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> UringOperation for ReadAt<B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         // Get raw buffer info
@@ -47,11 +52,29 @@ impl<B: BoundedIoBufMut> BackendSubmit for ReadAt<B> {
             .offset(self.offset as _)
             .build()
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+        // Recover the buffer
+        let mut buf = self.buf;
+
+        // If the operation was successful, advance the initialized cursor.
+        if let Ok(n) = res {
+            // Safety: the kernel wrote `n` bytes to the buffer.
+            unsafe {
+                buf.set_init(n);
+            }
+        }
+
+        (res, buf)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> BackendSubmit for ReadAt<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBufMut> PollOperation for ReadAt<B> {
+    type Output = BufResult<usize, B>;
+    fn attempt(&mut self) -> PollAttempt {
         // Regular files always report ready under kqueue, and pread can block on
         // disk I/O — offload to the blocking pool so the runtime thread stays free.
         // Buffer pointers remain valid: the Op (and its buffers) stay alive until
@@ -62,11 +85,29 @@ impl<B: BoundedIoBufMut> BackendSubmit for ReadAt<B> {
         let offset = self.offset as i64;
         macos_syscall_blocking!({ macos_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset)) })
     }
+
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+        // Recover the buffer
+        let mut buf = self.buf;
+
+        // If the operation was successful, advance the initialized cursor.
+        if let Ok(n) = res {
+            // Safety: the kernel wrote `n` bytes to the buffer.
+            unsafe {
+                buf.set_init(n);
+            }
+        }
+
+        (res, buf)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> BackendSubmit for ReadAt<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> IocpOperation for ReadAt<B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
@@ -87,12 +128,8 @@ impl<B: BoundedIoBufMut> BackendSubmit for ReadAt<B> {
             ReadFile(handle as _, ptr as *mut u8, len, &mut bytes_read, interest.as_mut_ptr())
         })
     }
-}
 
-impl<B: BoundedIoBufMut> BackendComplete for ReadAt<B> {
-    type Result = BufResult<usize, B>;
-
-    fn complete(self, completion_entry: super::Completion) -> Self::Result {
+    fn complete(self, completion_entry: super::Completion) -> Self::Output {
         // Convert the operation result to `usize`
         let res = completion_entry.result.map(|v| v as usize);
         // Recover the buffer

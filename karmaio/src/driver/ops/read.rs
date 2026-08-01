@@ -11,11 +11,18 @@ use std::os::fd::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -60,30 +67,61 @@ where
 }
 
 #[cfg(target_os = "linux")]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for Read<T, B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> UringOperation for Read<T, B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let ptr = self.buf.stable_write_ptr();
         let len = self.buf.bytes_total();
         opcode::Read::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
+
+    fn complete(mut self, completion: Completion) -> Self::Output {
+        match completion.result {
+            Ok(res) => {
+                let res = res as usize;
+                // Safety: the kernel wrote `res` bytes into the buffer.
+                unsafe {
+                    self.buf.set_init(res);
+                }
+                (Ok(res), self.buf)
+            }
+            Err(err) => (Err(err), self.buf),
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for Read<T, B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> PollOperation for Read<T, B> {
+    type Output = BufResult<usize, B>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr() as *mut libc::c_void;
             let len = self.buf.bytes_total();
             macos_syscall!(libc::read(self.io_handle.raw_fd(), ptr, len))
         })
     }
+
+    fn complete(mut self, completion: Completion) -> Self::Output {
+        match completion.result {
+            Ok(res) => {
+                let res = res as usize;
+                // Safety: the kernel wrote `res` bytes into the buffer.
+                unsafe {
+                    self.buf.set_init(res);
+                }
+                (Ok(res), self.buf)
+            }
+            Err(err) => (Err(err), self.buf),
+        }
+    }
 }
 
 #[cfg(windows)]
-impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for Read<T, B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> IocpOperation for Read<T, B> {
+    type Output = BufResult<usize, B>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
@@ -96,12 +134,8 @@ impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for R
             ReadFile(handle as _, ptr, len, std::ptr::null_mut(), interest.as_mut_ptr())
         })
     }
-}
 
-impl<T: 'static, B: BoundedIoBufMut + 'static> BackendComplete for Read<T, B> {
-    type Result = BufResult<usize, B>;
-
-    fn complete(mut self, completion: Completion) -> Self::Result {
+    fn complete(mut self, completion: Completion) -> Self::Output {
         match completion.result {
             Ok(res) => {
                 let res = res as usize;

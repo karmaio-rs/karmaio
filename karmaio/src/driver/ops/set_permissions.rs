@@ -3,10 +3,17 @@ use std::io;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     fs::Permissions,
     runtime::local::CURRENT_DRIVER,
@@ -36,17 +43,23 @@ impl Op<SetPermissions> {
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for SetPermissions {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for SetPermissions {
+    type Output = io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         let fd = self.handle.raw_fd();
         let mode = self.perm.mode() as libc::mode_t;
         macos_syscall_blocking!({ macos_syscall!(libc::fchmod(fd, mode)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for SetPermissions {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for SetPermissions {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::opcode;
 
         // No direct fchmod opcode in io_uring (as of current version). Perform
@@ -70,11 +83,17 @@ impl BackendSubmit for SetPermissions {
             return opcode::Nop::new().build();
         }
     }
+
+    fn complete(self, _cqe: Completion) -> Self::Output {
+        self.result
+            .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::Other, "set_permissions result missing")))
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for SetPermissions {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for SetPermissions {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::{FileBasicInfo, SetFileInformationByHandle};
 
         // Mirrors `FILE_BASIC_INFORMATION` from the Windows SDK. `windows-sys` does not
@@ -111,23 +130,8 @@ impl BackendSubmit for SetPermissions {
             })
         })
     }
-}
 
-#[cfg(target_os = "linux")]
-impl BackendComplete for SetPermissions {
-    type Result = io::Result<()>;
-
-    fn complete(self, _cqe: Completion) -> Self::Result {
-        self.result
-            .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::Other, "set_permissions result missing")))
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-impl BackendComplete for SetPermissions {
-    type Result = io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
     }
 }

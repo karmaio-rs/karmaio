@@ -5,11 +5,18 @@ use std::io::IoSliceMut;
 
 use socket2::SockAddr;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -91,17 +98,62 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> UringOperation for RecvFrom<B> {
+    type Output = BufResult<(usize, SocketAddr), B>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
     }
+
+    // `mut self` is required on Windows (`set_length`); unused on other targets.
+    #[allow(unused_mut)]
+    fn complete(mut self, completion_result: Completion) -> Self::Output {
+        let res = completion_result.result.map(|v| v as usize);
+        let mut buf = self.buf;
+
+        #[cfg(windows)]
+        {
+            let address_len = match usize::try_from(*self.socket_addr_len) {
+                Ok(length) if length <= self.socket_addr.len() as usize => length,
+                _ => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid socket address length",
+                        )),
+                        buf,
+                    );
+                }
+            };
+            // Sync the address length that the kernel wrote through the
+            // stable `lpFromlen` pointer during the overlapped operation.
+            unsafe {
+                self.socket_addr.set_length(address_len as _);
+            }
+        }
+
+        let res = res.and_then(|bytes_written| {
+            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "kernel returned an invalid socket address")
+            })?;
+
+            // The kernel wrote `bytes_written` bytes to the buffer.
+            unsafe {
+                buf.set_init(bytes_written);
+            }
+
+            Ok((bytes_written, socket_addr))
+        });
+
+        (res, buf)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBufMut> PollOperation for RecvFrom<B> {
+    type Output = BufResult<(usize, SocketAddr), B>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr();
             let len = self.buf.bytes_total();
@@ -126,11 +178,55 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
             result
         })
     }
+
+    // `mut self` is required on Windows (`set_length`); unused on other targets.
+    #[allow(unused_mut)]
+    fn complete(mut self, completion_result: Completion) -> Self::Output {
+        let res = completion_result.result.map(|v| v as usize);
+        let mut buf = self.buf;
+
+        #[cfg(windows)]
+        {
+            let address_len = match usize::try_from(*self.socket_addr_len) {
+                Ok(length) if length <= self.socket_addr.len() as usize => length,
+                _ => {
+                    return (
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "invalid socket address length",
+                        )),
+                        buf,
+                    );
+                }
+            };
+            // Sync the address length that the kernel wrote through the
+            // stable `lpFromlen` pointer during the overlapped operation.
+            unsafe {
+                self.socket_addr.set_length(address_len as _);
+            }
+        }
+
+        let res = res.and_then(|bytes_written| {
+            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "kernel returned an invalid socket address")
+            })?;
+
+            // The kernel wrote `bytes_written` bytes to the buffer.
+            unsafe {
+                buf.set_init(bytes_written);
+            }
+
+            Ok((bytes_written, socket_addr))
+        });
+
+        (res, buf)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
+    type Output = BufResult<(usize, SocketAddr), B>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecvFrom;
 
@@ -157,14 +253,10 @@ impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
             )
         })
     }
-}
-
-impl<B: BoundedIoBufMut> BackendComplete for RecvFrom<B> {
-    type Result = BufResult<(usize, SocketAddr), B>;
 
     // `mut self` is required on Windows (`set_length`); unused on other targets.
     #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Result {
+    fn complete(mut self, completion_result: Completion) -> Self::Output {
         let res = completion_result.result.map(|v| v as usize);
         let mut buf = self.buf;
 

@@ -1,10 +1,17 @@
 use std::io;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -74,8 +81,9 @@ impl<B: BoundedIoBufMut> Op<Readv<B>> {
 }
 
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> UringOperation for Readv<B> {
+    type Output = BufResult<usize, Vec<B>>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::Readv::new(
@@ -86,11 +94,38 @@ impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
         .offset(self.offset as _)
         .build()
     }
+
+    fn complete(self, completion_entry: Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+        // Recover the buffer
+        let mut bufs = self.bufs;
+
+        // If the operation was successful, advance the initialized cursor.
+        if let Ok(n) = res {
+            let mut count = n;
+            for buf in bufs.iter_mut() {
+                let sz = std::cmp::min(count, buf.bytes_total() - buf.bytes_init());
+                let pos = buf.bytes_init() + sz;
+                // Safety: the kernel returns bytes written, and we have ensured that `pos` is
+                // valid for current buffer.
+                unsafe { buf.set_init(pos) };
+                count -= sz;
+                if count == 0 {
+                    break;
+                }
+            }
+            assert_eq!(count, 0);
+        }
+
+        (res, bufs)
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
-    fn submit(&mut self) -> BackendSubmission {
+impl<B: BoundedIoBufMut> PollOperation for Readv<B> {
+    type Output = BufResult<usize, Vec<B>>;
+    fn attempt(&mut self) -> PollAttempt {
         // Same rationale as ReadAt: kqueue is useless for regular files and
         // preadv may block. Keep iovecs/buffers alive in the Op while the pool runs.
         let fd = self.io_handle.raw_fd();
@@ -99,11 +134,38 @@ impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
         let offset = self.offset as i64;
         macos_syscall_blocking!({ macos_syscall!(libc::preadv(fd, iovs as *const libc::iovec, iovcnt, offset)) })
     }
+
+    fn complete(self, completion_entry: Completion) -> Self::Output {
+        // Convert the operation result to `usize`
+        let res = completion_entry.result.map(|v| v as usize);
+        // Recover the buffer
+        let mut bufs = self.bufs;
+
+        // If the operation was successful, advance the initialized cursor.
+        if let Ok(n) = res {
+            let mut count = n;
+            for buf in bufs.iter_mut() {
+                let sz = std::cmp::min(count, buf.bytes_total() - buf.bytes_init());
+                let pos = buf.bytes_init() + sz;
+                // Safety: the kernel returns bytes written, and we have ensured that `pos` is
+                // valid for current buffer.
+                unsafe { buf.set_init(pos) };
+                count -= sz;
+                if count == 0 {
+                    break;
+                }
+            }
+            assert_eq!(count, 0);
+        }
+
+        (res, bufs)
+    }
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl<B: BoundedIoBufMut> IocpOperation for Readv<B> {
+    type Output = BufResult<usize, Vec<B>>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFileScatter;
 
@@ -132,12 +194,8 @@ impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
             )
         })
     }
-}
 
-impl<B: BoundedIoBufMut> BackendComplete for Readv<B> {
-    type Result = BufResult<usize, Vec<B>>;
-
-    fn complete(self, completion_entry: Completion) -> Self::Result {
+    fn complete(self, completion_entry: Completion) -> Self::Output {
         // Convert the operation result to `usize`
         let res = completion_entry.result.map(|v| v as usize);
         // Recover the buffer

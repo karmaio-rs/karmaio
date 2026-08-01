@@ -1,7 +1,14 @@
 use std::path::Path;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
+use crate::driver::ops::{Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Create a directory at path relative to the current working directory
@@ -32,8 +39,9 @@ impl Op<CreateDir> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for CreateDir {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for CreateDir {
+    type Output = std::io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
         let p_ref = self.path.as_c_str().as_ptr();
 
@@ -41,31 +49,37 @@ impl BackendSubmit for CreateDir {
             .mode(self.mode)
             .build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for CreateDir {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for CreateDir {
+    type Output = std::io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         let path = self.path.clone();
         let mode = self.mode;
         macos_syscall_blocking!({ macos_syscall!(libc::mkdir(path.as_c_str().as_ptr(), mode)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result.map(|_| ())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for CreateDir {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for CreateDir {
+    type Output = std::io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
         let path = self.path.clone();
         windows_syscall_blocking!({ windows_syscall!(BOOL, CreateDirectoryW(path.as_ptr(), std::ptr::null_mut())) })
     }
-}
 
-impl BackendComplete for CreateDir {
-    type Result = std::io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
     }
 }

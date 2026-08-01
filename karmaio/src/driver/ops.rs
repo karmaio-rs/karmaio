@@ -360,19 +360,3 @@ impl BlockingJob {
         (self.work)()
     }
 }
-
-// Select the concrete protocol and future type at compile time. These aliases
-// are target-local names used by the logical operation modules; the backend
-// itself still owns the actual submission result and lifecycle protocol.
-#[cfg(target_os = "windows")]
-pub(crate) use crate::driver::backends::iocp::{
-    IocpComplete as BackendComplete, IocpSubmission as BackendSubmission, IocpSubmit as BackendSubmit,
-};
-#[cfg(target_os = "linux")]
-pub(crate) use crate::driver::backends::iouring::{
-    Submission as BackendSubmission, UringComplete as BackendComplete, UringSubmit as BackendSubmit,
-};
-#[cfg(target_os = "macos")]
-pub(crate) use crate::driver::backends::kqueue::{
-    PollAttempt as BackendSubmission, PollComplete as BackendComplete, PollSubmit as BackendSubmit,
-};

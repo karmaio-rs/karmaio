@@ -1,9 +1,16 @@
 use socket2::SockAddr;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -32,8 +39,9 @@ impl Op<Connect> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Connect {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Connect {
+    type Output = std::io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         opcode::Connect::new(
@@ -43,11 +51,16 @@ impl BackendSubmit for Connect {
         )
         .build()
     }
+
+    fn complete(self, completion_entry: Completion) -> Self::Output {
+        completion_entry.result.map(|_| ())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Connect {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Connect {
+    type Output = std::io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         macos_syscall_submit!(connect self.io_handle.raw_fd(), {
             macos_syscall!(libc::connect(
                 self.io_handle.raw_fd(),
@@ -56,11 +69,16 @@ impl BackendSubmit for Connect {
             ))
         })
     }
+
+    fn complete(self, completion_entry: Completion) -> Self::Output {
+        completion_entry.result.map(|_| ())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Connect {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Connect {
+    type Output = std::io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use std::{mem, ptr, sync::OnceLock};
         use windows_sys::Win32::Networking::WinSock::{
@@ -114,22 +132,8 @@ impl BackendSubmit for Connect {
             )
         })
     }
-}
 
-#[cfg(unix)]
-impl BackendComplete for Connect {
-    type Result = std::io::Result<()>;
-
-    fn complete(self, completion_entry: Completion) -> Self::Result {
-        completion_entry.result.map(|_| ())
-    }
-}
-
-#[cfg(windows)]
-impl BackendComplete for Connect {
-    type Result = std::io::Result<()>;
-
-    fn complete(self, completion_entry: Completion) -> Self::Result {
+    fn complete(self, completion_entry: Completion) -> Self::Output {
         use windows_sys::Win32::Networking::WinSock::{SO_UPDATE_CONNECT_CONTEXT, SOCKET, SOL_SOCKET, setsockopt};
 
         completion_entry.result?;

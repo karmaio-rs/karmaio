@@ -19,32 +19,26 @@ use crate::driver::{Handle, Wakeup};
 
 pub(crate) type Submission = squeue::Entry;
 
-/// Build a normal one-shot io_uring submission.
-///
-/// Implementations are internal to the crate and must ensure that every raw
-/// pointer stored in the returned SQE points to memory that remains valid until
-/// the operation's terminal CQE.
-pub(crate) trait UringSubmit {
-    fn submit(&mut self) -> Submission;
-}
-
-pub(crate) trait UringComplete {
-    type Result;
-
-    fn complete(self, completion: Completion) -> Self::Result;
-}
-
-/// Backend-local operation protocol used by the typed io_uring future.
+/// Backend-local protocol for one-shot io_uring operations.
 ///
 /// Implementations must keep every pointer embedded in the returned SQE valid
-/// until the terminal CQE is dispatched. Kernel-visible control structures
-/// therefore need stable ownership, typically through a `Box`-owned field.
-pub(crate) trait UringOperation: UringSubmit + UringComplete<Result = Self::Output> {
+/// until the operation's terminal CQE. The operation payload remains owned by
+/// the typed [`Op`] future, or by the exceptional detached cleanup record,
+/// until [`UringOperation::complete`] has run.
+///
+/// # Safety
+///
+/// Implementations must ensure that every pointer embedded in the returned
+/// SQE remains valid and points to the correct operation-owned storage until
+/// the terminal CQE has been dispatched.
+pub(crate) unsafe trait UringOperation: 'static {
     type Output;
-}
 
-impl<T: UringSubmit + UringComplete> UringOperation for T {
-    type Output = T::Result;
+    /// Build the one-shot SQE for this operation.
+    fn submit(&mut self) -> Submission;
+
+    /// Convert the terminal CQE into the operation's typed result.
+    fn complete(self, completion: Completion) -> Self::Output;
 }
 
 enum State {
@@ -60,7 +54,7 @@ trait IgnoredOp: 'static {
 
 impl<T: UringOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(UringComplete::complete(*self, completion));
+        drop(UringOperation::complete(*self, completion));
     }
 }
 
@@ -204,7 +198,7 @@ impl IoUringBackend {
         let key = self.ops.insert(State::Submitted)?;
 
         // Submit the new operation to the kernel
-        let entry = UringSubmit::submit(&mut data).user_data(key.as_u64());
+        let entry = UringOperation::submit(&mut data).user_data(key.as_u64());
 
         while unsafe { self.uring.submission().push(&entry).is_err() } {
             // If the submission queue is full, flush it to the kernel
@@ -242,7 +236,7 @@ impl IoUringBackend {
                 // Run complete so orphan accept/open FDs are closed.
                 if let Some(State::Completed(completion)) = self.ops.remove(key) {
                     if let Some(data) = op.take_data() {
-                        drop(UringComplete::complete(data, completion));
+                        drop(UringOperation::complete(data, completion));
                     }
                 }
             }
@@ -275,7 +269,7 @@ impl IoUringBackend {
             // The kernel has completed the op. Resolve the future with the result
             State::Completed(_) => match self.ops.remove(op.key()) {
                 Some(State::Completed(completion)) => {
-                    Poll::Ready(UringComplete::complete(op.take_data().unwrap(), completion))
+                    Poll::Ready(UringOperation::complete(op.take_data().unwrap(), completion))
                 }
                 _ => unreachable!("invalid operation"),
             },
@@ -531,16 +525,14 @@ mod tests {
 
     struct CleanupMarker(Arc<AtomicBool>);
 
-    impl UringSubmit for CleanupMarker {
+    unsafe impl UringOperation for CleanupMarker {
+        type Output = ();
+
         fn submit(&mut self) -> Submission {
             io_uring::opcode::Nop::new().build()
         }
-    }
 
-    impl UringComplete for CleanupMarker {
-        type Result = ();
-
-        fn complete(self, _completion: Completion) -> Self::Result {
+        fn complete(self, _completion: Completion) -> Self::Output {
             self.0.store(true, Ordering::SeqCst);
         }
     }

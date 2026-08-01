@@ -1,9 +1,16 @@
 use std::io;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::io_handle::SharedIoHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     fs::Metadata,
     runtime::local::CURRENT_DRIVER,
@@ -45,8 +52,9 @@ impl Op<Stat> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Stat {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Stat {
+    type Output = io::Result<Metadata>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         let buf_ptr = self.statx_buf.as_mut() as *mut libc::statx as *mut types::statx;
@@ -60,11 +68,17 @@ impl BackendSubmit for Stat {
             .mask(libc::STATX_BASIC_STATS | libc::STATX_BTIME)
             .build()
     }
+
+    fn complete(self, completion: Completion) -> Self::Output {
+        completion.result?;
+        Ok(Metadata::from_statx(*self.statx_buf))
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Stat {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Stat {
+    type Output = io::Result<Metadata>;
+    fn attempt(&mut self) -> PollAttempt {
         use std::sync::{Arc, Mutex};
 
         // fstat fills a buffer we need after the pool job; share it with the worker.
@@ -81,38 +95,8 @@ impl BackendSubmit for Stat {
             result
         })
     }
-}
 
-#[cfg(windows)]
-impl BackendSubmit for Stat {
-    fn submit(&mut self) -> BackendSubmission {
-        use windows_sys::Win32::Foundation::HANDLE;
-
-        match Metadata::from_handle(self.handle.raw_handle() as HANDLE) {
-            Ok(metadata) => {
-                self.result = Some(metadata);
-                BackendSubmission::Ready(Completion { result: Ok(0) })
-            }
-            Err(err) => BackendSubmission::Ready(Completion { result: Err(err) }),
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
-impl BackendComplete for Stat {
-    type Result = io::Result<Metadata>;
-
-    fn complete(self, completion: Completion) -> Self::Result {
-        completion.result?;
-        Ok(Metadata::from_statx(*self.statx_buf))
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl BackendComplete for Stat {
-    type Result = io::Result<Metadata>;
-
-    fn complete(self, completion: Completion) -> Self::Result {
+    fn complete(self, completion: Completion) -> Self::Output {
         completion.result?;
         let slot = self
             .stat_shared
@@ -127,10 +111,21 @@ impl BackendComplete for Stat {
 }
 
 #[cfg(windows)]
-impl BackendComplete for Stat {
-    type Result = io::Result<Metadata>;
+unsafe impl IocpOperation for Stat {
+    type Output = io::Result<Metadata>;
+    fn submit(&mut self) -> IocpSubmission {
+        use windows_sys::Win32::Foundation::HANDLE;
 
-    fn complete(self, completion: Completion) -> Self::Result {
+        match Metadata::from_handle(self.handle.raw_handle() as HANDLE) {
+            Ok(metadata) => {
+                self.result = Some(metadata);
+                IocpSubmission::Ready(Completion { result: Ok(0) })
+            }
+            Err(err) => IocpSubmission::Ready(Completion { result: Err(err) }),
+        }
+    }
+
+    fn complete(self, completion: Completion) -> Self::Output {
         completion.result?;
         Ok(self.result.expect("metadata missing after successful submit"))
     }

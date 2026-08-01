@@ -65,27 +65,18 @@ pub(crate) enum PollAttempt {
     Blocking(BlockingJob),
 }
 
-/// Attempt a readiness-backed operation or produce a blocking-pool job.
-pub(crate) trait PollSubmit {
-    fn submit(&mut self) -> PollAttempt;
-}
-
-pub(crate) trait PollComplete {
-    type Result;
-
-    fn complete(self, completion: Completion) -> Self::Result;
-}
-
 /// Backend-local readiness operation protocol.
 ///
 /// A readiness operation must only retain resources that are safe to retry
 /// after the registered descriptor/filter becomes ready.
-pub(crate) trait PollOperation: PollSubmit + PollComplete<Result = Self::Output> {
+pub(crate) trait PollOperation: 'static {
     type Output;
-}
 
-impl<T: PollSubmit + PollComplete> PollOperation for T {
-    type Output = T::Result;
+    /// Attempt the operation without blocking the runtime thread.
+    fn attempt(&mut self) -> PollAttempt;
+
+    /// Convert a terminal syscall or blocking-pool result into the typed output.
+    fn complete(self, completion: Completion) -> Self::Output;
 }
 
 enum State {
@@ -102,7 +93,7 @@ trait IgnoredOp: 'static {
 
 impl<T: PollOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(PollComplete::complete(*self, completion));
+        drop(PollOperation::complete(*self, completion));
     }
 }
 
@@ -305,7 +296,7 @@ impl KqueueBackend {
                 if let State::Completed(completion) = slot.state
                     && let Some(data) = op.take_data()
                 {
-                    drop(PollComplete::complete(data, completion));
+                    drop(PollOperation::complete(data, completion));
                 }
             }
             State::Ready => {
@@ -338,7 +329,7 @@ impl KqueueBackend {
         match current_state {
             State::Completed(completion) => {
                 let data = op.take_data().expect("Op data consumed");
-                let result = PollComplete::complete(data, completion);
+                let result = PollOperation::complete(data, completion);
                 self.ops.remove(key);
                 Poll::Ready(result)
             }
@@ -347,11 +338,11 @@ impl KqueueBackend {
                 // or dispatch blocking work to the pool.
                 let data = op.data_mut().expect("Op data consumed");
 
-                match PollSubmit::submit(data) {
+                match PollOperation::attempt(data) {
                     PollAttempt::Ready(completion) => {
                         // Synchronous completion
                         let data = op.take_data().expect("Op data consumed");
-                        let result = PollComplete::complete(data, completion);
+                        let result = PollOperation::complete(data, completion);
                         self.ops.remove(key);
                         Poll::Ready(result)
                     }
@@ -377,7 +368,7 @@ impl KqueueBackend {
                         if res < 0 {
                             let err = std::io::Error::last_os_error();
                             let data = op.take_data().expect("Op data consumed");
-                            let result = PollComplete::complete(data, Completion { result: Err(err) });
+                            let result = PollOperation::complete(data, Completion { result: Err(err) });
                             self.ops.remove(key);
                             return Poll::Ready(result);
                         }
@@ -392,7 +383,7 @@ impl KqueueBackend {
                         if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
                             let data = op.take_data().expect("Op data consumed");
                             self.ops.remove(key);
-                            Poll::Ready(PollComplete::complete(data, Completion { result: Err(error) }))
+                            Poll::Ready(PollOperation::complete(data, Completion { result: Err(error) }))
                         } else {
                             Poll::Pending
                         }
@@ -611,16 +602,14 @@ mod tests {
 
     struct CleanupMarker(Arc<AtomicBool>);
 
-    impl PollSubmit for CleanupMarker {
-        fn submit(&mut self) -> PollAttempt {
+    impl PollOperation for CleanupMarker {
+        type Output = ();
+
+        fn attempt(&mut self) -> PollAttempt {
             PollAttempt::Ready(Completion { result: Ok(0) })
         }
-    }
 
-    impl PollComplete for CleanupMarker {
-        type Result = ();
-
-        fn complete(self, _completion: Completion) -> Self::Result {
+        fn complete(self, _completion: Completion) -> Self::Output {
             self.0.store(true, Ordering::SeqCst);
         }
     }

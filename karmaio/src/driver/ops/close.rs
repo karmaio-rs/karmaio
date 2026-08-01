@@ -1,9 +1,16 @@
 use std::io;
 
+#[cfg(windows)]
+use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
+#[cfg(target_os = "macos")]
+use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+
 use crate::{
     driver::{
         helpers::io_handle::OsRawHandle,
-        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
+        ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -21,30 +28,47 @@ impl Op<Close> {
 }
 
 #[cfg(target_os = "linux")]
-impl BackendSubmit for Close {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl UringOperation for Close {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
         let fd = match self.io_handle {
             OsRawHandle::Fd(fd) => fd,
         };
         opcode::Close::new(types::Fd(fd)).build()
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        // If the cancel op is successful we don't have to do anything else for it
+        let _ = cqe.result?;
+
+        Ok(())
+    }
 }
 
 #[cfg(target_os = "macos")]
-impl BackendSubmit for Close {
-    fn submit(&mut self) -> BackendSubmission {
+impl PollOperation for Close {
+    type Output = io::Result<()>;
+    fn attempt(&mut self) -> PollAttempt {
         // Own the raw fd for the pool job (Close owns the handle exclusively).
         let fd = match self.io_handle {
             OsRawHandle::Fd(fd) => fd,
         };
         macos_syscall_blocking!({ macos_syscall!(libc::close(fd)) })
     }
+
+    fn complete(self, cqe: Completion) -> Self::Output {
+        // If the cancel op is successful we don't have to do anything else for it
+        let _ = cqe.result?;
+
+        Ok(())
+    }
 }
 
 #[cfg(windows)]
-impl BackendSubmit for Close {
-    fn submit(&mut self) -> BackendSubmission {
+unsafe impl IocpOperation for Close {
+    type Output = io::Result<()>;
+    fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::{Foundation::CloseHandle, Networking::WinSock::closesocket};
 
         // Capture as integer types so the blocking job is Send (RawHandle is *mut c_void).
@@ -58,12 +82,8 @@ impl BackendSubmit for Close {
             }
         }
     }
-}
 
-impl BackendComplete for Close {
-    type Result = io::Result<()>;
-
-    fn complete(self, cqe: Completion) -> Self::Result {
+    fn complete(self, cqe: Completion) -> Self::Output {
         // If the cancel op is successful we don't have to do anything else for it
         let _ = cqe.result?;
 

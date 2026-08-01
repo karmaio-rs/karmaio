@@ -1,8 +1,7 @@
 use crate::{
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -33,11 +32,9 @@ impl Op<Sync> {
     }
 }
 
-impl Operable for Sync {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Sync {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Sync {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let mut op = opcode::Fsync::new(types::Fd(self.handle.raw_fd()));
@@ -51,8 +48,8 @@ impl Submittable for Sync {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Sync {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Sync {
+    fn submit(&mut self) -> BackendSubmission {
         // Capture a raw fd (Send); SharedIoHandle stays on the op for the lifetime of the future.
         let fd = self.handle.raw_fd();
         macos_syscall_blocking!({ macos_syscall!(libc::fsync(fd)) })
@@ -60,8 +57,8 @@ impl Submittable for Sync {
 }
 
 #[cfg(windows)]
-impl Submittable for Sync {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Sync {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::FlushFileBuffers;
 
         let handle = self.handle.raw_handle() as isize;
@@ -69,7 +66,7 @@ impl Submittable for Sync {
     }
 }
 
-impl Completable for Sync {
+impl BackendComplete for Sync {
     type Result = std::io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

@@ -1,9 +1,8 @@
 use std::io;
 use std::path::Path;
 
-use crate::driver::Submission;
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{Completable, Completion, Op, Operable, Submittable};
+use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Remove a file or directory from the filesystem.
@@ -31,11 +30,9 @@ impl Op<Unlink> {
     }
 }
 
-impl Operable for Unlink {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Unlink {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Unlink {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let flags = if self.remove_dir { libc::AT_REMOVEDIR } else { 0 };
@@ -47,8 +44,8 @@ impl Submittable for Unlink {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Unlink {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Unlink {
+    fn submit(&mut self) -> BackendSubmission {
         let path = self.path.clone();
         let remove_dir = self.remove_dir;
         macos_syscall_blocking!({
@@ -62,8 +59,8 @@ impl Submittable for Unlink {
 }
 
 #[cfg(windows)]
-impl Submittable for Unlink {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Unlink {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::{DeleteFileW, RemoveDirectoryW};
 
         let path = self.path.clone();
@@ -78,7 +75,7 @@ impl Submittable for Unlink {
     }
 }
 
-impl Completable for Unlink {
+impl BackendComplete for Unlink {
     type Result = io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

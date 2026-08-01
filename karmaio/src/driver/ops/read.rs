@@ -1,6 +1,6 @@
 //! Offset-less read operations for stream-like file descriptors (pipes, sockets,
 //! char devices). Unlike [`crate::driver::ops::read_at`], these never touch the
-//! offset, which matters on macOS/BSD where the kqueue `Submittable`
+//! offset, which matters on macOS/BSD where the kqueue `PollOperation`
 //! implementations of the offset-based ops use `pread`/`pwrite` and those
 //! syscalls fail (`ESPIPE`) on non-seekable descriptors.
 
@@ -14,9 +14,8 @@ use std::os::windows::io::AsRawHandle;
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -60,15 +59,9 @@ where
     }
 }
 
-#[cfg(unix)]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> Operable for Read<T, B> {}
-
-#[cfg(windows)]
-impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> Operable for Read<T, B> {}
-
 #[cfg(target_os = "linux")]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> Submittable for Read<T, B> {
-    fn submit(&mut self) -> Submission {
+impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for Read<T, B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let ptr = self.buf.stable_write_ptr();
@@ -78,8 +71,8 @@ impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> Submittable for Read<T,
 }
 
 #[cfg(target_os = "macos")]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> Submittable for Read<T, B> {
-    fn submit(&mut self) -> Submission {
+impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for Read<T, B> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr() as *mut libc::c_void;
             let len = self.buf.bytes_total();
@@ -89,8 +82,8 @@ impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> Submittable for Read<T,
 }
 
 #[cfg(windows)]
-impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> Submittable for Read<T, B> {
-    fn submit(&mut self) -> Submission {
+impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> BackendSubmit for Read<T, B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
@@ -105,7 +98,7 @@ impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> Submittable for Rea
     }
 }
 
-impl<T: 'static, B: BoundedIoBufMut + 'static> Completable for Read<T, B> {
+impl<T: 'static, B: BoundedIoBufMut + 'static> BackendComplete for Read<T, B> {
     type Result = BufResult<usize, B>;
 
     fn complete(mut self, completion: Completion) -> Self::Result {

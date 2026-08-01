@@ -1,4 +1,4 @@
-//! macOS/kqueue syscall helpers for `Submittable` implementations.
+//! macOS/kqueue syscall helpers for `PollOperation` implementations.
 
 /// Execute a syscall that returns a non-negative value on success.
 ///
@@ -18,16 +18,13 @@ macro_rules! macos_syscall {
 
 macro_rules! __macos_syscall_ready {
     ($result:expr) => {
-        return $crate::driver::Submission::Ready($crate::driver::ops::Completion {
-            result: $result,
-            flags: 0,
-        })
+        return $crate::driver::backends::kqueue::PollAttempt::Ready($crate::driver::ops::Completion { result: $result })
     };
 }
 
 macro_rules! __macos_syscall_register {
     ($fd:expr, $filter:expr) => {
-        return $crate::driver::Submission::Register($crate::driver::backends::kqueue::Interest::new(
+        return $crate::driver::backends::kqueue::PollAttempt::Register($crate::driver::backends::kqueue::Interest::new(
             $fd,
             $filter,
             libc::EV_ADD | libc::EV_ONESHOT,
@@ -35,7 +32,7 @@ macro_rules! __macos_syscall_register {
     };
 }
 
-/// Package a synchronous syscall as [`Submission::Blocking`] for the thread pool.
+/// Package a synchronous syscall as [`PollAttempt::Blocking`] for the thread pool.
 ///
 /// Captures outer locals with `move`. Prefer this for path-based FS ops and other
 /// syscalls that cannot use kqueue readiness (open, mkdir, rename, fstat, …).
@@ -48,21 +45,15 @@ macro_rules! __macos_syscall_register {
 /// ```
 macro_rules! macos_syscall_blocking {
     ($block:block) => {{
-        $crate::driver::Submission::Blocking($crate::driver::ops::BlockingJob::new(move || {
+        $crate::driver::backends::kqueue::PollAttempt::Blocking($crate::driver::ops::BlockingJob::new(move || {
             loop {
                 match { $block } {
                     Ok(val) => {
-                        return $crate::driver::ops::Completion {
-                            result: Ok(val),
-                            flags: 0,
-                        };
+                        return $crate::driver::ops::Completion { result: Ok(val) };
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(err) => {
-                        return $crate::driver::ops::Completion {
-                            result: Err(err),
-                            flags: 0,
-                        };
+                        return $crate::driver::ops::Completion { result: Err(err) };
                     }
                 }
             }
@@ -70,7 +61,7 @@ macro_rules! macos_syscall_blocking {
     }};
 }
 
-/// Retry a syscall on `EINTR` and return a `Submission`.
+/// Retry a syscall on `EINTR` and return a `PollAttempt`.
 ///
 /// # Forms
 ///

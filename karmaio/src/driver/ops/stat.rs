@@ -2,9 +2,8 @@ use std::io;
 
 use crate::{
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     fs::Metadata,
     runtime::local::CURRENT_DRIVER,
@@ -45,11 +44,9 @@ impl Op<Stat> {
     }
 }
 
-impl Operable for Stat {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Stat {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Stat {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let buf_ptr = self.statx_buf.as_mut() as *mut libc::statx as *mut types::statx;
@@ -66,8 +63,8 @@ impl Submittable for Stat {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Stat {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Stat {
+    fn submit(&mut self) -> BackendSubmission {
         use std::sync::{Arc, Mutex};
 
         // fstat fills a buffer we need after the pool job; share it with the worker.
@@ -87,28 +84,22 @@ impl Submittable for Stat {
 }
 
 #[cfg(windows)]
-impl Submittable for Stat {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Stat {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Foundation::HANDLE;
 
         match Metadata::from_handle(self.handle.raw_handle() as HANDLE) {
             Ok(metadata) => {
                 self.result = Some(metadata);
-                Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                })
+                BackendSubmission::Ready(Completion { result: Ok(0) })
             }
-            Err(err) => Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            }),
+            Err(err) => BackendSubmission::Ready(Completion { result: Err(err) }),
         }
     }
 }
 
 #[cfg(target_os = "linux")]
-impl Completable for Stat {
+impl BackendComplete for Stat {
     type Result = io::Result<Metadata>;
 
     fn complete(self, completion: Completion) -> Self::Result {
@@ -118,7 +109,7 @@ impl Completable for Stat {
 }
 
 #[cfg(target_os = "macos")]
-impl Completable for Stat {
+impl BackendComplete for Stat {
     type Result = io::Result<Metadata>;
 
     fn complete(self, completion: Completion) -> Self::Result {
@@ -136,7 +127,7 @@ impl Completable for Stat {
 }
 
 #[cfg(windows)]
-impl Completable for Stat {
+impl BackendComplete for Stat {
     type Result = io::Result<Metadata>;
 
     fn complete(self, completion: Completion) -> Self::Result {

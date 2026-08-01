@@ -12,9 +12,8 @@ use std::os::windows::io::AsRawHandle;
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -58,15 +57,9 @@ where
     }
 }
 
-#[cfg(unix)]
-impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> Operable for Write<T, B> {}
-
-#[cfg(windows)]
-impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> Operable for Write<T, B> {}
-
 #[cfg(target_os = "linux")]
-impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> Submittable for Write<T, B> {
-    fn submit(&mut self) -> Submission {
+impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Write<T, B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let ptr = self.buf.stable_read_ptr();
@@ -76,8 +69,8 @@ impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> Submittable for Write<T, B
 }
 
 #[cfg(target_os = "macos")]
-impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> Submittable for Write<T, B> {
-    fn submit(&mut self) -> Submission {
+impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Write<T, B> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             let ptr = self.buf.stable_read_ptr() as *const libc::c_void;
             let len = self.buf.bytes_init();
@@ -87,8 +80,8 @@ impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> Submittable for Write<T, B
 }
 
 #[cfg(windows)]
-impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> Submittable for Write<T, B> {
-    fn submit(&mut self) -> Submission {
+impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> BackendSubmit for Write<T, B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
@@ -103,7 +96,7 @@ impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> Submittable for Write<
     }
 }
 
-impl<T: 'static, B: BoundedIoBuf + 'static> Completable for Write<T, B> {
+impl<T: 'static, B: BoundedIoBuf + 'static> BackendComplete for Write<T, B> {
     type Result = BufResult<usize, B>;
 
     fn complete(self, completion: Completion) -> Self::Result {

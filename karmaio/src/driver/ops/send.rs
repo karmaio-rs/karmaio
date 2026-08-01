@@ -1,9 +1,8 @@
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -40,11 +39,9 @@ impl<B: BoundedIoBuf> Op<Send<B>> {
     }
 }
 
-impl<B: BoundedIoBuf> Operable for Send<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf> Submittable for Send<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let ptr = self.buf.stable_read_ptr();
@@ -55,8 +52,8 @@ impl<B: BoundedIoBuf> Submittable for Send<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf> Submittable for Send<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             let ptr = self.buf.stable_read_ptr();
             let len = self.buf.bytes_init();
@@ -67,8 +64,8 @@ impl<B: BoundedIoBuf> Submittable for Send<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf> Submittable for Send<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for Send<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSASend;
 
@@ -91,7 +88,7 @@ impl<B: BoundedIoBuf> Submittable for Send<B> {
     }
 }
 
-impl<B: BoundedIoBuf> Completable for Send<B> {
+impl<B: BoundedIoBuf> BackendComplete for Send<B> {
     type Result = BufResult<usize, B>;
 
     fn complete(self, completion_entry: super::Completion) -> Self::Result {

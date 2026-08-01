@@ -8,9 +8,8 @@ use socket2::SockAddr;
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -116,11 +115,9 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Op<SendMsg<B, C>> {
     }
 }
 
-impl<B: BoundedIoBuf, C: BoundedIoBuf> Operable for SendMsg<B, C> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::SendMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_ref() as *const _).build()
@@ -128,8 +125,8 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
             macos_syscall!(libc::sendmsg(
                 self.io_handle.raw_fd(),
@@ -141,8 +138,8 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendSubmit for SendMsg<B, C> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSASendTo;
 
@@ -172,7 +169,7 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> Submittable for SendMsg<B, C> {
     }
 }
 
-impl<B: BoundedIoBuf, C: BoundedIoBuf> Completable for SendMsg<B, C> {
+impl<B: BoundedIoBuf, C: BoundedIoBuf> BackendComplete for SendMsg<B, C> {
     type Result = BufResult<(usize, Option<C>), Vec<B>>;
 
     fn complete(self, completion_entry: super::Completion) -> Self::Result {

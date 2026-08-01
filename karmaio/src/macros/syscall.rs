@@ -1,4 +1,4 @@
-//! Platform-specific syscall helpers for driver `Submittable` implementations.
+//! Platform-specific syscall helpers for backend-native operation implementations.
 
 #[cfg(target_os = "macos")]
 #[macro_use]

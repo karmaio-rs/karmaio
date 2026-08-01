@@ -1,13 +1,8 @@
-use std::{
-    io::Result,
-    task::{Context, Poll},
-    time::Duration,
-};
-
-#[cfg(unix)]
-use std::os::fd::RawFd;
-#[cfg(windows)]
-use std::os::windows::io::RawHandle;
+//! Compile-time selection of the runtime's concrete backend.
+//!
+//! There is intentionally no cross-platform backend trait here. `PlatformBackend`
+//! and the operation protocol are selected together, so calls from [`Driver`]
+//! are statically dispatched to the target implementation.
 
 #[cfg(target_os = "windows")]
 pub(crate) mod iocp;
@@ -16,85 +11,9 @@ pub(crate) mod iouring;
 #[cfg(target_os = "macos")]
 pub(crate) mod kqueue;
 
-use crate::driver::{
-    Handle, Wakeup,
-    ops::{Completable, Op, Operable},
-};
-use crate::runtime::blocking::BlockingPoolHandle;
-
 #[cfg(target_os = "windows")]
-pub(crate) use self::iocp::IocpBackend as PlatformBackend;
-#[cfg(target_os = "windows")]
-pub(crate) use self::iocp::Submission;
+pub(crate) use self::iocp::{IocpBackend as PlatformBackend, IocpOperation as Operation};
 #[cfg(target_os = "linux")]
-pub(crate) use self::iouring::IoUringBackend as PlatformBackend;
-#[cfg(target_os = "linux")]
-pub(crate) use self::iouring::Submission;
+pub(crate) use self::iouring::{IoUringBackend as PlatformBackend, UringOperation as Operation};
 #[cfg(target_os = "macos")]
-pub(crate) use self::kqueue::KqueueBackend as PlatformBackend;
-#[cfg(target_os = "macos")]
-pub(crate) use self::kqueue::Submission;
-
-pub(crate) trait DriverBackend {
-    // Submit a prepared entry to the backend.
-    // `Operable` so every in-flight op can be type-erased into [`IgnoredOp`] on detach.
-    fn submit_op<T: Operable>(&mut self, data: T, handle: Handle) -> Result<Op<T>>;
-
-    /// Detach an operation: the caller no longer wants the result.
-    ///
-    /// Keeps the payload alive until the kernel completion when needed,
-    /// then cleans them up via [`crate::driver::ops::IgnoredOp`] so accept/open FDs close.
-    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>);
-
-    // Checks if an operation is still pending/valid.
-    //
-    // `blocking` / `wakeup` are used when an op returns `Submission::Blocking`
-    // (macOS / Windows path and fd metadata syscalls). Linux io_uring ignores them.
-    fn poll_op<T: Operable>(
-        &mut self,
-        op: &mut Op<T>,
-        cx: &mut Context<'_>,
-        blocking: &BlockingPoolHandle,
-        wakeup: &Wakeup,
-    ) -> Poll<T::Result>;
-
-    /// Flush the submission queue without waiting for completions.
-    ///
-    /// Called from the runtime cold path when tasks remain after a scheduler batch
-    /// (so io_uring SQEs are not held until park). kqueue / IOCP return `Ok(())`.
-    fn submit(&mut self) -> Result<()>;
-
-    // Wait infinitely and process returned events.
-    fn wait(&mut self) -> Result<usize>;
-
-    // Wait for specified timeout and process returned events.
-    fn wait_with_duration(&mut self, duration: Duration) -> Result<usize>;
-
-    /// Apply completions produced by the blocking thread pool.
-    ///
-    /// The runtime owns the pool and calls this after `wait*` as its own phase,
-    /// before platform I/O completion dispatch. Default: no-op (e.g. io_uring).
-    fn drain_blocking_completions(&mut self) {}
-
-    // Apply platform I/O completions (CQEs / kevents / IOCP packets).
-    // Does not drain the blocking pool — see [`drain_blocking_completions`].
-    fn dispatch_completions(&mut self);
-
-    /// Create a `Wakeup` token that can be used from other threads to wake
-    /// a currently blocked `wait*` call on this driver.
-    fn create_wakeup(&self) -> crate::driver::Wakeup;
-
-    /// Associate a file or socket handle with the driver's I/O mechanism.
-    ///
-    /// On Windows (IOCP), this calls `CreateIoCompletionPort` and sets
-    /// `SetFileCompletionNotificationModes` for optimal performance. On
-    /// Linux (io-uring) / macOS (kqueue), this is a no-op.
-    #[cfg(windows)]
-    fn attach(&self, handle: RawHandle) -> Result<()>;
-
-    /// Associate a file descriptor with the driver's I/O mechanism.
-    ///
-    /// On Linux (io-uring) / macOS (kqueue), this is a no-op.
-    #[cfg(unix)]
-    fn attach(&self, fd: RawFd) -> Result<()>;
-}
+pub(crate) use self::kqueue::{KqueueBackend as PlatformBackend, PollOperation as Operation};

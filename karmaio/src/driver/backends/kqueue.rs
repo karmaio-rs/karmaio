@@ -3,17 +3,14 @@ use std::{
     io::{Error, Result},
     os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
     sync::{Arc, Mutex},
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
 use slab::Slab;
 
-use crate::driver::{
-    Handle, Wakeup,
-    backends::DriverBackend,
-    ops::{BlockingJob, Completable, Completion, Op, Operable, State},
-};
+use crate::driver::ops::{BlockingJob, Completion, Op};
+use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
 
 // Newtype around `libc::kevent` for type safety and zero-cost conversion.
@@ -38,7 +35,7 @@ impl Interest {
             flags,
             fflags: 0,
             data: 0,
-            udata: 0 as *mut libc::c_void, // driver will overwrite
+            udata: std::ptr::null_mut(), // driver will overwrite
         })
     }
 
@@ -47,6 +44,11 @@ impl Interest {
     pub(crate) fn as_kevent_mut(&mut self) -> &mut libc::kevent {
         &mut self.0
     }
+
+    #[inline]
+    fn matches(&self, event: &libc::kevent) -> bool {
+        self.0.ident == event.ident && self.0.filter == event.filter
+    }
 }
 
 // Kqueue is an event notification based system.
@@ -54,11 +56,104 @@ impl Interest {
 // 1. The syscall completed and returned you the `Completion` result.
 // 2. The syscall will block, in which case you registed a notification and wait
 // 3. The work must run on the blocking pool (`Blocking`).
-pub(crate) enum Submission {
+pub(crate) enum PollAttempt {
     Ready(Completion),
     Register(Interest),
     /// Offload a Send closure to the runtime blocking pool.
     Blocking(BlockingJob),
+}
+
+pub(crate) trait PollSubmit {
+    fn submit(&mut self) -> PollAttempt;
+}
+
+pub(crate) trait PollComplete {
+    type Result;
+
+    fn complete(self, completion: Completion) -> Self::Result;
+}
+
+/// Backend-local readiness operation protocol.
+pub(crate) trait PollOperation: PollSubmit + PollComplete {
+    type Output;
+
+    fn attempt(&mut self) -> PollAttempt;
+    fn complete(self, completion: Completion) -> Self::Output;
+}
+
+impl<T: PollSubmit + PollComplete> PollOperation for T {
+    type Output = T::Result;
+
+    #[inline]
+    fn attempt(&mut self) -> PollAttempt {
+        PollSubmit::submit(self)
+    }
+
+    #[inline]
+    fn complete(self, completion: Completion) -> Self::Output {
+        PollComplete::complete(self, completion)
+    }
+}
+
+enum State {
+    Submitted,
+    Ready,
+    Waiting(Waker),
+    Completed(Completion),
+    Ignored(Box<dyn IgnoredOp>),
+}
+
+trait IgnoredOp: 'static {
+    fn cleanup(self: Box<Self>, completion: Completion);
+}
+
+impl<T: PollOperation + 'static> IgnoredOp for T {
+    fn cleanup(self: Box<Self>, completion: Completion) {
+        drop(PollOperation::complete(*self, completion));
+    }
+}
+
+impl State {
+    fn complete(&mut self, completion: Completion) -> bool {
+        match self {
+            State::Submitted | State::Ready => {
+                *self = State::Completed(completion);
+                false
+            }
+            State::Waiting(_) => {
+                let old = std::mem::replace(self, State::Completed(completion));
+                if let State::Waiting(waker) = old {
+                    waker.wake();
+                }
+                false
+            }
+            State::Ignored(_) => {
+                if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
+                    payload.cleanup(completion);
+                }
+                true
+            }
+            State::Completed(..) => unreachable!("completion delivered twice"),
+        }
+    }
+
+    fn ready(&mut self) -> bool {
+        match self {
+            State::Submitted => {
+                *self = State::Ready;
+                false
+            }
+            State::Waiting(_) => {
+                let old = std::mem::replace(self, State::Ready);
+                if let State::Waiting(waker) = old {
+                    waker.wake();
+                }
+                false
+            }
+            State::Ignored(..) => true,
+            State::Ready | State::Completed(..) => false,
+        }
+    }
 }
 
 struct Slot {
@@ -131,8 +226,8 @@ impl KqueueBackend {
     }
 }
 
-impl DriverBackend for KqueueBackend {
-    fn submit_op<T: Operable>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+impl KqueueBackend {
+    pub(crate) fn submit_op<T: PollOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
         let index = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
@@ -141,7 +236,7 @@ impl DriverBackend for KqueueBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: PollOperation + 'static>(&mut self, op: &mut Op<T>) {
         let index = op.index();
         let slot = match self.ops.get_mut(index) {
             Some(val) => val,
@@ -174,10 +269,10 @@ impl DriverBackend for KqueueBackend {
             State::Completed(_) => {
                 // Completion already stored but never polled — cleanup now.
                 let slot = self.ops.remove(index);
-                if let State::Completed(completion) = slot.state {
-                    if let Some(data) = op.take_data() {
-                        drop(data.complete(completion));
-                    }
+                if let State::Completed(completion) = slot.state
+                    && let Some(data) = op.take_data()
+                {
+                    drop(PollOperation::complete(data, completion));
                 }
             }
             State::Ready => {
@@ -189,13 +284,13 @@ impl DriverBackend for KqueueBackend {
         }
     }
 
-    fn poll_op<T: Operable>(
+    pub(crate) fn poll_op<T: PollOperation + 'static>(
         &mut self,
         op: &mut Op<T>,
         cx: &mut Context<'_>,
         blocking: &BlockingPoolHandle,
         wakeup: &Wakeup,
-    ) -> Poll<T::Result> {
+    ) -> Poll<T::Output> {
         let index = op.index();
 
         let Some(slot) = self.ops.get_mut(index) else {
@@ -210,7 +305,7 @@ impl DriverBackend for KqueueBackend {
         match current_state {
             State::Completed(completion) => {
                 let data = op.take_data().expect("Op data consumed");
-                let result = data.complete(completion);
+                let result = PollOperation::complete(data, completion);
                 self.ops.remove(index);
                 Poll::Ready(result)
             }
@@ -219,16 +314,16 @@ impl DriverBackend for KqueueBackend {
                 // or dispatch blocking work to the pool.
                 let data = op.data_mut().expect("Op data consumed");
 
-                match data.submit() {
-                    Submission::Ready(completion) => {
+                match data.attempt() {
+                    PollAttempt::Ready(completion) => {
                         // Synchronous completion
                         let data = op.take_data().expect("Op data consumed");
-                        let result = data.complete(completion);
+                        let result = PollOperation::complete(data, completion);
                         self.ops.remove(index);
                         Poll::Ready(result)
                     }
 
-                    Submission::Register(mut interest) => {
+                    PollAttempt::Register(mut interest) => {
                         // Would-block → register and park
                         interest.as_kevent_mut().udata = index as *mut libc::c_void;
 
@@ -249,10 +344,7 @@ impl DriverBackend for KqueueBackend {
                         if res < 0 {
                             let err = std::io::Error::last_os_error();
                             let data = op.take_data().expect("Op data consumed");
-                            let result = data.complete(Completion {
-                                result: Err(err),
-                                flags: 0,
-                            });
+                            let result = PollOperation::complete(data, Completion { result: Err(err) });
                             self.ops.remove(index);
                             return Poll::Ready(result);
                         }
@@ -262,7 +354,7 @@ impl DriverBackend for KqueueBackend {
                         Poll::Pending
                     }
 
-                    Submission::Blocking(job) => {
+                    PollAttempt::Blocking(job) => {
                         slot.state = State::Waiting(cx.waker().clone());
                         self.push_blocking(index, job, blocking, wakeup);
                         Poll::Pending
@@ -286,12 +378,12 @@ impl DriverBackend for KqueueBackend {
         }
     }
 
-    fn submit(&mut self) -> Result<()> {
+    pub(crate) fn submit(&mut self) -> Result<()> {
         // kqueue has no batched submission queue — everything is done synchronously in poll_op.
         Ok(())
     }
 
-    fn wait(&mut self) -> Result<usize> {
+    pub(crate) fn wait(&mut self) -> Result<usize> {
         let n = unsafe {
             libc::kevent(
                 self.kqueue.as_raw_fd(),
@@ -322,7 +414,7 @@ impl DriverBackend for KqueueBackend {
         Ok(n)
     }
 
-    fn wait_with_duration(&mut self, duration: Duration) -> Result<usize> {
+    pub(crate) fn wait_with_duration(&mut self, duration: Duration) -> Result<usize> {
         let timeout = duration_to_timespec(duration);
         let n = unsafe {
             libc::kevent(
@@ -354,7 +446,7 @@ impl DriverBackend for KqueueBackend {
         Ok(n)
     }
 
-    fn drain_blocking_completions(&mut self) {
+    pub(crate) fn drain_blocking_completions(&mut self) {
         // Called by the runtime after wait* (see Runtime::block_on).
         let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
         while let Some((index, completion)) = pending.pop_front() {
@@ -367,7 +459,7 @@ impl DriverBackend for KqueueBackend {
         }
     }
 
-    fn dispatch_completions(&mut self) {
+    pub(crate) fn dispatch_completions(&mut self) {
         for event in &self.events {
             // Cross-thread wakeup (EVFILT_USER) — not an I/O op.
             if event.filter == libc::EVFILT_USER {
@@ -380,9 +472,17 @@ impl DriverBackend for KqueueBackend {
                 // Only Register-path ops install interest. Blocking-pool ops leave
                 // interest as None; a wake packet must never call `ready()` on them
                 // (especially after they are already `Completed`).
-                let Some(_interest) = slot.interest.take() else {
+                let Some(interest) = slot.interest.as_ref() else {
                     continue;
                 };
+
+                // A deleted registration can still leave a stale event in
+                // the userspace batch. Only consume events matching the
+                // descriptor/filter currently installed in this slot.
+                if !interest.matches(event) {
+                    continue;
+                }
+                let _ = slot.interest.take();
 
                 let should_drop = slot.state.ready();
                 if should_drop {
@@ -397,7 +497,7 @@ impl DriverBackend for KqueueBackend {
         self.events.clear();
     }
 
-    fn create_wakeup(&self) -> crate::driver::Wakeup {
+    pub(crate) fn create_wakeup(&self) -> Wakeup {
         let kq = self.kqueue.as_raw_fd();
         crate::driver::Wakeup::new(move || {
             // Perform the EVFILT_USER trigger using the captured raw fd.
@@ -410,7 +510,7 @@ impl DriverBackend for KqueueBackend {
         })
     }
 
-    fn attach(&self, _fd: RawFd) -> Result<()> {
+    pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
         // No-op on kqueue: handles don't need explicit registration.
         Ok(())
     }
@@ -446,5 +546,66 @@ fn duration_to_timespec(duration: Duration) -> libc::timespec {
     libc::timespec {
         tv_sec: duration.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
         tv_nsec: duration.subsec_nanos() as libc::c_long,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::task::Wake;
+
+    struct CleanupMarker(Arc<AtomicBool>);
+
+    impl PollSubmit for CleanupMarker {
+        fn submit(&mut self) -> PollAttempt {
+            PollAttempt::Ready(Completion { result: Ok(0) })
+        }
+    }
+
+    impl PollComplete for CleanupMarker {
+        type Result = ();
+
+        fn complete(self, _completion: Completion) -> Self::Result {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct WakeMarker(Arc<AtomicBool>);
+
+    impl Wake for WakeMarker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn completion_before_first_poll_is_retained() {
+        let mut state = State::Submitted;
+        assert!(!state.complete(Completion { result: Ok(7) }));
+        assert!(matches!(state, State::Completed(..)));
+    }
+
+    #[test]
+    fn detached_completion_runs_typed_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
+
+        assert!(state.complete(Completion { result: Ok(0) }));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn readiness_wakes_the_current_waiter() {
+        let woken = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
+        let mut state = State::Waiting(waker);
+
+        assert!(!state.ready());
+        assert!(woken.load(Ordering::SeqCst));
+        assert!(matches!(state, State::Ready));
     }
 }

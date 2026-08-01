@@ -12,10 +12,7 @@ use std::{
     process,
 };
 
-use crate::driver::{
-    Submission,
-    ops::{Completion, Op, Operable, Submittable},
-};
+use crate::driver::ops::{BackendSubmission, BackendSubmit, Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 pub(crate) struct WaitProcess {
@@ -32,17 +29,15 @@ impl Op<WaitProcess> {
     }
 }
 
-impl Operable for WaitProcess {}
-
-impl Submittable for WaitProcess {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for WaitProcess {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
         // Poll the pidfd for readability; it becomes readable once the child exits.
         opcode::PollAdd::new(types::Fd(self.pidfd.as_raw_fd()), libc::POLLIN as u32).build()
     }
 }
 
-impl crate::driver::ops::Completable for WaitProcess {
+impl crate::driver::ops::BackendComplete for WaitProcess {
     type Result = io::Result<process::ExitStatus>;
 
     fn complete(mut self, _completion: Completion) -> Self::Result {

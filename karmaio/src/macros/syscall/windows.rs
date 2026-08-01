@@ -1,4 +1,4 @@
-//! Windows/IOCP syscall helpers for `Submittable` implementations.
+//! Windows/IOCP syscall helpers for `IocpOperation` implementations.
 
 /// Execute a synchronous Windows API call and return `io::Result<u32>`.
 ///
@@ -47,25 +47,21 @@ macro_rules! windows_syscall {
     }};
 }
 
-/// Package a synchronous Windows call as [`Submission::Blocking`] for the thread pool.
+/// Package a synchronous Windows call as [`IocpSubmission::Blocking`] for the thread pool.
 ///
 /// Prefer this for path-based FS APIs (`CreateDirectoryW`, `DeleteFileW`, …).
 macro_rules! windows_syscall_blocking {
     ($block:block) => {{
-        $crate::driver::Submission::Blocking($crate::driver::ops::BlockingJob::new(move || match { $block } {
-            Ok(val) => $crate::driver::ops::Completion {
-                result: Ok(val),
-                flags: 0,
-            },
-            Err(err) => $crate::driver::ops::Completion {
-                result: Err(err),
-                flags: 0,
-            },
+        $crate::driver::backends::iocp::IocpSubmission::Blocking($crate::driver::ops::BlockingJob::new(move || match {
+            $block
+        } {
+            Ok(val) => $crate::driver::ops::Completion { result: Ok(val) },
+            Err(err) => $crate::driver::ops::Completion { result: Err(err) },
         }))
     }};
 }
 
-/// Map an overlapped API result to `Submission::Pending` or `Submission::Ready(Err)`.
+/// Map an overlapped API result to `IocpSubmission::Pending` or `IocpSubmission::Ready(Err)`.
 ///
 /// - `file` — Win32 `BOOL` APIs (`ReadFile`, `WriteFile`); uses `last_os_error`
 /// - `socket` — Winsock APIs returning `0` on success (`WSARecv`, `WSASend`); uses `WSAGetLastError`
@@ -75,51 +71,46 @@ macro_rules! windows_syscall_submit_overlapped {
         #[allow(unused_unsafe)]
         let result = unsafe { $call };
         if result != 0 {
-            return $crate::driver::Submission::Pending($interest);
+            return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_IO_PENDING as i32) {
-            return $crate::driver::Submission::Pending($interest);
+            return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
-        $crate::driver::Submission::Ready($crate::driver::ops::Completion {
-            result: Err(err),
-            flags: 0,
-        })
+        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion { result: Err(err) })
     }};
     ($interest:expr, socket, $call:expr) => {{
         #[allow(unused_unsafe)]
         let result = unsafe { $call };
         if result == 0 {
-            return $crate::driver::Submission::Pending($interest);
+            return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
         let err = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
         if err == windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING {
-            return $crate::driver::Submission::Pending($interest);
+            return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
-        $crate::driver::Submission::Ready($crate::driver::ops::Completion {
+        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion {
             result: Err(std::io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }};
     ($interest:expr, winsock, $call:expr) => {{
         #[allow(unused_unsafe)]
         let result = unsafe { $call };
         if result != 0 {
-            return $crate::driver::Submission::Pending($interest);
+            return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
         let err = unsafe { windows_sys::Win32::Networking::WinSock::WSAGetLastError() };
         if err == windows_sys::Win32::Networking::WinSock::WSA_IO_PENDING {
-            return $crate::driver::Submission::Pending($interest);
+            return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
-        $crate::driver::Submission::Ready($crate::driver::ops::Completion {
+        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion {
             result: Err(std::io::Error::from_raw_os_error(err)),
-            flags: 0,
         })
     }};
 }

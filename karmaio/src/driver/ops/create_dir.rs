@@ -1,8 +1,7 @@
 use std::path::Path;
 
-use crate::driver::Submission;
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{Completable, Completion, Op, Operable, Submittable};
+use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Create a directory at path relative to the current working directory
@@ -32,11 +31,9 @@ impl Op<CreateDir> {
     }
 }
 
-impl Operable for CreateDir {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for CreateDir {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for CreateDir {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
         let p_ref = self.path.as_c_str().as_ptr();
 
@@ -47,8 +44,8 @@ impl Submittable for CreateDir {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for CreateDir {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for CreateDir {
+    fn submit(&mut self) -> BackendSubmission {
         let path = self.path.clone();
         let mode = self.mode;
         macos_syscall_blocking!({ macos_syscall!(libc::mkdir(path.as_c_str().as_ptr(), mode)) })
@@ -56,8 +53,8 @@ impl Submittable for CreateDir {
 }
 
 #[cfg(windows)]
-impl Submittable for CreateDir {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for CreateDir {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
         let path = self.path.clone();
@@ -65,7 +62,7 @@ impl Submittable for CreateDir {
     }
 }
 
-impl Completable for CreateDir {
+impl BackendComplete for CreateDir {
     type Result = std::io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

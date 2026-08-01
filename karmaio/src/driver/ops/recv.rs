@@ -1,9 +1,8 @@
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -42,11 +41,9 @@ impl<B: BoundedIoBufMut> Op<Recv<B>> {
     }
 }
 
-impl<B: BoundedIoBufMut> Operable for Recv<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> Submittable for Recv<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         // Get raw buffer info
@@ -58,8 +55,8 @@ impl<B: BoundedIoBufMut> Submittable for Recv<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> Submittable for Recv<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr();
             let len = self.buf.bytes_total();
@@ -71,8 +68,8 @@ impl<B: BoundedIoBufMut> Submittable for Recv<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> Submittable for Recv<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for Recv<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecv;
 
@@ -96,7 +93,7 @@ impl<B: BoundedIoBufMut> Submittable for Recv<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> Completable for Recv<B> {
+impl<B: BoundedIoBufMut> BackendComplete for Recv<B> {
     type Result = BufResult<usize, B>;
 
     fn complete(self, completion_entry: super::Completion) -> Self::Result {

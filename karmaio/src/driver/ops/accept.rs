@@ -5,9 +5,8 @@ use std::os::windows::io::RawSocket;
 
 use crate::{
     driver::{
-        Submission,
         helpers::{attached_handle::AttachedHandle, io_handle::SharedIoHandle, socket::Socket},
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -50,11 +49,9 @@ impl Op<Accept> {
     }
 }
 
-impl Operable for Accept {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Accept {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Accept {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
         opcode::Accept::new(
             types::Fd(self.io_handle.raw_fd()),
@@ -67,8 +64,8 @@ impl Submittable for Accept {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Accept {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Accept {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             macos_syscall!(libc::accept(
                 self.io_handle.raw_fd(),
@@ -80,8 +77,8 @@ impl Submittable for Accept {
 }
 
 #[cfg(windows)]
-impl Submittable for Accept {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Accept {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::{AcceptEx, SOCKET};
 
@@ -92,10 +89,7 @@ impl Submittable for Accept {
                 let socket = match create_accept_socket(listen_socket) {
                     Ok(socket) => socket,
                     Err(err) => {
-                        return Submission::Ready(Completion {
-                            result: Err(err),
-                            flags: 0,
-                        });
+                        return BackendSubmission::Ready(Completion { result: Err(err) });
                     }
                 };
 
@@ -125,7 +119,7 @@ impl Submittable for Accept {
 }
 
 #[cfg(unix)]
-impl Completable for Accept {
+impl BackendComplete for Accept {
     type Result = io::Result<(Socket, Option<SocketAddr>)>;
 
     fn complete(self, completion: Completion) -> Self::Result {
@@ -156,7 +150,7 @@ impl Completable for Accept {
 }
 
 #[cfg(windows)]
-impl Completable for Accept {
+impl BackendComplete for Accept {
     type Result = io::Result<(Socket, Option<SocketAddr>)>;
 
     fn complete(mut self, completion: Completion) -> Self::Result {

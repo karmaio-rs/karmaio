@@ -2,9 +2,8 @@ use std::io;
 
 use crate::{
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -25,11 +24,9 @@ impl Op<Truncate> {
     }
 }
 
-impl Operable for Truncate {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Truncate {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Truncate {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::Ftruncate::new(types::Fd(self.handle.raw_fd()), self.size).build()
@@ -37,8 +34,8 @@ impl Submittable for Truncate {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Truncate {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Truncate {
+    fn submit(&mut self) -> BackendSubmission {
         let fd = self.handle.raw_fd();
         let size = self.size as libc::off_t;
         macos_syscall_blocking!({ macos_syscall!(libc::ftruncate(fd, size)) })
@@ -46,8 +43,8 @@ impl Submittable for Truncate {
 }
 
 #[cfg(windows)]
-impl Submittable for Truncate {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Truncate {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::{SetEndOfFile, SetFilePointerEx};
 
         let handle = self.handle.raw_handle() as isize;
@@ -70,7 +67,7 @@ impl Submittable for Truncate {
     }
 }
 
-impl Completable for Truncate {
+impl BackendComplete for Truncate {
     type Result = io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

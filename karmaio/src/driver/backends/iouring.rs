@@ -1,7 +1,7 @@
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::{
     io::Result,
-    task::{Context, Poll},
+    task::{Context, Poll, Waker},
     time::Duration,
 };
 
@@ -10,13 +10,91 @@ use io_uring::{IoUring, squeue};
 
 use slab::Slab;
 
-use crate::driver::Handle;
-use crate::driver::{
-    backends::DriverBackend,
-    ops::{Completable, Completion, Detached, Op, Operable, State},
-};
+use crate::driver::ops::{Completion, Op};
+use crate::driver::{Handle, Wakeup};
 
 pub(crate) type Submission = squeue::Entry;
+
+/// Build and consume a normal one-shot io_uring operation.
+pub(crate) trait UringSubmit {
+    fn submit(&mut self) -> Submission;
+}
+
+pub(crate) trait UringComplete {
+    type Result;
+
+    fn complete(self, completion: Completion) -> Self::Result;
+}
+
+/// Backend-local operation protocol used by the typed io_uring future.
+pub(crate) trait UringOperation: UringSubmit + UringComplete {
+    type Output;
+
+    fn submit(&mut self) -> Submission;
+    fn complete(self, completion: Completion) -> Self::Output;
+}
+
+impl<T: UringSubmit + UringComplete> UringOperation for T {
+    type Output = T::Result;
+
+    #[inline]
+    fn submit(&mut self) -> Submission {
+        UringSubmit::submit(self)
+    }
+
+    #[inline]
+    fn complete(self, completion: Completion) -> Self::Output {
+        UringComplete::complete(self, completion)
+    }
+}
+
+enum State {
+    Submitted,
+    Waiting(Waker),
+    Completed(Completion),
+    Ignored(Box<dyn IgnoredOp>),
+}
+
+trait IgnoredOp: 'static {
+    fn cleanup(self: Box<Self>, completion: Completion);
+}
+
+impl<T: UringOperation + 'static> IgnoredOp for T {
+    fn cleanup(self: Box<Self>, completion: Completion) {
+        drop(UringOperation::complete(*self, completion));
+    }
+}
+
+struct Detached;
+
+impl IgnoredOp for Detached {
+    fn cleanup(self: Box<Self>, _completion: Completion) {}
+}
+
+impl State {
+    fn complete(&mut self, completion: Completion) -> bool {
+        match self {
+            State::Submitted => {
+                *self = State::Completed(completion);
+                false
+            }
+            State::Waiting(_) => {
+                let old = std::mem::replace(self, State::Completed(completion));
+                if let State::Waiting(waker) = old {
+                    waker.wake();
+                }
+                false
+            }
+            State::Ignored(_) => {
+                if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
+                    payload.cleanup(completion);
+                }
+                true
+            }
+            State::Completed(..) => unreachable!("completion delivered twice"),
+        }
+    }
+}
 
 pub(crate) struct IoUringBackend {
     // List of ops tracked by the driver
@@ -83,13 +161,13 @@ impl IoUringBackend {
     }
 }
 
-impl DriverBackend for IoUringBackend {
-    fn submit_op<T: Operable>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+impl IoUringBackend {
+    pub(crate) fn submit_op<T: UringOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
         // Allocate a new entry in the driver
         let index = self.ops.insert(State::Submitted);
 
         // Submit the new operation to the kernel
-        let entry = data.submit().user_data(index as _);
+        let entry = UringOperation::submit(&mut data).user_data(index as _);
 
         while unsafe { self.uring.submission().push(&entry).is_err() } {
             // If the submission queue is full, flush it to the kernel
@@ -100,7 +178,7 @@ impl DriverBackend for IoUringBackend {
         Ok(Op::<T>::new(index, data, handle))
     }
 
-    fn remove_op<T: Completable + 'static>(&mut self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: UringOperation + 'static>(&mut self, op: &mut Op<T>) {
         let index = op.index();
         // Get the op state from the driver
         let state = match self.ops.get_mut(index) {
@@ -124,24 +202,19 @@ impl DriverBackend for IoUringBackend {
                 // Run complete so orphan accept/open FDs are closed.
                 if let State::Completed(completion) = self.ops.remove(index) {
                     if let Some(data) = op.take_data() {
-                        drop(data.complete(completion));
+                        drop(UringOperation::complete(data, completion));
                     }
                 }
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
-            State::Ready => unreachable!("invalid operation state"),
         }
     }
 
-    fn poll_op<T: Operable>(
+    pub(crate) fn poll_op<T: UringOperation + 'static>(
         &mut self,
         op: &mut Op<T>,
         cx: &mut Context<'_>,
-        // IoUring is pure async, so we don't need this.
-        // This is only here to match the overall driver interface signature
-        _blocking: &crate::runtime::blocking::BlockingPoolHandle,
-        _wakeup: &crate::driver::Wakeup,
-    ) -> Poll<T::Result> {
+    ) -> Poll<T::Output> {
         // Get the op state from the driver
         let state = self.ops.get_mut(op.index()).expect("invalid internal state");
 
@@ -161,21 +234,19 @@ impl DriverBackend for IoUringBackend {
             }
             // The kernel has completed the op. Resolve the future with the result
             State::Completed(_) => match self.ops.remove(op.index()) {
-                State::Completed(completion) => Poll::Ready(op.take_data().unwrap().complete(completion)),
+                State::Completed(completion) => {
+                    Poll::Ready(UringOperation::complete(op.take_data().unwrap(), completion))
+                }
                 _ => unreachable!("invalid operation"),
             },
             // The op has been ignored/cancelled by the caller. It should not be polled again
             State::Ignored(..) => {
                 unreachable!("invalid operation")
             }
-            // This state is only set in poll based reactors, not completion reactors
-            State::Ready => {
-                unreachable!("invalid operation")
-            }
         }
     }
 
-    fn submit(&mut self) -> Result<()> {
+    pub(crate) fn submit(&mut self) -> Result<()> {
         loop {
             match self.uring.submit() {
                 Ok(_) => {
@@ -193,11 +264,11 @@ impl DriverBackend for IoUringBackend {
         }
     }
 
-    fn wait(&mut self) -> Result<usize> {
+    pub(crate) fn wait(&mut self) -> Result<usize> {
         self.uring.submit_and_wait(1)
     }
 
-    fn wait_with_duration(&mut self, duration: Duration) -> Result<usize> {
+    pub(crate) fn wait_with_duration(&mut self, duration: Duration) -> Result<usize> {
         let timeout = io_uring::types::Timespec::from(duration);
         let args = io_uring::types::SubmitArgs::new().timespec(&timeout);
 
@@ -215,7 +286,7 @@ impl DriverBackend for IoUringBackend {
         }
     }
 
-    fn dispatch_completions(&mut self) {
+    pub(crate) fn dispatch_completions(&mut self) {
         let mut completion_queue = self.uring.completion();
 
         completion_queue.sync();
@@ -243,14 +314,13 @@ impl DriverBackend for IoUringBackend {
 
             let index = completion.user_data() as usize;
             let res = completion.result();
-            let flags = completion.flags();
             let result = if res >= 0 {
                 Ok(res as u32)
             } else {
                 Err(std::io::Error::from_raw_os_error(-res))
             };
 
-            if self.ops[index].complete(Completion { result, flags }) {
+            if self.ops[index].complete(Completion { result }) {
                 self.ops.remove(index);
             }
         }
@@ -260,7 +330,7 @@ impl DriverBackend for IoUringBackend {
         }
     }
 
-    fn create_wakeup(&self) -> crate::driver::Wakeup {
+    pub(crate) fn create_wakeup(&self) -> Wakeup {
         let fd = self.eventfd.as_raw_fd();
         crate::driver::Wakeup::new(move || {
             let val: u64 = 1;
@@ -274,10 +344,12 @@ impl DriverBackend for IoUringBackend {
         })
     }
 
-    fn attach(&self, _fd: RawFd) -> Result<()> {
+    pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
         // No-op on io_uring: handles don't need explicit registration.
         Ok(())
     }
+
+    pub(crate) fn drain_blocking_completions(&mut self) {}
 }
 
 impl AsRawFd for IoUringBackend {
@@ -378,5 +450,65 @@ impl Drop for IoUringBackend {
                 drop(Box::from_raw(self.wakeup_buf));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    use std::task::Wake;
+
+    struct CleanupMarker(Arc<AtomicBool>);
+
+    impl UringSubmit for CleanupMarker {
+        fn submit(&mut self) -> Submission {
+            io_uring::opcode::Nop::new().build()
+        }
+    }
+
+    impl UringComplete for CleanupMarker {
+        type Result = ();
+
+        fn complete(self, _completion: Completion) -> Self::Result {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct WakeMarker(Arc<AtomicBool>);
+
+    impl Wake for WakeMarker {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn completion_before_first_poll_is_retained() {
+        let mut state = State::Submitted;
+        assert!(!state.complete(Completion { result: Ok(7) }));
+        assert!(matches!(state, State::Completed(..)));
+    }
+
+    #[test]
+    fn detached_completion_runs_typed_cleanup() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
+
+        assert!(state.complete(Completion { result: Ok(0) }));
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn completion_wakes_the_current_waiter() {
+        let woken = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
+        let mut state = State::Waiting(waker);
+
+        assert!(!state.complete(Completion { result: Ok(0) }));
+        assert!(woken.load(Ordering::SeqCst));
     }
 }

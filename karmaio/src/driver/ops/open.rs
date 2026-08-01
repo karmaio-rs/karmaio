@@ -5,12 +5,11 @@ use std::os::windows::io::RawHandle;
 
 use crate::{
     driver::{
-        Submission,
         helpers::{
             attached_handle::AttachedHandle,
             cstr::{OsPath, cstr},
         },
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     fs::{File, OpenOptions},
     runtime::local::CURRENT_DRIVER,
@@ -72,11 +71,9 @@ impl Op<Open> {
     }
 }
 
-impl Operable for Open {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Open {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Open {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         let flags = libc::O_CLOEXEC
@@ -94,24 +91,18 @@ impl Submittable for Open {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Open {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Open {
+    fn submit(&mut self) -> BackendSubmission {
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return Submission::Ready(Completion {
-                    result: Err(e),
-                    flags: 0,
-                });
+                return BackendSubmission::Ready(Completion { result: Err(e) });
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return Submission::Ready(Completion {
-                    result: Err(e),
-                    flags: 0,
-                });
+                return BackendSubmission::Ready(Completion { result: Err(e) });
             }
         };
 
@@ -124,26 +115,20 @@ impl Submittable for Open {
 }
 
 #[cfg(windows)]
-impl Submittable for Open {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Open {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return Submission::Ready(Completion {
-                    result: Err(e),
-                    flags: 0,
-                });
+                return BackendSubmission::Ready(Completion { result: Err(e) });
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return Submission::Ready(Completion {
-                    result: Err(e),
-                    flags: 0,
-                });
+                return BackendSubmission::Ready(Completion { result: Err(e) });
             }
         };
 
@@ -160,15 +145,9 @@ impl Submittable for Open {
         }) {
             Ok(handle) => {
                 self.handle = Some(handle as _);
-                Submission::Ready(Completion {
-                    result: Ok(0),
-                    flags: 0,
-                })
+                BackendSubmission::Ready(Completion { result: Ok(0) })
             }
-            Err(err) => Submission::Ready(Completion {
-                result: Err(err),
-                flags: 0,
-            }),
+            Err(err) => BackendSubmission::Ready(Completion { result: Err(err) }),
         }
     }
 }
@@ -185,7 +164,7 @@ impl Drop for Open {
 }
 
 #[cfg(unix)]
-impl Completable for Open {
+impl BackendComplete for Open {
     type Result = std::io::Result<File>;
 
     fn complete(self, cqe: Completion) -> Self::Result {
@@ -199,7 +178,7 @@ impl Completable for Open {
 }
 
 #[cfg(windows)]
-impl Completable for Open {
+impl BackendComplete for Open {
     type Result = std::io::Result<File>;
 
     fn complete(mut self, cqe: Completion) -> Self::Result {

@@ -1,8 +1,7 @@
 use std::path::Path;
 
-use crate::driver::Submission;
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{Completable, Completion, Op, Operable, Submittable};
+use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Create a symbolic link on the filesystem.
@@ -54,11 +53,9 @@ impl Op<Symlink> {
     }
 }
 
-impl Operable for Symlink {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Symlink {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Symlink {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::SymlinkAt::new(
@@ -71,8 +68,8 @@ impl Submittable for Symlink {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Symlink {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Symlink {
+    fn submit(&mut self) -> BackendSubmission {
         let original = self.original.clone();
         let link = self.link.clone();
         macos_syscall_blocking!({
@@ -82,8 +79,8 @@ impl Submittable for Symlink {
 }
 
 #[cfg(windows)]
-impl Submittable for Symlink {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Symlink {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::CreateSymbolicLinkW;
 
         let flags = if self.dir {
@@ -100,7 +97,7 @@ impl Submittable for Symlink {
     }
 }
 
-impl Completable for Symlink {
+impl BackendComplete for Symlink {
     type Result = std::io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

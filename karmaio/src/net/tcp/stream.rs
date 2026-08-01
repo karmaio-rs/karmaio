@@ -44,7 +44,7 @@ impl TcpStream {
             } else {
                 socket2::SockAddr::from(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, 0, 0, 0))
             };
-            socket.inner.handle.bind(&bind_addr)?;
+            socket.handle.bind(&bind_addr)?;
         }
 
         socket.connect(socket2::SockAddr::from(addr)).await?;

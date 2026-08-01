@@ -5,9 +5,8 @@ use std::os::unix::fs::PermissionsExt;
 
 use crate::{
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     fs::Permissions,
     runtime::local::CURRENT_DRIVER,
@@ -36,11 +35,9 @@ impl Op<SetPermissions> {
     }
 }
 
-impl Operable for SetPermissions {}
-
 #[cfg(target_os = "macos")]
-impl Submittable for SetPermissions {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for SetPermissions {
+    fn submit(&mut self) -> BackendSubmission {
         let fd = self.handle.raw_fd();
         let mode = self.perm.mode() as libc::mode_t;
         macos_syscall_blocking!({ macos_syscall!(libc::fchmod(fd, mode)) })
@@ -48,8 +45,8 @@ impl Submittable for SetPermissions {
 }
 
 #[cfg(target_os = "linux")]
-impl Submittable for SetPermissions {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for SetPermissions {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::opcode;
 
         // No direct fchmod opcode in io_uring (as of current version). Perform
@@ -76,8 +73,8 @@ impl Submittable for SetPermissions {
 }
 
 #[cfg(windows)]
-impl Submittable for SetPermissions {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for SetPermissions {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::{FileBasicInfo, SetFileInformationByHandle};
 
         // Mirrors `FILE_BASIC_INFORMATION` from the Windows SDK. `windows-sys` does not
@@ -117,7 +114,7 @@ impl Submittable for SetPermissions {
 }
 
 #[cfg(target_os = "linux")]
-impl Completable for SetPermissions {
+impl BackendComplete for SetPermissions {
     type Result = io::Result<()>;
 
     fn complete(self, _cqe: Completion) -> Self::Result {
@@ -127,7 +124,7 @@ impl Completable for SetPermissions {
 }
 
 #[cfg(not(target_os = "linux"))]
-impl Completable for SetPermissions {
+impl BackendComplete for SetPermissions {
     type Result = io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

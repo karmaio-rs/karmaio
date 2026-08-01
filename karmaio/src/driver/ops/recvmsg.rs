@@ -5,9 +5,8 @@ use socket2::SockAddr;
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -89,11 +88,9 @@ impl<B: BoundedIoBufMut> Op<RecvMsg<B>> {
     }
 }
 
-impl<B: BoundedIoBufMut> Operable for RecvMsg<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
@@ -101,8 +98,8 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             macos_syscall!(libc::recvmsg(
                 self.io_handle.raw_fd(),
@@ -114,8 +111,8 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for RecvMsg<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecvFrom;
 
@@ -143,7 +140,7 @@ impl<B: BoundedIoBufMut> Submittable for RecvMsg<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> Completable for RecvMsg<B> {
+impl<B: BoundedIoBufMut> BackendComplete for RecvMsg<B> {
     type Result = BufResult<(usize, SocketAddr), Vec<B>>;
 
     // `mut self` is required on Windows (`set_length`); unused on other targets.

@@ -2,9 +2,8 @@ use std::io;
 
 use crate::{
     driver::{
-        Submission,
         helpers::io_handle::OsRawHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -21,11 +20,9 @@ impl Op<Close> {
     }
 }
 
-impl Operable for Close {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Close {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Close {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
         let fd = match self.io_handle {
             OsRawHandle::Fd(fd) => fd,
@@ -35,8 +32,8 @@ impl Submittable for Close {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Close {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Close {
+    fn submit(&mut self) -> BackendSubmission {
         // Own the raw fd for the pool job (Close owns the handle exclusively).
         let fd = match self.io_handle {
             OsRawHandle::Fd(fd) => fd,
@@ -46,8 +43,8 @@ impl Submittable for Close {
 }
 
 #[cfg(windows)]
-impl Submittable for Close {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Close {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::{Foundation::CloseHandle, Networking::WinSock::closesocket};
 
         // Capture as integer types so the blocking job is Send (RawHandle is *mut c_void).
@@ -63,7 +60,7 @@ impl Submittable for Close {
     }
 }
 
-impl Completable for Close {
+impl BackendComplete for Close {
     type Result = io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

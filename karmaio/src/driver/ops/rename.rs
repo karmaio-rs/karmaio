@@ -1,9 +1,8 @@
 use std::io;
 use std::path::Path;
 
-use crate::driver::Submission;
 use crate::driver::helpers::cstr::{OsPath, cstr};
-use crate::driver::ops::{Completable, Completion, Op, Operable, Submittable};
+use crate::driver::ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// Rename a file or directory on the filesystem.
@@ -23,11 +22,9 @@ impl Op<Rename> {
     }
 }
 
-impl Operable for Rename {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Rename {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Rename {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::RenameAt::new(
@@ -41,8 +38,8 @@ impl Submittable for Rename {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Rename {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Rename {
+    fn submit(&mut self) -> BackendSubmission {
         let from = self.from.clone();
         let to = self.to.clone();
         macos_syscall_blocking!({ macos_syscall!(libc::rename(from.as_c_str().as_ptr(), to.as_c_str().as_ptr())) })
@@ -50,8 +47,8 @@ impl Submittable for Rename {
 }
 
 #[cfg(windows)]
-impl Submittable for Rename {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Rename {
+    fn submit(&mut self) -> BackendSubmission {
         use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
 
         let from = self.from.clone();
@@ -68,7 +65,7 @@ impl Submittable for Rename {
     }
 }
 
-impl Completable for Rename {
+impl BackendComplete for Rename {
     type Result = io::Result<()>;
 
     fn complete(self, cqe: Completion) -> Self::Result {

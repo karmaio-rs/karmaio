@@ -1,5 +1,4 @@
-use crate::driver::backends::{DriverBackend, PlatformBackend};
-use crate::driver::ops::{Completable, Op, Operable};
+use crate::driver::backends::{Operation, PlatformBackend};
 use crate::runtime::blocking::BlockingPoolHandle;
 use std::ops::Deref;
 #[cfg(unix)]
@@ -19,8 +18,7 @@ pub(crate) mod backends;
 pub(super) mod helpers;
 pub(crate) mod ops;
 
-// We expose clean type aliases here so the rest of the runtime (ops, executor, etc.) can use `Driver::Submission
-pub(crate) use backends::Submission;
+use crate::driver::ops::Op;
 
 // Shared, cloneable handle to the platform driver.
 //
@@ -61,15 +59,21 @@ impl Driver {
         })
     }
 
-    pub(crate) fn submit_op<T: Operable>(&self, data: T) -> io::Result<Op<T>> {
+    pub(crate) fn submit_op<T: Operation + 'static>(&self, data: T) -> io::Result<Op<T>> {
         self.backend.borrow_mut().submit_op(data, self.into())
     }
 
-    pub(crate) fn remove_op<T: Completable + 'static>(&self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: Operation + 'static>(&self, op: &mut Op<T>) {
         self.backend.borrow_mut().remove_op(op)
     }
 
-    pub(crate) fn poll_op<T: Operable>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Result> {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
+        self.backend.borrow_mut().poll_op(op, cx)
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
         self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup)
     }
 

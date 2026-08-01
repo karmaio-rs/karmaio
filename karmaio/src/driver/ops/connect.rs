@@ -2,9 +2,8 @@ use socket2::SockAddr;
 
 use crate::{
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -32,11 +31,9 @@ impl Op<Connect> {
     }
 }
 
-impl Operable for Connect {}
-
 #[cfg(target_os = "linux")]
-impl Submittable for Connect {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Connect {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::Connect::new(
@@ -49,8 +46,8 @@ impl Submittable for Connect {
 }
 
 #[cfg(target_os = "macos")]
-impl Submittable for Connect {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Connect {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(connect self.io_handle.raw_fd(), {
             macos_syscall!(libc::connect(
                 self.io_handle.raw_fd(),
@@ -62,8 +59,8 @@ impl Submittable for Connect {
 }
 
 #[cfg(windows)]
-impl Submittable for Connect {
-    fn submit(&mut self) -> Submission {
+impl BackendSubmit for Connect {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use std::{mem, ptr, sync::OnceLock};
         use windows_sys::Win32::Networking::WinSock::{
@@ -120,7 +117,7 @@ impl Submittable for Connect {
 }
 
 #[cfg(unix)]
-impl Completable for Connect {
+impl BackendComplete for Connect {
     type Result = std::io::Result<()>;
 
     fn complete(self, completion_entry: Completion) -> Self::Result {
@@ -129,7 +126,7 @@ impl Completable for Connect {
 }
 
 #[cfg(windows)]
-impl Completable for Connect {
+impl BackendComplete for Connect {
     type Result = std::io::Result<()>;
 
     fn complete(self, completion_entry: Completion) -> Self::Result {

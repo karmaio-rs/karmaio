@@ -1,9 +1,8 @@
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -36,11 +35,9 @@ impl<B: BoundedIoBuf> Op<WriteAt<B>> {
     }
 }
 
-impl<B: BoundedIoBuf> Operable for WriteAt<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for WriteAt<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         // Get raw buffer info
@@ -54,8 +51,8 @@ impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for WriteAt<B> {
+    fn submit(&mut self) -> BackendSubmission {
         // Regular files always report ready under kqueue, and pwrite can block on
         // disk I/O — offload to the blocking pool so the runtime thread stays free.
         // Buffer pointers remain valid: the Op (and its buffers) stay alive until
@@ -69,8 +66,8 @@ impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for WriteAt<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
@@ -99,7 +96,7 @@ impl<B: BoundedIoBuf> Submittable for WriteAt<B> {
     }
 }
 
-impl<B: BoundedIoBuf> Completable for WriteAt<B> {
+impl<B: BoundedIoBuf> BackendComplete for WriteAt<B> {
     type Result = BufResult<usize, B>;
 
     fn complete(self, completion_entry: super::Completion) -> Self::Result {

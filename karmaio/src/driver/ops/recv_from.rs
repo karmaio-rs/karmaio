@@ -8,9 +8,8 @@ use socket2::SockAddr;
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -91,11 +90,9 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
     }
 }
 
-impl<B: BoundedIoBufMut> Operable for RecvFrom<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
@@ -103,8 +100,8 @@ impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
+    fn submit(&mut self) -> BackendSubmission {
         macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
             let ptr = self.buf.stable_write_ptr();
             let len = self.buf.bytes_total();
@@ -132,8 +129,8 @@ impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for RecvFrom<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecvFrom;
 
@@ -162,7 +159,7 @@ impl<B: BoundedIoBufMut> Submittable for RecvFrom<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> Completable for RecvFrom<B> {
+impl<B: BoundedIoBufMut> BackendComplete for RecvFrom<B> {
     type Result = BufResult<(usize, SocketAddr), B>;
 
     // `mut self` is required on Windows (`set_length`); unused on other targets.

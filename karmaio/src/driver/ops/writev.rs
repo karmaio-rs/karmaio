@@ -3,9 +3,8 @@ use std::io;
 use crate::{
     buf::{BoundedIoBuf, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -74,11 +73,9 @@ impl<B: BoundedIoBuf> Op<Writev<B>> {
     }
 }
 
-impl<B: BoundedIoBuf> Operable for Writev<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBuf> Submittable for Writev<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::Writev::new(
@@ -92,8 +89,8 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf> Submittable for Writev<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
+    fn submit(&mut self) -> BackendSubmission {
         // Same rationale as WriteAt: kqueue is useless for regular files and
         // pwritev may block. Keep iovecs/buffers alive in the Op while the pool runs.
         let fd = self.io_handle.raw_fd();
@@ -105,8 +102,8 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBuf> Submittable for Writev<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBuf> BackendSubmit for Writev<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFileGather;
 
@@ -132,7 +129,7 @@ impl<B: BoundedIoBuf> Submittable for Writev<B> {
     }
 }
 
-impl<B: BoundedIoBuf> Completable for Writev<B> {
+impl<B: BoundedIoBuf> BackendComplete for Writev<B> {
     type Result = BufResult<usize, Vec<B>>;
 
     fn complete(self, completion_entry: Completion) -> Self::Result {

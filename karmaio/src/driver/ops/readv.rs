@@ -3,9 +3,8 @@ use std::io;
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
     driver::{
-        Submission,
         helpers::io_handle::SharedIoHandle,
-        ops::{Completable, Completion, Op, Operable, Submittable},
+        ops::{BackendComplete, BackendSubmission, BackendSubmit, Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
 };
@@ -74,11 +73,9 @@ impl<B: BoundedIoBufMut> Op<Readv<B>> {
     }
 }
 
-impl<B: BoundedIoBufMut> Operable for Readv<B> {}
-
 #[cfg(target_os = "linux")]
-impl<B: BoundedIoBufMut> Submittable for Readv<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use io_uring::{opcode, types};
 
         opcode::Readv::new(
@@ -92,8 +89,8 @@ impl<B: BoundedIoBufMut> Submittable for Readv<B> {
 }
 
 #[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> Submittable for Readv<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
+    fn submit(&mut self) -> BackendSubmission {
         // Same rationale as ReadAt: kqueue is useless for regular files and
         // preadv may block. Keep iovecs/buffers alive in the Op while the pool runs.
         let fd = self.io_handle.raw_fd();
@@ -105,8 +102,8 @@ impl<B: BoundedIoBufMut> Submittable for Readv<B> {
 }
 
 #[cfg(windows)]
-impl<B: BoundedIoBufMut> Submittable for Readv<B> {
-    fn submit(&mut self) -> Submission {
+impl<B: BoundedIoBufMut> BackendSubmit for Readv<B> {
+    fn submit(&mut self) -> BackendSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFileScatter;
 
@@ -137,7 +134,7 @@ impl<B: BoundedIoBufMut> Submittable for Readv<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> Completable for Readv<B> {
+impl<B: BoundedIoBufMut> BackendComplete for Readv<B> {
     type Result = BufResult<usize, Vec<B>>;
 
     fn complete(self, completion_entry: Completion) -> Self::Result {

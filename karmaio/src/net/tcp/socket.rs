@@ -42,7 +42,7 @@ impl TcpSocket {
             Some(socket2::Protocol::TCP),
         )?;
 
-        let inner = Socket::from(socket);
+        let inner = Socket::from_socket(socket)?;
 
         inner.set_async_flags()?;
 
@@ -57,7 +57,7 @@ impl TcpSocket {
             Some(socket2::Protocol::TCP),
         )?;
 
-        let inner = Socket::from(socket);
+        let inner = Socket::from_socket(socket)?;
 
         inner.set_async_flags()?;
 

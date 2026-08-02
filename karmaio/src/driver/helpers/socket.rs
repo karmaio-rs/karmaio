@@ -2,10 +2,10 @@ use std::net::SocketAddr;
 use std::{io::Result, os::raw::c_int};
 
 #[cfg(unix)]
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 
 #[cfg(windows)]
-use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, OwnedSocket, RawSocket};
+use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, RawSocket};
 
 use crate::buf::{BoundedIoBuf, BoundedIoBufMut, BufResult};
 use crate::driver::helpers::attached_handle::AttachedHandle;
@@ -48,6 +48,18 @@ fn configure_async_socket(socket: &socket2::Socket) -> Result<()> {
 }
 
 impl Socket {
+    fn attach(socket: socket2::Socket) -> Result<AttachedHandle<socket2::Socket>> {
+        #[cfg(windows)]
+        {
+            AttachedHandle::new_socket(socket)
+        }
+
+        #[cfg(unix)]
+        {
+            AttachedHandle::new(socket)
+        }
+    }
+
     pub(crate) fn set_async_flags(&self) -> Result<()> {
         configure_async_socket(&*self.handle)
     }
@@ -58,9 +70,7 @@ impl Socket {
         configure_async_socket(&socket)?;
 
         Ok(Self {
-            // SAFETY: We're creating an AttachedHandle that will associate with
-            // the driver on first use.
-            handle: unsafe { AttachedHandle::new_unchecked(socket) },
+            handle: Self::attach(socket)?,
         })
     }
 
@@ -71,9 +81,7 @@ impl Socket {
         configure_async_socket(&socket)?;
 
         Ok(Self {
-            // SAFETY: We're creating an AttachedHandle that will associate with
-            // the driver on first use.
-            handle: unsafe { AttachedHandle::new_unchecked(socket) },
+            handle: Self::attach(socket)?,
         })
     }
 
@@ -109,9 +117,14 @@ impl Socket {
         socket.bind(&socket_addr)?;
 
         Ok(Self {
-            // SAFETY: We're creating an AttachedHandle that will associate with
-            // the driver on first use.
-            handle: unsafe { AttachedHandle::new_unchecked(socket) },
+            handle: Self::attach(socket)?,
+        })
+    }
+
+    /// Wrap an already-created socket and attach it to the current runtime.
+    pub(crate) fn from_socket(socket: socket2::Socket) -> Result<Self> {
+        Ok(Self {
+            handle: Self::attach(socket)?,
         })
     }
 
@@ -251,35 +264,13 @@ impl From<AttachedHandle<socket2::Socket>> for Socket {
     }
 }
 
-impl From<socket2::Socket> for Socket {
-    fn from(socket: socket2::Socket) -> Self {
-        Self {
-            // SAFETY: We're creating an AttachedHandle that will associate with
-            // the driver on first use.
-            handle: unsafe { AttachedHandle::new_unchecked(socket) },
-        }
-    }
-}
-
-#[cfg(unix)]
-impl From<OwnedFd> for Socket {
-    fn from(fd: OwnedFd) -> Self {
-        Self::from(socket2::Socket::from(fd))
-    }
-}
-
-#[cfg(windows)]
-impl From<OwnedSocket> for Socket {
-    fn from(socket: OwnedSocket) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
 #[cfg(unix)]
 impl FromRawFd for Socket {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
         // Safety: caller guarantees `fd` is an open socket; ownership transfers here.
-        Self::from(unsafe { socket2::Socket::from_raw_fd(fd) })
+        Self {
+            handle: unsafe { AttachedHandle::new_unchecked(socket2::Socket::from_raw_fd(fd)) },
+        }
     }
 }
 
@@ -287,62 +278,8 @@ impl FromRawFd for Socket {
 impl FromRawSocket for Socket {
     unsafe fn from_raw_socket(socket: RawSocket) -> Self {
         // Safety: caller guarantees `socket` is open; ownership transfers here.
-        Self::from(unsafe { socket2::Socket::from_raw_socket(socket) })
-    }
-}
-
-#[cfg(unix)]
-impl From<std::net::TcpStream> for Socket {
-    fn from(socket: std::net::TcpStream) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(windows)]
-impl From<std::net::TcpStream> for Socket {
-    fn from(socket: std::net::TcpStream) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(unix)]
-impl From<std::net::TcpListener> for Socket {
-    fn from(socket: std::net::TcpListener) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(windows)]
-impl From<std::net::TcpListener> for Socket {
-    fn from(socket: std::net::TcpListener) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(unix)]
-impl From<std::net::UdpSocket> for Socket {
-    fn from(socket: std::net::UdpSocket) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(windows)]
-impl From<std::net::UdpSocket> for Socket {
-    fn from(socket: std::net::UdpSocket) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(unix)]
-impl From<std::os::unix::net::UnixStream> for Socket {
-    fn from(socket: std::os::unix::net::UnixStream) -> Self {
-        Self::from(socket2::Socket::from(socket))
-    }
-}
-
-#[cfg(unix)]
-impl From<std::os::unix::net::UnixListener> for Socket {
-    fn from(socket: std::os::unix::net::UnixListener) -> Self {
-        Self::from(socket2::Socket::from(socket))
+        Self {
+            handle: unsafe { AttachedHandle::new_unchecked(socket2::Socket::from_raw_socket(socket)) },
+        }
     }
 }

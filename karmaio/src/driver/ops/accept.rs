@@ -26,7 +26,7 @@ use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
-        helpers::{attached_handle::AttachedHandle, io_handle::SharedIoHandle, socket::Socket},
+        helpers::{io_handle::SharedIoHandle, socket::Socket},
         ops::{Completion, Op},
     },
     runtime::local::CURRENT_DRIVER,
@@ -107,10 +107,7 @@ unsafe impl UringOperation for Accept {
         let raw_fd = completion.result? as RawFd;
         // Safety: accept returned a new open socket fd; ownership transfers here.
         let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
-        let socket = Socket {
-            // SAFETY: The socket was just accepted and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(sock) },
-        };
+        let socket = Socket::from_socket(sock)?;
 
         socket.set_async_flags()?;
 
@@ -161,9 +158,7 @@ impl KqueueOperation for Accept {
             .take()
             .ok_or_else(|| io::Error::other("accepted socket missing after successful accept"))?;
         let sock = socket2::Socket::from(accepted);
-        let socket = Socket {
-            handle: unsafe { AttachedHandle::new_unchecked(sock) },
-        };
+        let socket = Socket::from_socket(sock)?;
 
         socket.set_async_flags()?;
         let address = address.map(SocketAddr::try_from).transpose().map_err(io::Error::from)?;
@@ -175,6 +170,7 @@ impl KqueueOperation for Accept {
 #[cfg(windows)]
 unsafe impl IocpOperation for Accept {
     type Output = io::Result<(Socket, Option<SocketAddr>)>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::{AcceptEx, SOCKET};
@@ -267,10 +263,7 @@ unsafe impl IocpOperation for Accept {
         let accepted_socket = self.accepted_socket.take().expect("missing accepted socket");
         // Safety: AcceptEx produced an open socket; ownership transfers here.
         let sock = unsafe { socket2::Socket::from_raw_socket(accepted_socket) };
-        let socket = Socket {
-            // SAFETY: The socket was just accepted and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(sock) },
-        };
+        let socket = Socket::from_socket(sock)?;
 
         let _ = socket.set_async_flags();
 

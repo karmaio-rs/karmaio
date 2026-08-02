@@ -48,23 +48,23 @@ impl Child {
     /// Spawns a child from a configured standard-library `Command`.
     pub(crate) fn spawn(inner: &mut StdCommand, kill_on_drop: bool) -> io::Result<Child> {
         let child = inner.spawn()?;
-        Ok(Child::from_std(child, kill_on_drop))
+        Child::from_std(child, kill_on_drop)
     }
 
     /// Wraps an already-spawned [`std::process::Child`],
     /// taking ownership of its piped stdio handles.
-    pub(crate) fn from_std(mut child: StdChild, kill_on_drop: bool) -> Child {
-        let stdin = child.stdin.take().map(ChildStdin::from);
-        let stdout = child.stdout.take().map(ChildStdout::from);
-        let stderr = child.stderr.take().map(ChildStderr::from);
-        Child {
+    pub(crate) fn from_std(mut child: StdChild, kill_on_drop: bool) -> io::Result<Child> {
+        let stdin = child.stdin.take().map(ChildStdin::from_std).transpose()?;
+        let stdout = child.stdout.take().map(ChildStdout::from_std).transpose()?;
+        let stderr = child.stderr.take().map(ChildStderr::from_std).transpose()?;
+        Ok(Child {
             child: Some(child),
             status: None,
             stdin,
             stdout,
             stderr,
             kill_on_drop,
-        }
+        })
     }
 
     /// Returns the OS-assigned process identifier, if the child is still alive.

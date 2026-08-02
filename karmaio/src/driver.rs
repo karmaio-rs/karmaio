@@ -2,9 +2,7 @@ use crate::driver::backends::{Operation, PlatformBackend};
 use crate::runtime::blocking::BlockingPoolHandle;
 use std::ops::Deref;
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, RawFd};
-#[cfg(windows)]
-use std::os::windows::io::RawHandle;
+use std::os::fd::AsRawFd;
 use std::task::Poll;
 use std::{
     cell::RefCell,
@@ -18,6 +16,8 @@ pub(crate) mod backends;
 pub(super) mod helpers;
 pub(crate) mod ops;
 
+#[cfg(windows)]
+use crate::driver::helpers::io_handle::HandleRegistration;
 use crate::driver::ops::Op;
 
 // Shared, cloneable handle to the platform driver.
@@ -32,6 +32,8 @@ pub(crate) struct Driver {
     wakeup: Wakeup,
     /// Handle to the runtime's blocking thread pool for offloading sync work.
     blocking: BlockingPoolHandle,
+    #[cfg(windows)]
+    association: crate::driver::backends::iocp::IocpAssociation,
 }
 
 // A weak handle to the driver, plus cloneable tokens that outlive individual
@@ -41,6 +43,8 @@ pub(crate) struct Handle {
     backend: Weak<RefCell<PlatformBackend>>,
     wakeup: Wakeup,
     blocking: BlockingPoolHandle,
+    #[cfg(windows)]
+    association: crate::driver::backends::iocp::IocpAssociation,
 }
 
 impl Driver {
@@ -52,10 +56,14 @@ impl Driver {
             let b = backend.borrow();
             b.create_wakeup()
         };
+        #[cfg(windows)]
+        let association = backend.borrow().association();
         Ok(Self {
             backend,
             wakeup,
             blocking,
+            #[cfg(windows)]
+            association,
         })
     }
 
@@ -123,24 +131,6 @@ impl Driver {
     pub(crate) fn blocking_pool(&self) -> &BlockingPoolHandle {
         &self.blocking
     }
-
-    /// Associates a file or socket handle with the driver's I/O mechanism.
-    ///
-    /// On Windows (IOCP), this calls `CreateIoCompletionPort` and configures
-    /// completion notification behavior. On Linux (io-uring) / macOS and BSDs
-    /// (kqueue), this is a no-op.
-    #[cfg(windows)]
-    pub(crate) fn attach(&self, handle: RawHandle) -> io::Result<()> {
-        self.backend.borrow().attach(handle)
-    }
-
-    /// Associates a file descriptor with the driver's I/O mechanism.
-    ///
-    /// On Linux (io-uring) / macOS and BSDs (kqueue), this is a no-op.
-    #[cfg(unix)]
-    pub(crate) fn attach(&self, fd: RawFd) -> io::Result<()> {
-        self.backend.borrow().attach(fd)
-    }
 }
 
 #[cfg(unix)]
@@ -157,10 +147,14 @@ impl From<(PlatformBackend, BlockingPoolHandle)> for Driver {
         // primarily for tests or special construction and cross-thread wake
         // may not be required.
         let wakeup = Wakeup::new(|| {});
+        #[cfg(windows)]
+        let association = backend.borrow().association();
         Self {
             backend,
             wakeup,
             blocking,
+            #[cfg(windows)]
+            association,
         }
     }
 }
@@ -172,7 +166,17 @@ impl Handle {
             backend,
             wakeup: self.wakeup.clone(),
             blocking: self.blocking.clone(),
+            #[cfg(windows)]
+            association: self.association.clone(),
         })
+    }
+
+    /// Associates a resource with this runtime's IOCP without borrowing the
+    /// backend. This is also safe to call while the backend is decoding a
+    /// completion and constructing an operation-created resource.
+    #[cfg(windows)]
+    pub(crate) fn associate(&self, registration: &HandleRegistration) -> io::Result<()> {
+        self.association.associate(registration)
     }
 }
 
@@ -185,6 +189,8 @@ where
             backend: Rc::downgrade(&driver.backend),
             wakeup: driver.wakeup.clone(),
             blocking: driver.blocking.clone(),
+            #[cfg(windows)]
+            association: driver.association.clone(),
         }
     }
 }

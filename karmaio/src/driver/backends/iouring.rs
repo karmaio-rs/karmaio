@@ -374,11 +374,6 @@ impl IoUringBackend {
         crate::driver::Wakeup::new(move || wakeup.wake())
     }
 
-    pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
-        // No-op on io_uring: handles don't need explicit registration.
-        Ok(())
-    }
-
     pub(crate) fn drain_blocking_completions(&mut self) {}
 }
 

@@ -39,11 +39,7 @@ impl Default for Scheduler {
 
 impl Drop for Scheduler {
     fn drop(&mut self) {
-        // Break the remote-queue ownership cycle before fields are dropped:
-        // each queued `Task` holds a `ScheduleHandle` that clones the same
-        // `Arc` as this queue. Mark closed, drain, and drop those tasks while
-        // our `Arc` is still alive so the queue can empty cleanly.
-        self.remote.shutdown();
+        self.shutdown();
     }
 }
 
@@ -69,6 +65,15 @@ impl Scheduler {
     /// completion-based runtimes.
     pub(crate) fn tick(&self) {
         self.remote.drain_into(&self.tasks);
+    }
+
+    /// Drop queued tasks while the driver remains alive so their detached
+    /// operation state can be handed back to the backend during shutdown.
+    pub(crate) fn shutdown(&mut self) {
+        // Close the remote queue first. Dropping local tasks may drop wakers
+        // that otherwise try to enqueue more tasks during teardown.
+        self.remote.shutdown();
+        self.tasks.clear();
     }
 }
 

@@ -80,23 +80,7 @@ impl Op<Open> {
             handle: None,
         };
 
-        let op = CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))?;
-
-        // On Windows, CreateFileW is synchronous but the handle must be
-        // associated with the IOCP before any overlapped I/O is performed on it.
-        #[cfg(target_os = "windows")]
-        if let Some(open) = op.data_ref() {
-            if let Some(handle) = open.handle {
-                CURRENT_DRIVER.with(|driver| {
-                    let driver = driver.upgrade().ok_or_else(|| {
-                        std::io::Error::new(std::io::ErrorKind::BrokenPipe, "runtime is shutting down")
-                    })?;
-                    driver.attach(handle)
-                })?;
-            }
-        }
-
-        Ok(op)
+        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
     }
 }
 
@@ -123,8 +107,7 @@ unsafe impl UringOperation for Open {
         // Safety: open returned a new open file descriptor; ownership transfers here.
         let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
         Ok(File {
-            // SAFETY: The file was just opened and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(file) },
+            handle: AttachedHandle::new(file)?,
         })
     }
 }
@@ -172,8 +155,7 @@ impl KqueueOperation for Open {
         // Safety: open returned a new open file descriptor; ownership transfers here.
         let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
         Ok(File {
-            // SAFETY: The file was just opened and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(file) },
+            handle: AttachedHandle::new(file)?,
         })
     }
 }
@@ -222,8 +204,7 @@ unsafe impl IocpOperation for Open {
         // Safety: open produced an open Win32 file handle; ownership transfers here.
         let file = unsafe { std::fs::File::from_raw_handle(handle) };
         Ok(File {
-            // SAFETY: The file was just opened and will be used within the runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(file) },
+            handle: AttachedHandle::new(file)?,
         })
     }
 }

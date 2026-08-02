@@ -22,15 +22,15 @@ use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
-    driver::{helpers::io_handle::SharedIoHandle, ops::Op},
+    driver::{helpers::attached_handle::AttachedHandle, ops::Op},
     io::{AsyncRead, AsyncWrite},
 };
 
 /// Platform pipe-end type stored in child stdio handles.
 #[cfg(unix)]
-type PipeHandle = SharedIoHandle<OwnedFd>;
+type PipeHandle = AttachedHandle<OwnedFd>;
 #[cfg(windows)]
-type PipeHandle = SharedIoHandle<OwnedHandle>;
+type PipeHandle = AttachedHandle<OwnedHandle>;
 
 /// A handle to a child process's standard input (writable).
 pub struct ChildStdin {
@@ -48,7 +48,7 @@ pub struct ChildStderr {
 }
 
 #[cfg(unix)]
-fn take_pipe_fd(io: impl IntoRawFd) -> PipeHandle {
+fn take_pipe_fd(io: impl IntoRawFd) -> io::Result<PipeHandle> {
     // Safety: ChildStd* into_raw_fd transfers exclusive ownership of the pipe end.
     let fd = unsafe { OwnedFd::from_raw_fd(io.into_raw_fd()) };
     // Set non-blocking mode for async I/O readiness notifications (kqueue, epoll, etc.)
@@ -56,62 +56,62 @@ fn take_pipe_fd(io: impl IntoRawFd) -> PipeHandle {
     if let Ok(flags) = fcntl_getfl(&fd) {
         let _ = fcntl_setfl(&fd, flags | OFlags::NONBLOCK);
     }
-    SharedIoHandle::new(fd)
+    AttachedHandle::new(fd)
 }
 
 #[cfg(windows)]
-fn take_pipe_handle(io: impl IntoRawHandle) -> PipeHandle {
+fn take_pipe_handle(io: impl IntoRawHandle) -> io::Result<PipeHandle> {
     // Safety: ChildStd* into_raw_handle transfers exclusive ownership of the pipe end.
-    SharedIoHandle::new(unsafe { OwnedHandle::from_raw_handle(io.into_raw_handle() as _) })
+    AttachedHandle::new(unsafe { OwnedHandle::from_raw_handle(io.into_raw_handle() as _) })
 }
 
-impl From<std::process::ChildStdin> for ChildStdin {
-    fn from(io: std::process::ChildStdin) -> Self {
+impl ChildStdin {
+    pub(crate) fn from_std(io: std::process::ChildStdin) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            Self {
-                handle: Some(take_pipe_fd(io)),
-            }
+            Ok(Self {
+                handle: Some(take_pipe_fd(io)?),
+            })
         }
         #[cfg(windows)]
         {
-            Self {
-                handle: Some(take_pipe_handle(io)),
-            }
+            Ok(Self {
+                handle: Some(take_pipe_handle(io)?),
+            })
         }
     }
 }
 
-impl From<std::process::ChildStdout> for ChildStdout {
-    fn from(io: std::process::ChildStdout) -> Self {
+impl ChildStdout {
+    pub(crate) fn from_std(io: std::process::ChildStdout) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            Self {
-                handle: Some(take_pipe_fd(io)),
-            }
+            Ok(Self {
+                handle: Some(take_pipe_fd(io)?),
+            })
         }
         #[cfg(windows)]
         {
-            Self {
-                handle: Some(take_pipe_handle(io)),
-            }
+            Ok(Self {
+                handle: Some(take_pipe_handle(io)?),
+            })
         }
     }
 }
 
-impl From<std::process::ChildStderr> for ChildStderr {
-    fn from(io: std::process::ChildStderr) -> Self {
+impl ChildStderr {
+    pub(crate) fn from_std(io: std::process::ChildStderr) -> io::Result<Self> {
         #[cfg(unix)]
         {
-            Self {
-                handle: Some(take_pipe_fd(io)),
-            }
+            Ok(Self {
+                handle: Some(take_pipe_fd(io)?),
+            })
         }
         #[cfg(windows)]
         {
-            Self {
-                handle: Some(take_pipe_handle(io)),
-            }
+            Ok(Self {
+                handle: Some(take_pipe_handle(io)?),
+            })
         }
     }
 }

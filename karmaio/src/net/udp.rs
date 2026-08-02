@@ -172,9 +172,10 @@ impl From<Socket> for UdpSocket {
     }
 }
 
-impl From<std::net::UdpSocket> for UdpSocket {
-    fn from(socket: std::net::UdpSocket) -> Self {
-        let inner = Socket::from(socket);
-        Self { inner }
+impl UdpSocket {
+    /// Creates a UDP socket from a standard-library UDP socket.
+    pub fn from_std(socket: std::net::UdpSocket) -> std::io::Result<Self> {
+        let inner = Socket::from_socket(socket2::Socket::from(socket))?;
+        Ok(Self { inner })
     }
 }

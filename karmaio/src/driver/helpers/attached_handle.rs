@@ -22,6 +22,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, RawHandle, RawSocket};
 
 use super::io_handle::SharedIoHandle;
+#[cfg(windows)]
 use crate::runtime::local::CURRENT_DRIVER;
 
 /// A handle associated with the runtime's I/O driver.
@@ -49,8 +50,8 @@ impl<T> AttachedHandle<T> {
     ///
     /// # Safety
     ///
-    /// * The user should ensure that the source is associated with the current
-    ///   driver.
+    /// * The source must already be associated with the current runtime before
+    ///   it is used for IOCP operations.
     /// * `T` should be an owned fd/handle.
     pub unsafe fn new_unchecked(source: T) -> Self {
         Self {
@@ -66,25 +67,48 @@ impl<T: AsRawHandle> AttachedHandle<T> {
     ///
     /// On Windows, this associates the handle with the IOCP completion port.
     pub fn new(source: T) -> io::Result<Self> {
-        CURRENT_DRIVER.with(|handle| -> io::Result<()> {
-            let driver = handle.upgrade().expect("not in a runtime context");
-            driver.attach(source.as_raw_handle())
-        })?;
-        Ok(unsafe { Self::new_unchecked(source) })
+        let source = SharedIoHandle::new(source);
+        current_driver()?.associate(&source.handle_registration())?;
+        Ok(Self { source })
     }
+}
+
+#[cfg(windows)]
+impl<T: AsRawSocket> AttachedHandle<T> {
+    /// Create a socket [`AttachedHandle`] and associate it with the current
+    /// runtime's IOCP port exactly once.
+    pub fn new_socket(source: T) -> io::Result<Self> {
+        let source = SharedIoHandle::new(source);
+        current_driver()?.associate(&source.socket_registration())?;
+        Ok(Self { source })
+    }
+}
+
+#[cfg(windows)]
+fn current_driver() -> io::Result<crate::driver::Handle> {
+    if !CURRENT_DRIVER.is_set() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "handle attachment requires a running karmaio runtime",
+        ));
+    }
+
+    CURRENT_DRIVER.with(|handle| {
+        if handle.upgrade().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "karmaio runtime is no longer available for handle attachment",
+            ));
+        }
+
+        Ok(handle.clone())
+    })
 }
 
 #[cfg(unix)]
 impl<T: AsFd> AttachedHandle<T> {
-    /// Create [`AttachedHandle`]. It tries to associate the source with the
-    /// current runtime's driver, and will return [`Err`] if it fails.
-    ///
-    /// On Linux (io-uring) / macOS and BSDs (kqueue), this is a no-op.
+    /// Create [`AttachedHandle`]. Unix backends do not require registration.
     pub fn new(source: T) -> io::Result<Self> {
-        CURRENT_DRIVER.with(|handle| -> io::Result<()> {
-            let driver = handle.upgrade().expect("not in a runtime context");
-            driver.attach(source.as_fd().as_raw_fd())
-        })?;
         Ok(unsafe { Self::new_unchecked(source) })
     }
 }
@@ -112,16 +136,6 @@ impl<T> Clone for AttachedHandle<T> {
         Self {
             source: self.source.clone(),
         }
-    }
-}
-
-// --- From conversions ---
-
-impl<T> From<SharedIoHandle<T>> for AttachedHandle<T> {
-    /// Wrap a [`SharedIoHandle`] without associating. Use only when the handle
-    /// is already associated with the current driver.
-    fn from(source: SharedIoHandle<T>) -> Self {
-        Self { source }
     }
 }
 

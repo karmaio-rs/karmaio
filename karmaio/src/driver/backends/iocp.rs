@@ -1,9 +1,12 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     io::{Error, Result},
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle},
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -18,12 +21,18 @@ use windows_sys::Win32::{
     System::WindowsProgramming::FILE_SKIP_SET_EVENT_ON_HANDLE,
 };
 
-use crate::driver::ops::{OpKey, OpTable};
+use crate::driver::helpers::io_handle::HandleRegistration;
+use crate::driver::ops::{BlockingCompletionGuard, BlockingCompletionQueue, OpKey, OpTable};
 use crate::driver::{
     Handle, Wakeup,
     ops::{BlockingJob, Completion, Op},
 };
 use crate::runtime::blocking::BlockingPoolHandle;
+
+// Monotonic identity for an IOCP backend. Using an ID instead of the completion
+// port address avoids treating a resource as registered with a new runtime if
+// the allocator happens to reuse the old port's address.
+static NEXT_REGISTRAR: AtomicUsize = AtomicUsize::new(1);
 
 // Stable allocation passed to Windows for one overlapped operation.
 //
@@ -275,6 +284,34 @@ impl AsRawHandle for CompletionPort {
     }
 }
 
+/// Cloneable IOCP association capability owned by a runtime handle.
+///
+/// Keeping this separate from [`IocpBackend`] lets an operation-created
+/// resource attach while the backend is already mutably borrowed to decode a
+/// completion. The association call therefore does not re-enter the backend's
+/// `RefCell`.
+#[derive(Clone)]
+pub(crate) struct IocpAssociation {
+    port: Arc<CompletionPort>,
+    registrar: usize,
+}
+
+impl IocpAssociation {
+    pub(crate) fn associate(&self, registration: &HandleRegistration) -> Result<()> {
+        registration.associate(self.registrar, |handle| {
+            self.port.add_handle(handle, 0)?;
+
+            // Avoid event objects, but retain completion-port packets for
+            // synchronous overlapped success.
+            unsafe {
+                let _ = SetFileCompletionNotificationModes(handle as HANDLE, FILE_SKIP_SET_EVENT_ON_HANDLE as u8);
+            }
+
+            Ok(())
+        })
+    }
+}
+
 /// Shared completion-port wakeup state. The port remains owned by this Arc
 /// while remote wakeup closures are still alive, and the closed flag prevents
 /// writes after backend shutdown.
@@ -300,6 +337,7 @@ impl IocpWakeup {
 pub(crate) struct IocpBackend {
     // Completion port shared by all handles registered with this backend.
     port: Arc<CompletionPort>,
+    association: IocpAssociation,
     wakeup: Arc<IocpWakeup>,
     // Per-op state keyed by a generational operation identity.
     ops: OpTable<Slot>,
@@ -313,37 +351,40 @@ pub(crate) struct IocpBackend {
     //    b. Processing completions
     entries: Vec<OVERLAPPED_ENTRY>,
     /// Completions produced by blocking-pool workers (index, result).
-    blocking_done: Arc<Mutex<VecDeque<(OpKey, Completion)>>>,
+    blocking_done: BlockingCompletionQueue,
 }
 
 impl IocpBackend {
     pub(crate) fn new(capacity: usize) -> Result<Self> {
         let port = Arc::new(CompletionPort::new()?);
+        let registrar = NEXT_REGISTRAR.fetch_add(1, Ordering::Relaxed);
+        let association = IocpAssociation {
+            port: Arc::clone(&port),
+            registrar,
+        };
         let wakeup = Arc::new(IocpWakeup {
             port: Arc::clone(&port),
             closed: std::sync::atomic::AtomicBool::new(false),
         });
         Ok(Self {
             port,
+            association,
             wakeup,
             ops: OpTable::new(capacity)?,
             pending_by_overlapped: HashMap::with_capacity(capacity),
             entries: vec![unsafe { std::mem::zeroed() }; capacity],
-            blocking_done: Arc::new(Mutex::new(VecDeque::new())),
+            blocking_done: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         })
     }
 
     fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
         let done = Arc::clone(&self.blocking_done);
-        let wakeup = wakeup.clone();
+        let guard = BlockingCompletionGuard::new(key, done, wakeup.clone());
         pool.try_dispatch(Box::new(move || {
-            let completion = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
+            let result = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
                 result: Err(Error::other("blocking operation panicked")),
             });
-            done.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back((key, completion));
-            wakeup.wake();
+            guard.complete(result);
         }))
     }
 }
@@ -363,9 +404,6 @@ impl IocpBackend {
                 self.ops.get_mut(key).expect("inserted IOCP operation missing").state = State::Completed(completion);
             }
             IocpSubmission::Pending(mut interest) => {
-                // The handle must be attached to the IOCP before submitting.
-                // This is now enforced by the Attacher type at handle creation.
-                //
                 // The kernel owns this OVERLAPPED until completion. Stamp the
                 // slab index into the stable allocation before storing it.
                 interest.set_key(key);
@@ -591,17 +629,8 @@ impl IocpBackend {
         crate::driver::Wakeup::new(move || wakeup.wake())
     }
 
-    pub(crate) fn attach(&self, handle: RawHandle) -> Result<()> {
-        self.port.add_handle(handle, 0)?;
-
-        // Avoid event objects, but retain completion-port packets for synchronous
-        // overlapped success. The operation protocol represents such requests as
-        // `Pending` and therefore relies on the packet being delivered.
-        unsafe {
-            let _ = SetFileCompletionNotificationModes(handle as HANDLE, FILE_SKIP_SET_EVENT_ON_HANDLE as u8);
-        }
-
-        Ok(())
+    pub(crate) fn association(&self) -> IocpAssociation {
+        self.association.clone()
     }
 }
 

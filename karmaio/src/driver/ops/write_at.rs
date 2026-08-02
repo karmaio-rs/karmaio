@@ -112,6 +112,7 @@ impl<B: BoundedIoBuf> KqueueOperation for WriteAt<B> {
 #[cfg(windows)]
 unsafe impl<B: BoundedIoBuf> IocpOperation for WriteAt<B> {
     type Output = BufResult<usize, B>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFile;

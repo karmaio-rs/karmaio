@@ -124,6 +124,7 @@ impl<T: AsFd + AsRawFd + 'static, B: BoundedIoBuf + 'static> KqueueOperation for
 #[cfg(windows)]
 unsafe impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> IocpOperation for Write<T, B> {
     type Output = BufResult<usize, B>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFile;

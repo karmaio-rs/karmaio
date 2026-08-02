@@ -91,6 +91,10 @@ impl Timer {
         }
     }
 
+    pub(crate) fn clear(&mut self) {
+        self.wheel.clear();
+    }
+
     pub(crate) fn poll_timer(&mut self, cx: &mut Context<'_>, key: &TimerKey) -> Poll<()> {
         if self.is_completed(key) {
             Poll::Ready(())

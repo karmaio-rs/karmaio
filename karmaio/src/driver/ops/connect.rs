@@ -98,6 +98,7 @@ impl KqueueOperation for Connect {
 #[cfg(windows)]
 unsafe impl IocpOperation for Connect {
     type Output = std::io::Result<()>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use std::{mem, ptr, sync::OnceLock};

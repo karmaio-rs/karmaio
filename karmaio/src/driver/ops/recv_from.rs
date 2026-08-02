@@ -233,6 +233,7 @@ impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
 #[cfg(windows)]
 unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
     type Output = BufResult<(usize, SocketAddr), B>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSARecvFrom;

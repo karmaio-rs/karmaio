@@ -18,6 +18,8 @@ use std::os::windows::io::{
     AsRawHandle, AsRawSocket, FromRawHandle, FromRawSocket, IntoRawHandle, IntoRawSocket, OwnedHandle, OwnedSocket,
     RawHandle, RawSocket,
 };
+#[cfg(windows)]
+use windows_sys::Win32::Foundation::HANDLE;
 
 use crate::driver::ops::Op;
 
@@ -52,6 +54,8 @@ impl<T> SharedIoHandle<T> {
             inner: Rc::new(Inner {
                 resource: Some(resource),
                 state: RefCell::new(State::Init),
+                #[cfg(windows)]
+                association: Rc::new(RefCell::new(AssociationState::Unassociated)),
             }),
         }
     }
@@ -81,6 +85,8 @@ impl<T> SharedIoHandle<T> {
                 // Drop state without dropping the resource.
                 unsafe {
                     std::ptr::drop_in_place(&mut inner.state);
+                    #[cfg(windows)]
+                    std::ptr::drop_in_place(&mut inner.association);
                 }
                 Ok(resource)
             }
@@ -185,6 +191,15 @@ impl<T: AsRawHandle> SharedIoHandle<T> {
     pub(crate) fn raw_handle(&self) -> RawHandle {
         self.with_resource(|r| r.as_raw_handle())
     }
+
+    /// Returns the shared state used to associate this file handle with IOCP.
+    #[cfg(windows)]
+    pub(crate) fn handle_registration(&self) -> HandleRegistration {
+        HandleRegistration {
+            association: Rc::clone(&self.inner.association),
+            raw: WindowsRawHandle::Handle(self.raw_handle()),
+        }
+    }
 }
 
 #[cfg(windows)]
@@ -192,6 +207,15 @@ impl<T: AsRawSocket> SharedIoHandle<T> {
     /// Returns the underlying Win32 socket.
     pub(crate) fn raw_socket(&self) -> RawSocket {
         self.with_resource(|r| r.as_raw_socket())
+    }
+
+    /// Returns the shared state used to associate this socket with IOCP.
+    #[cfg(windows)]
+    pub(crate) fn socket_registration(&self) -> HandleRegistration {
+        HandleRegistration {
+            association: Rc::clone(&self.inner.association),
+            raw: WindowsRawHandle::Socket(self.raw_socket()),
+        }
     }
 }
 
@@ -268,6 +292,68 @@ pub(crate) enum OsRawHandle {
     Handle(RawHandle),
     #[cfg(windows)]
     Socket(RawSocket),
+}
+
+/// Shared exact-once association state for a Windows handle or socket.
+///
+/// The state is shared by all `SharedIoHandle` clones. A successful association
+/// is idempotent for the same IOCP, while an attempt to use the resource with a
+/// different runtime is rejected.
+#[cfg(windows)]
+#[derive(Clone)]
+pub(crate) struct HandleRegistration {
+    association: Rc<RefCell<AssociationState>>,
+    raw: WindowsRawHandle,
+}
+
+#[cfg(windows)]
+#[derive(Clone, Copy)]
+enum WindowsRawHandle {
+    Handle(RawHandle),
+    Socket(RawSocket),
+}
+
+#[cfg(windows)]
+enum AssociationState {
+    Unassociated,
+    Associated(usize),
+}
+
+#[cfg(windows)]
+impl HandleRegistration {
+    /// Associate the resource once, leaving it retryable if registration fails.
+    pub(crate) fn associate(
+        &self,
+        registrar: usize,
+        register: impl FnOnce(HANDLE) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut state = self.association.borrow_mut();
+        match *state {
+            AssociationState::Associated(current) if current == registrar => return Ok(()),
+            AssociationState::Associated(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "I/O handle is already associated with another karmaio driver",
+                ));
+            }
+            AssociationState::Unassociated => {}
+        }
+
+        register(self.raw.as_handle())?;
+        *state = AssociationState::Associated(registrar);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl WindowsRawHandle {
+    #[inline]
+    fn as_handle(self) -> HANDLE {
+        match self {
+            Self::Handle(handle) => handle as HANDLE,
+            Self::Socket(socket) => socket as HANDLE,
+        }
+    }
 }
 
 /// Rebuild an owned OS resource from a raw value and drop it (closes the resource).
@@ -403,6 +489,10 @@ struct Inner<T> {
     // Track the sharing state of the handle:
     // normal, being waited on to allow a close by the parent's owner, or already closed.
     state: RefCell<State>,
+
+    /// Shared across every clone so successful IOCP registration happens once.
+    #[cfg(windows)]
+    association: Rc<RefCell<AssociationState>>,
 }
 
 impl<T> Inner<T> {
@@ -442,7 +532,71 @@ enum State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    use std::cell::Cell;
+    #[cfg(unix)]
     use std::task::Poll;
+
+    #[cfg(windows)]
+    fn test_registration(raw: WindowsRawHandle) -> HandleRegistration {
+        HandleRegistration {
+            association: Rc::new(RefCell::new(AssociationState::Unassociated)),
+            raw,
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registration_associates_once_and_rejects_another_driver() {
+        let registration = test_registration(WindowsRawHandle::Handle(1usize as RawHandle));
+        let calls = Cell::new(0);
+
+        registration
+            .associate(7, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .expect("first registration");
+        registration
+            .associate(7, |_| {
+                calls.set(calls.get() + 1);
+                Ok(())
+            })
+            .expect("same driver registration is idempotent");
+
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            registration
+                .associate(8, |_| Ok(()))
+                .expect_err("another driver must be rejected")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn failed_registration_can_be_retried() {
+        let raw = usize::MAX as RawSocket;
+        let registration = test_registration(WindowsRawHandle::Socket(raw));
+        let seen = Cell::new(0usize);
+
+        assert_eq!(
+            registration
+                .associate(3, |handle| {
+                    seen.set(handle as usize);
+                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "injected"))
+                })
+                .expect_err("injected registration failure")
+                .kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(seen.get(), raw as usize);
+
+        registration
+            .associate(3, |_| Ok(()))
+            .expect("failed registration must remain retryable");
+    }
 
     #[cfg(unix)]
     fn dev_null_handle() -> SharedIoHandle<std::fs::File> {

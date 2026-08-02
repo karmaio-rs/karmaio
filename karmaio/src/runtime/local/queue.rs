@@ -49,6 +49,14 @@ impl<S: Schedule> LocalTaskQueue<S> {
         queue.pop_front()
     }
 
+    pub(crate) fn clear(&self) {
+        // SAFETY:
+        // Exclusive mutable access because this local queue is only mutated by
+        // the owning runtime thread.
+        let queue = unsafe { &mut *self.queue.get() };
+        queue.clear();
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         // SAFETY:
         // Exclusive mutable access because this local queue is only read by

@@ -196,6 +196,7 @@ impl<B: BoundedIoBuf, C: BoundedIoBuf> KqueueOperation for SendMsg<B, C> {
 #[cfg(windows)]
 unsafe impl<B: BoundedIoBuf, C: BoundedIoBuf> IocpOperation for SendMsg<B, C> {
     type Output = BufResult<(usize, Option<C>), Vec<B>>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Networking::WinSock::WSASendTo;

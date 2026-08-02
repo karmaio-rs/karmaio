@@ -192,6 +192,7 @@ impl<B: BoundedIoBufMut> KqueueOperation for Readv<B> {
 #[cfg(windows)]
 unsafe impl<B: BoundedIoBufMut> IocpOperation for Readv<B> {
     type Output = BufResult<usize, Vec<B>>;
+
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFileScatter;

@@ -5,11 +5,10 @@
 //! readiness interests, and terminal completions.
 
 use std::{
-    collections::VecDeque,
     io::{self, Error, Result},
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
@@ -22,7 +21,9 @@ use rustix::{
     io::{Errno, FdFlags, fcntl_setfd},
 };
 
-use crate::driver::ops::{BlockingJob, Completion, Op, OpKey, OpTable};
+use crate::driver::ops::{
+    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, Op, OpKey, OpTable,
+};
 use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
 
@@ -491,7 +492,7 @@ pub(crate) struct KqueueBackend {
     kqueue: Kqueue,
     ops: OpTable<Slot>,
     /// Completions produced by blocking-pool workers (key, result).
-    blocking_done: Arc<Mutex<VecDeque<(OpKey, Completion)>>>,
+    blocking_done: BlockingCompletionQueue,
 }
 
 impl KqueueBackend {
@@ -499,7 +500,7 @@ impl KqueueBackend {
         Ok(Self {
             kqueue: Kqueue::new(capacity)?,
             ops: OpTable::new(capacity)?,
-            blocking_done: Arc::new(Mutex::new(VecDeque::new())),
+            blocking_done: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         })
     }
 
@@ -509,16 +510,13 @@ impl KqueueBackend {
 
     fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
         let done = Arc::clone(&self.blocking_done);
-        let wakeup = wakeup.clone();
+        let guard = BlockingCompletionGuard::new(key, done, wakeup.clone());
         pool.try_dispatch(Box::new(move || {
-            let completion =
+            let result =
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
                     result: Err(Error::other("blocking operation panicked")),
                 });
-            done.lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .push_back((key, completion));
-            wakeup.wake();
+            guard.complete(result);
         }))
     }
 
@@ -739,10 +737,6 @@ impl KqueueBackend {
     pub(crate) fn create_wakeup(&self) -> Wakeup {
         let wakeup = self.kqueue.wakeup();
         Wakeup::new(move || wakeup.wake())
-    }
-
-    pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
-        Ok(())
     }
 }
 

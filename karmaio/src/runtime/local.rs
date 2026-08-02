@@ -54,13 +54,25 @@ scoped_thread_local!(pub(crate) static CURRENT_TIMER: Rc<RefCell<Timer>>);
 /// the kernel (or blocking pool) finishes, so this is memory-safe, but it is
 /// not the same as eager cancellation.
 pub struct Runtime {
-    pub(crate) driver: Driver,
     pub(crate) scheduler: Scheduler,
     pub(crate) timer: Rc<RefCell<Timer>>,
-    /// Owns the blocking pool. Dropped before `driver` (fields drop in reverse
-    /// declaration order) so workers finishing during shutdown can still wake
-    /// a live driver.
     _blocking: BlockingPool,
+    pub(crate) driver: Driver,
+}
+
+impl Drop for Runtime {
+    fn drop(&mut self) {
+        // Drop task futures and timer-held wakers while the driver remains
+        // alive. Detached operations can then retain their payloads in the
+        // backend until the kernel or blocking pool reaches a terminal state.
+        self.scheduler.shutdown();
+        self.timer.borrow_mut().clear();
+
+        // Once the pool is joined, no worker can enqueue another completion.
+        // Drain the final batch before backend Drop performs platform cleanup.
+        self._blocking.shutdown_and_join();
+        self.driver.drain_blocking_completions();
+    }
 }
 
 impl Runtime {
@@ -84,11 +96,10 @@ impl Runtime {
         scheduler.set_wakeup(driver.wakeup());
 
         Ok(Self {
-            driver,
             scheduler,
             timer: Rc::new(RefCell::new(Timer::new())),
-            // Declared last so it drops first (Rust drops fields in reverse order).
             _blocking: blocking,
+            driver,
         })
     }
 
@@ -393,6 +404,41 @@ mod tests {
         });
 
         drop(runtime);
+    }
+
+    #[test]
+    fn dropping_runtime_joins_running_blocking_work() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (completed_tx, completed_rx) = mpsc::channel();
+        let (drop_started_tx, drop_started_rx) = mpsc::channel();
+
+        let task = runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("report blocking work start");
+            release_rx.recv().expect("release blocking work");
+            completed_tx.send(()).expect("report blocking work completion");
+        });
+
+        runtime.block_on(async {
+            crate::time::sleep(std::time::Duration::from_millis(1)).await;
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking work should start before teardown");
+        drop(task);
+
+        let releaser = thread::spawn(move || {
+            drop_started_rx.recv().expect("wait for runtime teardown");
+            release_tx.send(()).expect("release blocking work");
+        });
+
+        drop_started_tx.send(()).expect("start runtime teardown");
+        drop(runtime);
+        releaser.join().expect("release thread should finish");
+        completed_rx
+            .try_recv()
+            .expect("runtime drop should join the running blocking job");
     }
 
     #[test]

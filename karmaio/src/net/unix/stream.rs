@@ -140,17 +140,17 @@ impl From<Socket> for UnixStream {
     }
 }
 
-impl From<std::os::unix::net::UnixStream> for UnixStream {
-    /// Creates new `UnixStream` from a previously bound `std::os::unix::net::UnixStream`.
+impl UnixStream {
+    /// Creates a Unix stream from a standard-library Unix stream.
     ///
-    /// This function is intended to be used to wrap a TCP listener from the standard library.
+    /// This function is intended to wrap a Unix stream from the standard library.
     /// The conversion assumes nothing about the underlying socket.
     /// It is left up to the user to decide what socket options are appropriate for their use case.
     ///
     /// This can be used in conjunction with socket2's `Socket` interface to configure a socket before it's handed off,
     /// such as setting options like `reuse_address` or binding to multiple addresses.
-    fn from(socket: std::os::unix::net::UnixStream) -> Self {
-        let inner = Socket::from(socket);
-        Self { inner }
+    pub fn from_std(socket: std::os::unix::net::UnixStream) -> std::io::Result<Self> {
+        let inner = Socket::from_socket(socket2::Socket::from(socket))?;
+        Ok(Self { inner })
     }
 }

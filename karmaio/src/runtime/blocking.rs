@@ -67,6 +67,11 @@ struct Shared {
     num_threads: usize,
     num_idle: usize,
     shutdown: bool,
+    shutdown_complete: bool,
+    /// Workers reserved under the mutex but whose `JoinHandle` has not yet
+    /// been recorded. Shutdown waits for this to reach zero before taking the
+    /// worker list.
+    num_starting_workers: usize,
     worker_threads: Vec<thread::JoinHandle<()>>,
     next_thread_id: usize,
 }
@@ -82,6 +87,8 @@ impl BlockingPool {
                     num_threads: 0,
                     num_idle: 0,
                     shutdown: false,
+                    shutdown_complete: false,
+                    num_starting_workers: 0,
                     worker_threads: Vec::new(),
                     next_thread_id: 0,
                 }),
@@ -109,6 +116,14 @@ impl BlockingPool {
         self.handle().dispatch(f);
     }
 
+    /// Stop accepting new work, discard queued jobs, and join every worker.
+    ///
+    /// Jobs already running are allowed to finish. The operation is idempotent;
+    /// concurrent callers wait for the first shutdown to finish joining.
+    pub(crate) fn shutdown_and_join(&self) {
+        self.inner.shutdown_and_join();
+    }
+
     /// Number of live worker threads (for tests / diagnostics).
     #[cfg(test)]
     pub(crate) fn num_threads(&self) -> usize {
@@ -118,7 +133,7 @@ impl BlockingPool {
 
 impl Drop for BlockingPool {
     fn drop(&mut self) {
-        self.inner.shutdown_and_join();
+        self.shutdown_and_join();
     }
 }
 
@@ -186,18 +201,28 @@ impl PoolInner {
             // Reserve the slot under the lock so concurrent dispatches do not
             // overshoot `thread_cap`.
             shared.num_threads += 1;
+            shared.num_starting_workers += 1;
             let other_live = shared.num_threads - 1;
             drop(shared);
 
             match self.spawn_worker(id) {
                 Ok(handle) => {
                     let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    shared.num_starting_workers = shared.num_starting_workers.saturating_sub(1);
                     shared.worker_threads.push(handle);
+                    self.condvar.notify_all();
                     Ok(())
                 }
                 Err(err) => {
                     let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                    shared.num_starting_workers = shared.num_starting_workers.saturating_sub(1);
                     shared.num_threads = shared.num_threads.saturating_sub(1);
+                    self.condvar.notify_all();
+                    if shared.shutdown {
+                        // Shutdown cleared the queue while worker startup was
+                        // in progress, so the dropped job is already canceled.
+                        return Ok(());
+                    }
                     if other_live > 0 {
                         // Existing workers will eventually drain the queue.
                         Ok(())
@@ -271,18 +296,33 @@ impl PoolInner {
     fn shutdown_and_join(&self) {
         let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
         if shared.shutdown {
+            while !shared.shutdown_complete {
+                shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner());
+            }
             return;
         }
         shared.shutdown = true;
         // Drop queued jobs so oneshot receivers observe cancellation.
         shared.queue.clear();
-        let workers = std::mem::take(&mut shared.worker_threads);
         self.condvar.notify_all();
+
+        // A dispatcher may have reserved a worker slot and released the mutex
+        // to call `thread::spawn`. Wait until it records the JoinHandle before
+        // taking the worker list.
+        while shared.num_starting_workers > 0 {
+            shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner());
+        }
+
+        let workers = std::mem::take(&mut shared.worker_threads);
         drop(shared);
 
         for handle in workers {
             let _ = handle.join();
         }
+
+        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.shutdown_complete = true;
+        self.condvar.notify_all();
     }
 }
 
@@ -399,7 +439,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -421,6 +461,47 @@ mod tests {
 
         let result = handle.try_dispatch(Box::new(|| {}));
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn shutdown_discards_queued_jobs_and_joins_running_work() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let pool = BlockingPool::new(1, Duration::from_secs(5));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+
+        pool.dispatch(move || {
+            started_tx.send(()).expect("report running job");
+            release_rx.recv().expect("release running job");
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should start the first job");
+
+        let queued_job_dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = DropFlag(Arc::clone(&queued_job_dropped));
+        pool.dispatch(move || drop(drop_flag));
+
+        let releaser = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            release_tx.send(()).expect("release worker");
+        });
+
+        pool.shutdown_and_join();
+        releaser.join().expect("release thread should finish");
+
+        assert!(queued_job_dropped.load(Ordering::Acquire));
+
+        // A second shutdown observes the completed first shutdown and does
+        // not attempt to join workers again.
+        pool.shutdown_and_join();
     }
 
     #[test]

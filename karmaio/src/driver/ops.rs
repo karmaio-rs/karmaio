@@ -5,6 +5,12 @@ use std::{
     task::{Context, Poll},
 };
 
+#[cfg(not(target_os = "linux"))]
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
+
 use crate::driver::Handle;
 use crate::driver::backends::Operation;
 use slab::Slab;
@@ -278,6 +284,122 @@ pub(crate) mod write;
 /// IOCP details.
 pub(crate) struct Completion {
     pub(crate) result: io::Result<u32>,
+}
+
+/// Completion queue shared by a readiness/completion backend and its blocking
+/// workers.
+#[cfg(not(target_os = "linux"))]
+pub(crate) type BlockingCompletionQueue = Arc<Mutex<VecDeque<(OpKey, Completion)>>>;
+
+/// Delivers exactly one terminal completion for a dispatched blocking job.
+///
+/// The blocking pool may discard a queued closure during shutdown. Keeping the
+/// notifier in a guard ensures that such a job still retires its backend slot
+/// and runs detached cleanup. The same guard also converts a worker panic into
+/// a terminal completion when the worker closure unwinds.
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct BlockingCompletionGuard {
+    notifier: Option<BlockingCompletionNotifier>,
+}
+
+#[cfg(not(target_os = "linux"))]
+struct BlockingCompletionNotifier {
+    key: OpKey,
+    done: BlockingCompletionQueue,
+    wakeup: crate::driver::Wakeup,
+}
+
+#[cfg(not(target_os = "linux"))]
+impl BlockingCompletionGuard {
+    pub(crate) fn new(key: OpKey, done: BlockingCompletionQueue, wakeup: crate::driver::Wakeup) -> Self {
+        Self {
+            notifier: Some(BlockingCompletionNotifier { key, done, wakeup }),
+        }
+    }
+
+    /// Deliver the completion produced by a normally returning job.
+    pub(crate) fn complete(mut self, completion: Completion) {
+        self.send(completion);
+    }
+
+    fn send(&mut self, completion: Completion) {
+        let Some(notifier) = self.notifier.take() else {
+            return;
+        };
+
+        notifier
+            .done
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .push_back((notifier.key, completion));
+        notifier.wakeup.wake();
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+impl Drop for BlockingCompletionGuard {
+    fn drop(&mut self) {
+        self.send(Completion {
+            result: Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "blocking operation cancelled before completion",
+            )),
+        });
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod blocking_completion_tests {
+    use super::*;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    };
+
+    #[test]
+    fn dropped_guard_delivers_one_interrupted_completion() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakeup = crate::driver::Wakeup::new({
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let key = OpTable::new(1).unwrap().insert(()).unwrap();
+
+        drop(BlockingCompletionGuard::new(key, Arc::clone(&queue), wakeup));
+
+        let completions = queue.lock().unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, key);
+        assert_eq!(
+            completions[0].1.result.as_ref().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn completed_guard_does_not_notify_again_on_drop() {
+        let queue = Arc::new(Mutex::new(VecDeque::new()));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakeup = crate::driver::Wakeup::new({
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        let key = OpTable::new(1).unwrap().insert(()).unwrap();
+        let guard = BlockingCompletionGuard::new(key, Arc::clone(&queue), wakeup);
+
+        guard.complete(Completion { result: Ok(7) });
+
+        let completions = queue.lock().unwrap();
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].1.result.as_ref().unwrap(), &7);
+        assert_eq!(wakes.load(Ordering::Relaxed), 1);
+    }
 }
 
 /// A typed one-shot operation future shared by all backends.

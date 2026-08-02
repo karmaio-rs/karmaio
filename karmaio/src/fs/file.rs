@@ -131,14 +131,12 @@ impl File {
     }
 }
 
-impl From<std::fs::File> for File {
-    fn from(file: std::fs::File) -> Self {
-        Self {
-            // SAFETY: We're creating an AttachedHandle that will associate with
-            // the driver on first use. This is safe because the File will be used
-            // within a runtime context.
-            handle: unsafe { AttachedHandle::new_unchecked(file) },
-        }
+impl File {
+    /// Creates a Karmaio file from a standard-library file.
+    pub fn from_std(file: std::fs::File) -> std::io::Result<Self> {
+        Ok(Self {
+            handle: AttachedHandle::new(file)?,
+        })
     }
 }
 

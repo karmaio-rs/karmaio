@@ -97,17 +97,17 @@ impl From<Socket> for TcpListener {
     }
 }
 
-impl From<std::net::TcpListener> for TcpListener {
-    /// Creates new `TcpListener` from a previously bound `std::net::TcpListener`.
+impl TcpListener {
+    /// Creates a listener from a previously bound standard-library listener.
     ///
-    /// This function is intended to be used to wrap a TCP listener from the standard library.
+    /// This function is intended to wrap a TCP listener from the standard library.
     /// The conversion assumes nothing about the underlying socket.
     /// It is left up to the user to decide what socket options are appropriate for their use case.
     ///
     /// This can be used in conjunction with socket2's `Socket` interface to configure a socket before it's handed off,
     /// such as setting options like `reuse_address` or binding to multiple addresses.
-    fn from(socket: std::net::TcpListener) -> Self {
-        let inner = Socket::from(socket);
-        Self { inner }
+    pub fn from_std(socket: std::net::TcpListener) -> std::io::Result<Self> {
+        let inner = Socket::from_socket(socket2::Socket::from(socket))?;
+        Ok(Self { inner })
     }
 }

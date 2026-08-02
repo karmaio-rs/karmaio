@@ -127,13 +127,13 @@ impl KqueueOperation for Open {
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return KqueueAttempt::Ready(Completion { result: Err(e) });
+                return KqueueAttempt::Ready(Completion::new(Err(e) ));
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return KqueueAttempt::Ready(Completion { result: Err(e) });
+                return KqueueAttempt::Ready(Completion::new(Err(e) ));
             }
         };
 
@@ -169,13 +169,13 @@ unsafe impl IocpOperation for Open {
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return IocpSubmission::Ready(Completion { result: Err(e) });
+                return IocpSubmission::Ready(Completion::new(Err(e) ));
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return IocpSubmission::Ready(Completion { result: Err(e) });
+                return IocpSubmission::Ready(Completion::new(Err(e) ));
             }
         };
 
@@ -192,9 +192,9 @@ unsafe impl IocpOperation for Open {
         }) {
             Ok(handle) => {
                 self.handle = Some(handle as _);
-                IocpSubmission::Ready(Completion { result: Ok(0) })
+                IocpSubmission::Ready(Completion::new(Ok(0) ))
             }
-            Err(err) => IocpSubmission::Ready(Completion { result: Err(err) }),
+            Err(err) => IocpSubmission::Ready(Completion::new(Err(err) )),
         }
     }
 

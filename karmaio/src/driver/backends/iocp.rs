@@ -22,11 +22,11 @@ use windows_sys::Win32::{
 };
 
 use crate::driver::helpers::io_handle::HandleRegistration;
-use crate::driver::ops::{BlockingCompletionGuard, BlockingCompletionQueue, OpKey, OpTable};
-use crate::driver::{
-    Handle, Wakeup,
-    ops::{BlockingJob, Completion, Op},
+use crate::driver::ops::{
+    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, DeferredAction, Op,
+    OpKey, OpTable,
 };
+use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
 
 // Monotonic identity for an IOCP backend. Using an ID instead of the completion
@@ -182,28 +182,34 @@ impl IgnoredOp for Detached {
 }
 
 impl State {
-    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>) {
+    /// Apply a terminal completion.
+    ///
+    /// Returns `(remove_slot, wake, deferred_cleanup)`. Detached cleanup and
+    /// task wakes are returned rather than run immediately so the driver can
+    /// release its backend borrow first.
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>, Option<DeferredAction>) {
         match self {
             State::Submitted => {
                 *self = State::Completed(completion);
-                (false, None)
+                (false, None, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    return (false, Some(waker));
+                    return (false, Some(waker), None);
                 }
-                (false, None)
+                (false, None, None)
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
-                    payload.cleanup(completion);
+                    let action = DeferredAction::new(move || payload.cleanup(completion));
+                    return (true, None, Some(action));
                 }
-                (true, None)
+                (true, None, None)
             }
             // Ignore duplicate terminal packets. The first completion remains
             // available for the future to consume.
-            State::Completed(..) => (false, None),
+            State::Completed(..) => (false, None, None),
         }
     }
 }
@@ -390,9 +396,7 @@ impl IocpBackend {
         let done = Arc::clone(&self.blocking_done);
         let guard = BlockingCompletionGuard::new(key, done, wakeup.clone());
         pool.try_dispatch(Box::new(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
-                result: Err(Error::other("blocking operation panicked")),
-            });
+            let result = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked")),));
             guard.complete(result);
         }))
     }
@@ -445,11 +449,11 @@ impl IocpBackend {
         Ok(Op::<T>::new(key, data, handle))
     }
 
-    pub(crate) fn remove_op<T: IocpOperation + 'static>(&mut self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: IocpOperation + 'static>(&mut self, op: &mut Op<T>) -> Option<Completion> {
         let key = op.key();
         let Some(slot) = self.ops.get_mut(key) else {
             // Op already dropped or removed.
-            return;
+            return None;
         };
 
         match &slot.state {
@@ -458,7 +462,7 @@ impl IocpBackend {
                 if slot.blocking_job.take().is_some() {
                     self.ops.remove(key);
                     let _ = op.take_data();
-                    return;
+                    return None;
                 }
 
                 // Overlapped path: ask Windows to cancel, keep payload until
@@ -468,16 +472,15 @@ impl IocpBackend {
                     IocpOperation::cancel(&mut data, interest);
                 }
                 slot.state = State::Ignored(Box::new(data));
+                None
             }
             State::Completed(_) => {
-                // Completion already dequeued but never polled — cleanup now.
-                // (Also covers Accept Drop closing pre-allocated sockets when
-                // complete moves them out; errors leave Drop as the backstop.)
+                // Completion already dequeued but never polled. Return it so the
+                // driver can run typed complete after releasing the backend borrow.
                 let slot = self.ops.remove(key).expect("completed operation disappeared");
-                if let State::Completed(completion) = slot.state {
-                    if let Some(data) = op.take_data() {
-                        drop(IocpOperation::complete(data, completion));
-                    }
+                match slot.state {
+                    State::Completed(completion) => Some(completion),
+                    _ => None,
                 }
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
@@ -490,7 +493,7 @@ impl IocpBackend {
         cx: &mut Context<'_>,
         blocking: &BlockingPoolHandle,
         wakeup: &Wakeup,
-    ) -> Poll<T::Output> {
+    ) -> Poll<Completion> {
         let key = op.key();
         let slot = self.ops.get_mut(key).expect("invalid internal state");
 
@@ -498,9 +501,8 @@ impl IocpBackend {
         if let Some(job) = slot.blocking_job.take() {
             slot.state = State::Waiting(cx.waker().clone());
             if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
-                let data = op.take_data().expect("Op data consumed");
                 self.ops.remove(key);
-                return Poll::Ready(IocpOperation::complete(data, Completion { result: Err(error) }));
+                return Poll::Ready(Completion::new(Err(error)));
             }
             return Poll::Pending;
         }
@@ -528,11 +530,7 @@ impl IocpBackend {
                 .expect("completed operation disappeared")
                 .state
             {
-                // Completion was already dispatched. Consume op data exactly
-                // once and let the op-specific code decode the CQ result.
-                State::Completed(completion) => {
-                    Poll::Ready(IocpOperation::complete(op.take_data().unwrap(), completion))
-                }
+                State::Completed(completion) => Poll::Ready(completion),
                 _ => unreachable!("invalid operation"),
             },
             // The op has been ignored/cancelled by the caller. It should not be polled again
@@ -557,31 +555,32 @@ impl IocpBackend {
         Ok(num_entries)
     }
 
-    pub(crate) fn drain_blocking_completions(&mut self) {
+    pub(crate) fn drain_blocking_completions(&mut self) -> Vec<DeferredAction> {
         // Called by the runtime after wait* (see Runtime::block_on).
         let completions: Vec<_> = {
             let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
             pending.drain(..).collect()
         };
-        let mut wakeups = Vec::new();
+        let mut deferred = Vec::new();
         for (key, completion) in completions {
             if let Some(slot) = self.ops.get_mut(key) {
-                let (should_drop, waker) = slot.state.complete(completion);
+                let (should_drop, waker, cleanup) = slot.state.complete(completion);
                 if let Some(waker) = waker {
-                    wakeups.push(waker);
+                    deferred.push(DeferredAction::new(move || waker.wake()));
+                }
+                if let Some(cleanup) = cleanup {
+                    deferred.push(cleanup);
                 }
                 if should_drop {
                     self.ops.remove(key);
                 }
             }
         }
-        for waker in wakeups {
-            waker.wake();
-        }
+        deferred
     }
 
-    pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
-        let mut wakeups = Vec::new();
+    pub(crate) fn dispatch_completions(&mut self) -> Result<Vec<DeferredAction>> {
+        let mut deferred = Vec::new();
         for entry in &self.entries {
             let overlapped = entry.lpOverlapped;
 
@@ -619,9 +618,12 @@ impl IocpBackend {
 
                 // `State::complete` handles both waking a live waiter and
                 // reporting whether an ignored op can now be dropped.
-                let (should_drop, waker) = slot.state.complete(Completion { result });
+                let (should_drop, waker, cleanup) = slot.state.complete(Completion::new(result));
                 if let Some(waker) = waker {
-                    wakeups.push(waker);
+                    deferred.push(DeferredAction::new(move || waker.wake()));
+                }
+                if let Some(cleanup) = cleanup {
+                    deferred.push(cleanup);
                 }
 
                 if should_drop {
@@ -630,14 +632,10 @@ impl IocpBackend {
             }
         }
 
-        for waker in wakeups {
-            waker.wake();
-        }
-
         // All entires have been processed, so we clear the vec for the next round
         // Note: This does not deallocate the vec, so we still have the existing capacity
         self.entries.clear();
-        Ok(())
+        Ok(deferred)
     }
 
     pub(crate) fn create_wakeup(&self) -> Wakeup {
@@ -656,9 +654,9 @@ impl IocpBackend {
     ///
     /// Runtime teardown calls this explicitly after the blocking pool has
     /// joined. `Drop` remains as a final backstop for standalone backend use.
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) -> Vec<DeferredAction> {
         if self.shutting_down {
-            return;
+            return Vec::new();
         }
         self.shutting_down = true;
         self.wakeup.close();
@@ -696,18 +694,21 @@ impl IocpBackend {
                 continue;
             }
 
-            self.drain_blocking_completions();
-            self.dispatch_completions()
-                .expect("internal error while draining IOCP completions");
+            DeferredAction::run_all(self.drain_blocking_completions());
+            DeferredAction::run_all(
+                self.dispatch_completions()
+                    .expect("internal error while draining IOCP completions"),
+            );
         }
 
         self.ops.clear();
+        Vec::new()
     }
 }
 
 impl Drop for IocpBackend {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -741,7 +742,7 @@ mod tests {
         type Output = ();
 
         fn submit(&mut self) -> IocpSubmission {
-            IocpSubmission::Ready(Completion { result: Ok(0) })
+            IocpSubmission::Ready(Completion::new(Ok(0) ))
         }
 
         fn complete(self, _completion: Completion) -> Self::Output {
@@ -760,7 +761,10 @@ mod tests {
     #[test]
     fn completion_before_first_poll_is_retained() {
         let mut state = State::Submitted;
-        assert!(!state.complete(Completion { result: Ok(7) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(7)));
+        assert!(!remove);
+        assert!(wake.is_none());
+        assert!(cleanup.is_none());
         assert!(matches!(state, State::Completed(..)));
     }
 
@@ -769,7 +773,10 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
 
-        assert!(state.complete(Completion { result: Ok(0) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
+        assert!(remove);
+        assert!(wake.is_none());
+        cleanup.expect("detached cleanup should be deferred").run();
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
@@ -779,7 +786,10 @@ mod tests {
         let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
         let mut state = State::Waiting(waker);
 
-        assert!(!state.complete(Completion { result: Ok(0) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
+        assert!(!remove);
+        assert!(cleanup.is_none());
+        wake.expect("waiting state should return its waker").wake();
         assert!(woken.load(Ordering::SeqCst));
     }
 

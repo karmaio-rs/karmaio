@@ -42,6 +42,10 @@ pub(crate) struct Accept {
     io_handle: SharedIoHandle<socket2::Socket>,
     #[cfg(target_os = "linux")]
     socketaddr: Box<(libc::sockaddr_storage, libc::socklen_t)>,
+    /// Owned accepted socket claimed as soon as the platform produces it, so
+    /// later failures in `complete` still close the descriptor via `Drop`.
+    #[cfg(target_os = "linux")]
+    accepted_socket: Option<socket2::Socket>,
     #[cfg(windows)]
     accepted_socket: Option<RawSocket>,
     #[cfg(any(
@@ -69,7 +73,7 @@ impl Op<Accept> {
 
         let data = Accept {
             io_handle: io_handle.clone(),
-            #[cfg(windows)]
+            #[cfg(any(target_os = "linux", windows))]
             accepted_socket: None,
             #[cfg(any(
                 target_os = "macos",
@@ -101,12 +105,20 @@ unsafe impl UringOperation for Accept {
         .build()
     }
 
-    fn complete(self, completion: Completion) -> Self::Output {
+    fn complete(mut self, completion: Completion) -> Self::Output {
         use std::os::fd::{FromRawFd, RawFd};
 
+        // Claim the accepted fd before any fallible post-processing so Drop
+        // still closes it if a later step fails (or the consumer has detached).
         let raw_fd = completion.result? as RawFd;
-        // Safety: accept returned a new open socket fd; ownership transfers here.
-        let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+        // Safety: a successful Accept CQE transfers ownership of one new
+        // socket descriptor to this operation.
+        self.accepted_socket = Some(unsafe { socket2::Socket::from_raw_fd(raw_fd) });
+
+        let sock = self
+            .accepted_socket
+            .take()
+            .expect("successful accept completion missing owned socket");
         let socket = Socket::from_socket(sock)?;
 
         socket.set_async_flags()?;
@@ -182,7 +194,7 @@ unsafe impl IocpOperation for Accept {
                 let socket = match create_accept_socket(listen_socket) {
                     Ok(socket) => socket,
                     Err(err) => {
-                        return IocpSubmission::Ready(Completion { result: Err(err) });
+                        return IocpSubmission::Ready(Completion::new(Err(err) ));
                     }
                 };
 
@@ -271,9 +283,12 @@ unsafe impl IocpOperation for Accept {
     }
 }
 
-#[cfg(windows)]
 impl Drop for Accept {
     fn drop(&mut self) {
+        // Linux: `accepted_socket` is a real `Socket` and closes itself on drop.
+        // Windows: close the pre-allocated AcceptEx socket if complete never took it.
+        // kqueue: `accepted` is `OwnedFd` and closes itself on drop.
+        #[cfg(windows)]
         if let Some(socket) = self.accepted_socket.take() {
             unsafe {
                 windows_sys::Win32::Networking::WinSock::closesocket(socket as _);

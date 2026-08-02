@@ -52,11 +52,12 @@ macro_rules! windows_syscall {
 /// Prefer this for path-based FS APIs (`CreateDirectoryW`, `DeleteFileW`, …).
 macro_rules! windows_syscall_blocking {
     ($block:block) => {{
+        // EINTR is retried by [`BlockingJob::run`]; the closure itself is a single attempt.
         $crate::driver::backends::iocp::IocpSubmission::Blocking($crate::driver::ops::BlockingJob::new(move || match {
             $block
         } {
-            Ok(val) => $crate::driver::ops::Completion { result: Ok(val) },
-            Err(err) => $crate::driver::ops::Completion { result: Err(err) },
+            Ok(val) => $crate::driver::ops::Completion::new(Ok(val)),
+            Err(err) => $crate::driver::ops::Completion::new(Err(err)),
         }))
     }};
 }
@@ -79,7 +80,7 @@ macro_rules! windows_syscall_submit_overlapped {
             return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
-        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion { result: Err(err) })
+        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion::new(Err(err) ))
     }};
     ($interest:expr, socket, $call:expr) => {{
         #[allow(unused_unsafe)]
@@ -93,9 +94,7 @@ macro_rules! windows_syscall_submit_overlapped {
             return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
-        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion {
-            result: Err(std::io::Error::from_raw_os_error(err)),
-        })
+        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion::new(Err(std::io::Error::from_raw_os_error(err)),))
     }};
     ($interest:expr, winsock, $call:expr) => {{
         #[allow(unused_unsafe)]
@@ -109,8 +108,6 @@ macro_rules! windows_syscall_submit_overlapped {
             return $crate::driver::backends::iocp::IocpSubmission::Pending($interest);
         }
 
-        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion {
-            result: Err(std::io::Error::from_raw_os_error(err)),
-        })
+        $crate::driver::backends::iocp::IocpSubmission::Ready($crate::driver::ops::Completion::new(Err(std::io::Error::from_raw_os_error(err)),))
     }};
 }

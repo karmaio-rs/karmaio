@@ -18,7 +18,7 @@ pub(crate) mod ops;
 
 #[cfg(windows)]
 use crate::driver::helpers::io_handle::HandleRegistration;
-use crate::driver::ops::Op;
+use crate::driver::ops::{DeferredAction, Op};
 
 // Shared, cloneable handle to the platform driver.
 //
@@ -72,12 +72,25 @@ impl Driver {
     }
 
     pub(crate) fn remove_op<T: Operation + 'static>(&self, op: &mut Op<T>) {
-        self.backend.borrow_mut().remove_op(op)
+        // Run typed complete outside the backend borrow: `complete` may drop
+        // user buffers or construct resources that re-enter the driver.
+        let completion = self.backend.borrow_mut().remove_op(op);
+        if let Some(completion) = completion
+            && let Some(data) = op.take_data()
+        {
+            drop(Operation::complete(data, completion));
+        }
     }
 
     #[cfg(target_os = "linux")]
     pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
-        self.backend.borrow_mut().poll_op(op, cx)
+        match self.backend.borrow_mut().poll_op(op, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(completion) => {
+                let data = op.take_data().expect("op data missing at completion");
+                Poll::Ready(Operation::complete(data, completion))
+            }
+        }
     }
 
     #[cfg(any(
@@ -89,7 +102,13 @@ impl Driver {
         target_os = "dragonfly"
     ))]
     pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
-        self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup)
+        match self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(completion) => {
+                let data = op.take_data().expect("op data missing at completion");
+                Poll::Ready(Operation::complete(data, completion))
+            }
+        }
     }
 
     /// Flush the backend submission queue without waiting for completions.
@@ -114,19 +133,23 @@ impl Driver {
     /// Called by the runtime after `wait*` so pool results are merged into op
     /// state (and waiters woken) before the next scheduler tick.
     pub(crate) fn drain_blocking_completions(&self) {
-        self.backend.borrow_mut().drain_blocking_completions();
+        let deferred = self.backend.borrow_mut().drain_blocking_completions();
+        DeferredAction::run_all(deferred);
     }
 
     /// Complete the platform shutdown phase after the blocking pool has
     /// stopped producing work. This keeps backend cleanup independent of Rust
     /// field-drop order and leaves `Drop` as an idempotent backstop.
     pub(crate) fn shutdown(&self) {
-        self.backend.borrow_mut().shutdown();
+        let deferred = self.backend.borrow_mut().shutdown();
+        DeferredAction::run_all(deferred);
     }
 
     /// Apply platform I/O completions (kevent / IOCP / io_uring CQEs).
     pub(crate) fn dispatch_completions(&self) -> io::Result<()> {
-        self.backend.borrow_mut().dispatch_completions()
+        let deferred = self.backend.borrow_mut().dispatch_completions()?;
+        DeferredAction::run_all(deferred);
+        Ok(())
     }
 
     /// Returns a cloneable token that can wake the driver from any thread.

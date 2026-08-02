@@ -5,6 +5,7 @@
 //! readiness interests, and terminal completions.
 
 use std::{
+    collections::HashMap,
     io::{self, Error, Result},
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     sync::{
@@ -22,7 +23,8 @@ use rustix::{
 };
 
 use crate::driver::ops::{
-    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, Op, OpKey, OpTable,
+    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, CompletionKey,
+    DeferredAction, Op, OpKey, OpTable,
 };
 use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
@@ -114,29 +116,35 @@ impl<T: KqueueOperation + 'static> IgnoredOp for T {
 }
 
 impl State {
-    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>) {
+    /// Apply a terminal completion.
+    ///
+    /// Returns `(remove_slot, wake, deferred_cleanup)`. Detached cleanup and
+    /// task wakes are returned rather than run immediately so the driver can
+    /// release its backend borrow first.
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>, Option<DeferredAction>) {
         match self {
             State::Submitted | State::Ready => {
                 *self = State::Completed(completion);
-                (false, None)
+                (false, None, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    (false, Some(waker))
+                    (false, Some(waker), None)
                 } else {
-                    (false, None)
+                    (false, None, None)
                 }
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
-                    payload.cleanup(completion);
+                    let action = DeferredAction::new(move || payload.cleanup(completion));
+                    return (true, None, Some(action));
                 }
-                (true, None)
+                (true, None, None)
             }
             // Ignore duplicate readiness/completion notifications. The first
             // terminal result remains available for the future to consume.
-            State::Completed(..) => (false, None),
+            State::Completed(..) => (false, None, None),
         }
     }
 
@@ -365,7 +373,10 @@ fn submit_changes(fd: &OwnedFd, changes: &[kqueue::Event]) -> io::Result<()> {
 }
 
 fn decode_event(event: &kqueue::Event) -> Option<KqueueEvent> {
-    let key = OpKey::from_raw(event.udata() as usize)?;
+    // Wakeup filters carry a reserved control token, not an operation key.
+    let CompletionKey::Operation(key) = CompletionKey::decode(event.udata().addr() as u64)? else {
+        return None;
+    };
     let (fd, direction, readable, writable) = match event.filter() {
         kqueue::EventFilter::Read(fd) => (
             fd,
@@ -396,7 +407,7 @@ fn socket_error_completion(fd: RawFd) -> Completion {
         Ok(Err(error)) => Err(io::Error::from(error)),
         Err(error) => Err(io::Error::from(error)),
     };
-    Completion { result }
+    Completion::new(result)
 }
 
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
@@ -418,7 +429,7 @@ impl WakeupKind {
                     user_flags: kqueue::UserDefinedFlags::new(0),
                 },
                 kqueue::EventFlags::ADD | kqueue::EventFlags::RECEIPT | kqueue::EventFlags::CLEAR,
-                usize::MAX as *mut std::ffi::c_void,
+                std::ptr::without_provenance_mut(CompletionKey::wake_raw()),
             )],
         )
     }
@@ -437,7 +448,7 @@ impl WakeupKind {
                     user_flags: kqueue::UserDefinedFlags::new(0),
                 },
                 kqueue::EventFlags::ADD | kqueue::EventFlags::RECEIPT,
-                usize::MAX as *mut std::ffi::c_void,
+                std::ptr::without_provenance_mut(CompletionKey::wake_raw()),
             )],
         )
     }
@@ -452,7 +463,7 @@ impl WakeupKind {
                     user_flags: kqueue::UserDefinedFlags::new(0),
                 },
                 kqueue::EventFlags::DELETE | kqueue::EventFlags::RECEIPT,
-                usize::MAX as *mut std::ffi::c_void,
+                std::ptr::without_provenance_mut(CompletionKey::wake_raw()),
             )],
         )
     }
@@ -480,7 +491,7 @@ impl WakeupKind {
                 self.read.as_raw_fd(),
                 Direction::Read,
                 kqueue::EventFlags::ADD | kqueue::EventFlags::ONESHOT | kqueue::EventFlags::RECEIPT,
-                usize::MAX,
+                CompletionKey::wake_raw(),
             )],
         )
     }
@@ -514,7 +525,7 @@ impl WakeupKind {
                 self.read.as_raw_fd(),
                 Direction::Read,
                 kqueue::EventFlags::DELETE | kqueue::EventFlags::RECEIPT,
-                usize::MAX,
+                CompletionKey::wake_raw(),
             )],
         )
     }
@@ -524,6 +535,8 @@ impl WakeupKind {
 pub(crate) struct KqueueBackend {
     kqueue: Kqueue,
     ops: OpTable<Slot>,
+    /// Fast lookup for the single waiter allowed per `(fd, direction)` filter.
+    interests: HashMap<(RawFd, Direction), OpKey>,
     /// Completions produced by blocking-pool workers (key, result).
     blocking_done: BlockingCompletionQueue,
     shutting_down: bool,
@@ -534,19 +547,29 @@ impl KqueueBackend {
         Ok(Self {
             kqueue: Kqueue::new(capacity)?,
             ops: OpTable::new(capacity)?,
+            interests: HashMap::with_capacity(capacity),
             blocking_done: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
             shutting_down: false,
         })
     }
 
-    fn delete_interest(&self, key: OpKey, interest: Interest) {
-        let _ = self.kqueue.delete(interest, key);
+    fn has_interest(&self, interest: Interest) -> bool {
+        self.interests.contains_key(&(interest.fd, interest.direction))
     }
 
-    fn has_interest(&self, interest: Interest) -> bool {
-        self.ops
-            .iter()
-            .any(|(_, slot)| slot.registration.map(|registration| registration.interest) == Some(interest))
+    fn install_registration(&mut self, key: OpKey, registration: Registration) {
+        self.interests
+            .insert((registration.interest.fd, registration.interest.direction), key);
+        self.ops.get_mut(key).expect("operation missing while registering").registration = Some(registration);
+    }
+
+    fn take_registration(&mut self, key: OpKey) -> Option<Registration> {
+        let registration = self.ops.get_mut(key)?.registration.take()?;
+        if self.interests.get(&(registration.interest.fd, registration.interest.direction)) == Some(&key) {
+            self.interests
+                .remove(&(registration.interest.fd, registration.interest.direction));
+        }
+        Some(registration)
     }
 
     fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
@@ -554,9 +577,7 @@ impl KqueueBackend {
         let guard = BlockingCompletionGuard::new(key, done, wakeup.clone());
         pool.try_dispatch(Box::new(move || {
             let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion {
-                    result: Err(Error::other("blocking operation panicked")),
-                });
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked")),));
             guard.complete(result);
         }))
     }
@@ -574,54 +595,66 @@ impl KqueueBackend {
         Ok(Op::<T>::new(key, data, handle))
     }
 
-    pub(crate) fn remove_op<T: KqueueOperation + 'static>(&mut self, op: &mut Op<T>) {
+    /// Detach or cancel an operation.
+    ///
+    /// When the operation already has a terminal completion that was never
+    /// polled, returns that completion so the driver can run typed `complete`
+    /// after releasing the backend borrow. The payload remains in `op`.
+    pub(crate) fn remove_op<T: KqueueOperation + 'static>(&mut self, op: &mut Op<T>) -> Option<Completion> {
         let key = op.key();
         let Some(slot) = self.ops.get_mut(key) else {
-            return;
+            return None;
         };
 
         match &slot.state {
             State::Submitted => {
                 self.ops.remove(key);
                 let _ = op.take_data();
+                None
             }
             State::Waiting(..) => {
-                if let Some(registration) = slot.registration.take() {
+                if let Some(registration) = self.take_registration(key) {
                     // EV_DELETE is synchronous. The non-blocking syscall has
                     // not produced a resource yet.
-                    self.delete_interest(key, registration.interest);
+                    let _ = self.kqueue.delete(registration.interest, key);
                     self.ops.remove(key);
                     let _ = op.take_data();
                 } else {
                     // A blocking-pool job still owns the operation payload so
                     // late completion can clean up resources it produces.
                     let data = op.take_data().expect("op data missing on detach");
-                    slot.state = State::Ignored(Box::new(data));
+                    self.ops.get_mut(key).expect("waiting op missing").state = State::Ignored(Box::new(data));
                 }
+                None
             }
             State::Completed(_) => {
                 let slot = self.ops.remove(key).expect("completed operation disappeared");
-                if let State::Completed(completion) = slot.state
-                    && let Some(data) = op.take_data()
-                {
-                    drop(KqueueOperation::complete(data, completion));
+                match slot.state {
+                    State::Completed(completion) => Some(completion),
+                    _ => None,
                 }
             }
             State::Ready => {
                 self.ops.remove(key);
                 let _ = op.take_data();
+                None
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
         }
     }
 
+    /// Drive one poll of a kqueue operation.
+    ///
+    /// On `Poll::Ready`, the terminal [`Completion`] is returned and the op
+    /// payload is left in `op` so the driver can run typed `complete` after
+    /// releasing the backend borrow.
     pub(crate) fn poll_op<T: KqueueOperation + 'static>(
         &mut self,
         op: &mut Op<T>,
         cx: &mut Context<'_>,
         blocking: &BlockingPoolHandle,
         wakeup: &Wakeup,
-    ) -> Poll<T::Output> {
+    ) -> Poll<Completion> {
         let key = op.key();
         let current_state = {
             let slot = self.ops.get_mut(key).expect("invalid internal operation state");
@@ -630,19 +663,15 @@ impl KqueueBackend {
 
         match current_state {
             State::Completed(completion) => {
-                let data = op.take_data().expect("op data consumed");
-                let result = KqueueOperation::complete(data, completion);
                 self.ops.remove(key);
-                Poll::Ready(result)
+                Poll::Ready(completion)
             }
             State::Ready | State::Submitted => {
                 let data = op.data_mut().expect("op data consumed");
                 match KqueueOperation::attempt(data) {
                     KqueueAttempt::Ready(completion) => {
-                        let data = op.take_data().expect("op data consumed");
-                        let result = KqueueOperation::complete(data, completion);
                         self.ops.remove(key);
-                        Poll::Ready(result)
+                        Poll::Ready(completion)
                     }
                     KqueueAttempt::Register { interest, on_ready } => {
                         // kqueue identifies a filter only by `(fd, filter)`.
@@ -650,39 +679,29 @@ impl KqueueBackend {
                         // the first operation's udata, so reject it before
                         // issuing EV_ADD rather than silently losing a waiter.
                         if self.has_interest(interest) {
-                            let data = op.take_data().expect("op data consumed");
-                            let result = KqueueOperation::complete(
-                                data,
-                                Completion {
-                                    result: Err(Error::new(
-                                        io::ErrorKind::AlreadyExists,
-                                        "kqueue descriptor/filter already has a waiter",
-                                    )),
-                                },
-                            );
                             self.ops.remove(key);
-                            return Poll::Ready(result);
+                            return Poll::Ready(Completion::new(Err(Error::new(
+                                io::ErrorKind::AlreadyExists,
+                                "kqueue descriptor/filter already has a waiter",
+                            ))));
                         }
 
                         if let Err(error) = self.kqueue.arm(interest, key) {
-                            let data = op.take_data().expect("op data consumed");
-                            let result = KqueueOperation::complete(data, Completion { result: Err(error) });
                             self.ops.remove(key);
-                            return Poll::Ready(result);
+                            return Poll::Ready(Completion::new(Err(error)));
                         }
 
-                        let slot = self.ops.get_mut(key).expect("operation removed while registering");
-                        slot.registration = Some(Registration { interest, on_ready });
-                        slot.state = State::Waiting(cx.waker().clone());
+                        self.install_registration(key, Registration { interest, on_ready });
+                        self.ops.get_mut(key).expect("operation removed while registering").state =
+                            State::Waiting(cx.waker().clone());
                         Poll::Pending
                     }
                     KqueueAttempt::Blocking(job) => {
                         let slot = self.ops.get_mut(key).expect("operation removed while dispatching");
                         slot.state = State::Waiting(cx.waker().clone());
                         if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
-                            let data = op.take_data().expect("op data consumed");
                             self.ops.remove(key);
-                            Poll::Ready(KqueueOperation::complete(data, Completion { result: Err(error) }))
+                            Poll::Ready(Completion::new(Err(error)))
                         } else {
                             Poll::Pending
                         }
@@ -713,32 +732,33 @@ impl KqueueBackend {
         self.kqueue.wait(Some(duration))
     }
 
-    pub(crate) fn drain_blocking_completions(&mut self) {
+    pub(crate) fn drain_blocking_completions(&mut self) -> Vec<DeferredAction> {
         let completions: Vec<_> = {
             let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
             pending.drain(..).collect()
         };
 
-        let mut wakeups = Vec::new();
+        let mut deferred = Vec::new();
         for (key, completion) in completions {
             if let Some(slot) = self.ops.get_mut(key) {
-                let (should_drop, waker) = slot.state.complete(completion);
+                let (should_drop, waker, cleanup) = slot.state.complete(completion);
                 if let Some(waker) = waker {
-                    wakeups.push(waker);
+                    deferred.push(DeferredAction::new(move || waker.wake()));
+                }
+                if let Some(cleanup) = cleanup {
+                    deferred.push(cleanup);
                 }
                 if should_drop {
                     self.ops.remove(key);
                 }
             }
         }
-        for waker in wakeups {
-            waker.wake();
-        }
+        deferred
     }
 
-    pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
+    pub(crate) fn dispatch_completions(&mut self) -> Result<Vec<DeferredAction>> {
         let events: Vec<_> = self.kqueue.events().collect();
-        let mut wakeups = Vec::new();
+        let mut deferred = Vec::new();
 
         for event in events {
             // A deleted registration can still be present in the userspace
@@ -748,7 +768,7 @@ impl KqueueBackend {
                 continue;
             }
 
-            self.mark_ready(event.key, event.fd, event.direction, &mut wakeups);
+            self.mark_ready(event.key, event.fd, event.direction, &mut deferred);
 
             // EOF on a read filter means the descriptor cannot make useful
             // progress for a pending write either. Wake the independently
@@ -756,23 +776,15 @@ impl KqueueBackend {
             // the platform's terminal result. Its own descriptor/filter is
             // validated before it is transitioned.
             if event.readable && event.writable {
-                let write_key = self.ops.iter().find_map(|(key, slot)| {
-                    (slot.registration.map(|registration| registration.interest)
-                        == Some(Interest::new(event.fd, Direction::Write)))
-                    .then_some(key)
-                });
-                if let Some(write_key) = write_key {
-                    self.mark_ready(write_key, event.fd, Direction::Write, &mut wakeups);
+                if let Some(&write_key) = self.interests.get(&(event.fd, Direction::Write)) {
+                    self.mark_ready(write_key, event.fd, Direction::Write, &mut deferred);
                 }
             }
         }
 
         // Kqueue's event storage retains capacity while the next wait fills it.
         self.kqueue.events.clear();
-        for waker in wakeups {
-            waker.wake();
-        }
-        Ok(())
+        Ok(deferred)
     }
 
     fn is_current_interest(&mut self, key: OpKey, fd: RawFd, direction: Direction) -> bool {
@@ -782,24 +794,31 @@ impl KqueueBackend {
             .is_some_and(|registration| registration.interest == Interest::new(fd, direction))
     }
 
-    fn mark_ready(&mut self, key: OpKey, fd: RawFd, direction: Direction, wakeups: &mut Vec<Waker>) {
-        let Some(slot) = self.ops.get_mut(key) else {
-            return;
-        };
-        let Some(registration) = slot.registration else {
+    fn mark_ready(&mut self, key: OpKey, fd: RawFd, direction: Direction, deferred: &mut Vec<DeferredAction>) {
+        let Some(registration) = self.take_registration(key) else {
             return;
         };
         if registration.interest != Interest::new(fd, direction) {
+            // put it back if this was a mismatched lookup
+            self.install_registration(key, registration);
             return;
         }
 
-        slot.registration = None;
-        let (should_drop, waker) = match registration.on_ready {
-            KqueueReadyAction::Retry => slot.state.ready(),
+        let Some(slot) = self.ops.get_mut(key) else {
+            return;
+        };
+        let (should_drop, waker, cleanup) = match registration.on_ready {
+            KqueueReadyAction::Retry => {
+                let (should_drop, waker) = slot.state.ready();
+                (should_drop, waker, None)
+            }
             KqueueReadyAction::CompleteSocketError => slot.state.complete(socket_error_completion(fd)),
         };
         if let Some(waker) = waker {
-            wakeups.push(waker);
+            deferred.push(DeferredAction::new(move || waker.wake()));
+        }
+        if let Some(cleanup) = cleanup {
+            deferred.push(cleanup);
         }
         if should_drop {
             self.ops.remove(key);
@@ -832,7 +851,7 @@ impl AsRawFd for KqueueBackend {
 
 impl Drop for KqueueBackend {
     fn drop(&mut self) {
-        self.shutdown();
+        DeferredAction::run_all(self.shutdown());
     }
 }
 
@@ -840,9 +859,12 @@ impl KqueueBackend {
     /// Stop accepting work, remove readiness filters, and release detached
     /// blocking-operation payloads. Runtime teardown calls this explicitly
     /// after the blocking pool has joined; `Drop` is the final backstop.
-    pub(crate) fn shutdown(&mut self) {
+    ///
+    /// Returns deferred cleanups so the driver can run them after releasing
+    /// its backend borrow.
+    pub(crate) fn shutdown(&mut self) -> Vec<DeferredAction> {
         if self.shutting_down {
-            return;
+            return Vec::new();
         }
         self.shutting_down = true;
         self.kqueue.close_wakeup();
@@ -852,22 +874,24 @@ impl KqueueBackend {
         // mutable table borrow to make the ownership boundary obvious.
         let interests: Vec<_> = self
             .ops
-            .iter_mut()
+            .iter()
             .filter_map(|(key, slot)| {
                 slot.registration
-                    .take()
+                    .as_ref()
                     .map(|registration| (key, registration.interest))
             })
             .collect();
         for (key, interest) in interests {
-            self.delete_interest(key, interest);
+            let _ = self.take_registration(key);
+            let _ = self.kqueue.delete(interest, key);
         }
+        self.interests.clear();
 
         // Runtime joins the blocking pool before this phase, so any jobs that
         // completed during pool shutdown are already in this queue. Apply
         // them before removing detached payloads, otherwise a successful
         // open/accept result could be dropped without running its typed cleanup.
-        self.drain_blocking_completions();
+        let mut deferred = self.drain_blocking_completions();
 
         let leftovers: Vec<_> = self.ops.iter().map(|(key, _)| key).collect();
         for key in leftovers {
@@ -875,14 +899,17 @@ impl KqueueBackend {
                 continue;
             };
             if let State::Ignored(payload) = slot.state {
-                payload.cleanup(Completion {
-                    result: Err(Error::other("kqueue backend shut down before operation completion")),
-                });
+                deferred.push(DeferredAction::new(move || {
+                    payload.cleanup(Completion::new(Err(Error::other(
+                        "kqueue backend shut down before operation completion",
+                    ))))
+                }));
             }
         }
 
         self.ops.clear();
         debug_assert!(self.ops.is_empty(), "kqueue driver shutdown left ops in the table");
+        deferred
     }
 }
 
@@ -901,7 +928,7 @@ mod tests {
         type Output = ();
 
         fn attempt(&mut self) -> KqueueAttempt {
-            KqueueAttempt::Ready(Completion { result: Ok(0) })
+            KqueueAttempt::Ready(Completion::new(Ok(0) ))
         }
 
         fn complete(self, _completion: Completion) -> Self::Output {
@@ -920,7 +947,10 @@ mod tests {
     #[test]
     fn completion_before_first_poll_is_retained() {
         let mut state = State::Submitted;
-        assert!(!state.complete(Completion { result: Ok(7) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(7)));
+        assert!(!remove);
+        assert!(wake.is_none());
+        assert!(cleanup.is_none());
         assert!(matches!(state, State::Completed(..)));
     }
 
@@ -929,7 +959,10 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
 
-        assert!(state.complete(Completion { result: Ok(0) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
+        assert!(remove);
+        assert!(wake.is_none());
+        cleanup.expect("detached cleanup should be deferred").run();
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
@@ -1030,16 +1063,20 @@ mod tests {
         fn duplicate_descriptor_filter_waiters_are_detected() {
             let mut backend = KqueueBackend::new(8).expect("create backend");
             let interest = Interest::new(42, Direction::Read);
-            backend
+            let key = backend
                 .ops
                 .insert(Slot {
                     state: State::Waiting(std::task::Waker::noop().clone()),
-                    registration: Some(Registration {
-                        interest,
-                        on_ready: KqueueReadyAction::Retry,
-                    }),
+                    registration: None,
                 })
                 .unwrap();
+            backend.install_registration(
+                key,
+                Registration {
+                    interest,
+                    on_ready: KqueueReadyAction::Retry,
+                },
+            );
 
             assert!(backend.has_interest(interest));
             assert!(!backend.has_interest(Interest::new(42, Direction::Write)));
@@ -1053,29 +1090,38 @@ mod tests {
                 .ops
                 .insert(Slot {
                     state: State::Waiting(std::task::Waker::noop().clone()),
-                    registration: Some(Registration {
-                        interest: Interest::new(42, Direction::Read),
-                        on_ready: KqueueReadyAction::Retry,
-                    }),
+                    registration: None,
                 })
                 .unwrap();
             let write_key = backend
                 .ops
                 .insert(Slot {
                     state: State::Waiting(std::task::Waker::noop().clone()),
-                    registration: Some(Registration {
-                        interest: Interest::new(42, Direction::Write),
-                        on_ready: KqueueReadyAction::Retry,
-                    }),
+                    registration: None,
                 })
                 .unwrap();
+            backend.install_registration(
+                read_key,
+                Registration {
+                    interest: Interest::new(42, Direction::Read),
+                    on_ready: KqueueReadyAction::Retry,
+                },
+            );
+            backend.install_registration(
+                write_key,
+                Registration {
+                    interest: Interest::new(42, Direction::Write),
+                    on_ready: KqueueReadyAction::Retry,
+                },
+            );
 
             backend.kqueue.events.push(kqueue::Event::new(
                 kqueue::EventFilter::Read(42),
                 kqueue::EventFlags::EOF,
                 read_key.raw() as *mut std::ffi::c_void,
             ));
-            backend.dispatch_completions().unwrap();
+            let deferred = backend.dispatch_completions().unwrap();
+            DeferredAction::run_all(deferred);
 
             assert!(backend.ops.get_mut(read_key).unwrap().registration.is_none());
             assert!(backend.ops.get_mut(write_key).unwrap().registration.is_none());

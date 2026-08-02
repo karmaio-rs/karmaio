@@ -19,9 +19,9 @@ macro_rules! kqueue_syscall {
 
 macro_rules! __kqueue_syscall_ready {
     ($result:expr) => {
-        return $crate::driver::backends::kqueue::KqueueAttempt::Ready($crate::driver::ops::Completion {
-            result: $result,
-        })
+        return $crate::driver::backends::kqueue::KqueueAttempt::Ready(
+            $crate::driver::ops::Completion::new($result),
+        )
     };
 }
 
@@ -52,17 +52,11 @@ macro_rules! __kqueue_syscall_register_connect {
 /// syscalls that cannot use kqueue readiness (open, mkdir, rename, fstat, …).
 macro_rules! kqueue_syscall_blocking {
     ($block:block) => {{
+        // EINTR is retried by [`BlockingJob::run`]; the closure itself is a single attempt.
         $crate::driver::backends::kqueue::KqueueAttempt::Blocking($crate::driver::ops::BlockingJob::new(move || {
-            loop {
-                match { $block } {
-                    Ok(val) => {
-                        return $crate::driver::ops::Completion { result: Ok(val) };
-                    }
-                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(err) => {
-                        return $crate::driver::ops::Completion { result: Err(err) };
-                    }
-                }
+            match { $block } {
+                Ok(val) => $crate::driver::ops::Completion::new(Ok(val)),
+                Err(err) => $crate::driver::ops::Completion::new(Err(err)),
             }
         }))
     }};

@@ -27,7 +27,12 @@ pub(crate) struct OpKey(usize);
 impl OpKey {
     const INDEX_BITS: u32 = usize::BITS / 2;
     const INDEX_MASK: usize = (1usize << Self::INDEX_BITS) - 1;
+    // Keep the highest generation unused so ordinary keys never overlap the
+    // reserved all-ones completion-control values in [`CompletionKey`].
     const GENERATION_MAX: usize = Self::INDEX_MASK - 1;
+
+    /// Largest number of operation slots representable by this token.
+    pub(crate) const MAX_CAPACITY: usize = Self::INDEX_MASK;
 
     pub(crate) const INVALID: Self = Self(0);
 
@@ -42,8 +47,13 @@ impl OpKey {
     }
 
     #[inline]
+    pub(crate) fn slot_is_representable(slot: usize) -> bool {
+        slot < Self::MAX_CAPACITY
+    }
+
+    #[inline]
     fn from_components(slot: usize, generation: usize) -> Option<Self> {
-        if slot >= Self::INDEX_MASK || !(1..=Self::GENERATION_MAX).contains(&generation) {
+        if !Self::slot_is_representable(slot) || !(1..=Self::GENERATION_MAX).contains(&generation) {
             return None;
         }
 
@@ -72,6 +82,53 @@ impl OpKey {
     }
 }
 
+/// Non-operation completion identifiers used by platform backends.
+///
+/// These are decoded in one place so an operation table never receives a wake
+/// or cancellation acknowledgement as if it were an op key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Control packets are backend-specific.
+pub(crate) enum CompletionKey {
+    Operation(OpKey),
+    Wake,
+    Cancel,
+    WakeCancel,
+}
+
+#[allow(dead_code)] // Control packets are backend-specific.
+impl CompletionKey {
+    const WAKE_RAW: usize = usize::MAX;
+    const CANCEL_RAW: usize = usize::MAX - 1;
+    const WAKE_CANCEL_RAW: usize = usize::MAX - 2;
+
+    #[inline]
+    pub(crate) const fn wake_raw() -> usize {
+        Self::WAKE_RAW
+    }
+
+    #[inline]
+    pub(crate) const fn cancel_raw() -> usize {
+        Self::CANCEL_RAW
+    }
+
+    #[inline]
+    pub(crate) const fn wake_cancel_raw() -> usize {
+        Self::WAKE_CANCEL_RAW
+    }
+
+    #[inline]
+    pub(crate) fn decode(raw: u64) -> Option<Self> {
+        let raw = usize::try_from(raw).ok()?;
+
+        match raw {
+            Self::WAKE_RAW => Some(Self::Wake),
+            Self::CANCEL_RAW => Some(Self::Cancel),
+            Self::WAKE_CANCEL_RAW => Some(Self::WakeCancel),
+            _ => OpKey::from_raw(raw).map(Self::Operation),
+        }
+    }
+}
+
 /// A slab with generation tracking for backend operation identities.
 pub(crate) struct OpTable<T> {
     entries: Slab<Option<T>>,
@@ -82,19 +139,35 @@ pub(crate) struct OpTable<T> {
 
 impl<T> OpTable<T> {
     pub(crate) fn new(capacity: usize) -> io::Result<Self> {
-        if capacity == 0 || capacity >= OpKey::INDEX_MASK {
+        if capacity == 0 || capacity > OpKey::MAX_CAPACITY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "driver operation capacity is outside the representable key range",
             ));
         }
 
+        Self::new_with_generation_limit(capacity, OpKey::GENERATION_MAX)
+    }
+
+    fn new_with_generation_limit(capacity: usize, generation_limit: usize) -> io::Result<Self> {
+        if !(1..=OpKey::GENERATION_MAX).contains(&generation_limit) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "driver operation generation limit is outside the representable range",
+            ));
+        }
+
         Ok(Self {
             entries: Slab::with_capacity(capacity),
             generations: Vec::with_capacity(capacity),
-            generation_limit: OpKey::GENERATION_MAX,
+            generation_limit,
             active_len: 0,
         })
+    }
+
+    #[cfg(test)]
+    fn new_for_test(capacity: usize, generation_limit: usize) -> io::Result<Self> {
+        Self::new_with_generation_limit(capacity, generation_limit)
     }
 
     pub(crate) fn insert(&mut self, value: T) -> io::Result<OpKey> {
@@ -103,7 +176,7 @@ impl<T> OpTable<T> {
 
     pub(crate) fn insert_with_key(&mut self, create: impl FnOnce(OpKey) -> T) -> io::Result<OpKey> {
         let slot = self.entries.vacant_key();
-        if slot >= OpKey::INDEX_MASK {
+        if !OpKey::slot_is_representable(slot) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "driver operation table exhausted its key range",
@@ -201,7 +274,7 @@ impl<T> OpTable<T> {
 
 #[cfg(test)]
 mod key_tests {
-    use super::OpTable;
+    use super::{CompletionKey, OpKey, OpTable};
 
     #[test]
     fn stale_keys_are_rejected_after_slot_reuse() {
@@ -212,7 +285,107 @@ mod key_tests {
         let second = table.insert("second").unwrap();
         assert_ne!(first, second);
         assert_eq!(table.get(first), None);
+        assert_eq!(table.get_mut(first), None);
+        assert_eq!(table.remove(first), None);
         assert_eq!(table.get(second), Some(&"second"));
+    }
+
+    #[test]
+    fn insertion_factory_receives_the_stored_key() {
+        let mut table = OpTable::new(1).unwrap();
+        let key = table.insert_with_key(|key| key).unwrap();
+        assert_eq!(table.get(key), Some(&key));
+    }
+
+    #[test]
+    fn completion_key_reserves_control_values() {
+        assert_eq!(
+            CompletionKey::decode(CompletionKey::wake_raw() as u64),
+            Some(CompletionKey::Wake)
+        );
+        assert_eq!(
+            CompletionKey::decode(CompletionKey::cancel_raw() as u64),
+            Some(CompletionKey::Cancel)
+        );
+        assert_eq!(
+            CompletionKey::decode(CompletionKey::wake_cancel_raw() as u64),
+            Some(CompletionKey::WakeCancel)
+        );
+
+        // Reserved control values must never decode as ordinary operation keys.
+        assert_eq!(OpKey::from_raw(CompletionKey::wake_raw()), None);
+        assert_eq!(OpKey::from_raw(CompletionKey::cancel_raw()), None);
+        assert_eq!(OpKey::from_raw(CompletionKey::wake_cancel_raw()), None);
+
+        let key = OpTable::new(1).unwrap().insert(()).unwrap();
+        assert_eq!(
+            CompletionKey::decode(key.as_u64()),
+            Some(CompletionKey::Operation(key))
+        );
+        assert_eq!(CompletionKey::decode(0), None);
+        assert_eq!(CompletionKey::decode(OpKey::INVALID.as_u64()), None);
+    }
+
+    #[test]
+    fn capacity_must_fit_token_encoding() {
+        assert!(OpTable::<()>::new(0).is_err());
+        assert!(OpTable::<()>::new(OpKey::MAX_CAPACITY.saturating_add(1)).is_err());
+        assert!(OpKey::slot_is_representable(OpKey::MAX_CAPACITY - 1));
+        assert!(!OpKey::slot_is_representable(OpKey::MAX_CAPACITY));
+    }
+
+    #[test]
+    fn invalid_key_lookup_is_safe() {
+        let mut table = OpTable::new(1).unwrap();
+        let key = table.insert("active").unwrap();
+
+        assert_eq!(table.get(OpKey::INVALID), None);
+        assert_eq!(table.get_mut(OpKey::INVALID), None);
+        assert_eq!(table.remove(OpKey::INVALID), None);
+        assert_eq!(table.get(key), Some(&"active"));
+    }
+
+    #[test]
+    fn exhausted_generation_retires_slot_instead_of_wrapping() {
+        let mut table = OpTable::new_for_test(1, 2).unwrap();
+        let first = table.insert("first").unwrap();
+        assert_eq!(table.remove(first), Some("first"));
+
+        let second = table.insert("second").unwrap();
+        assert_eq!(
+            first.components().map(|(slot, _)| slot),
+            second.components().map(|(slot, _)| slot)
+        );
+        assert_eq!(table.remove(second), Some("second"));
+
+        let third = table.insert("third").unwrap();
+        assert_ne!(
+            first.components().map(|(slot, _)| slot),
+            third.components().map(|(slot, _)| slot)
+        );
+        assert_eq!(table.get(first), None);
+        assert_eq!(table.get(second), None);
+    }
+
+    #[test]
+    fn clear_invalidates_active_keys_and_retires_exhausted_slots() {
+        let mut table = OpTable::new_for_test(1, 2).unwrap();
+        let first = table.insert("first").unwrap();
+
+        table.clear();
+        assert!(table.is_empty());
+        assert_eq!(table.get(first), None);
+
+        let second = table.insert("second").unwrap();
+        assert_ne!(first, second);
+        table.clear();
+
+        let third = table.insert("third").unwrap();
+        assert_ne!(
+            second.components().map(|(slot, _)| slot),
+            third.components().map(|(slot, _)| slot)
+        );
+        assert_eq!(table.get(second), None);
     }
 }
 
@@ -278,12 +451,69 @@ pub(crate) mod write;
 
 /// Terminal result shared by the backend protocols.
 ///
-/// The result intentionally contains only the operation result. Backend
-/// completion metadata stays in the backend that owns it, which keeps the
-/// common operation contract independent of io_uring CQE flags and kqueue or
-/// IOCP details.
+/// `result` is the portable syscall/completion outcome. `flags` preserves
+/// backend completion metadata (for example io_uring CQE flags) for future
+/// multishot and metadata-aware ops without forcing every caller to know the
+/// source backend.
 pub(crate) struct Completion {
     pub(crate) result: io::Result<u32>,
+    #[allow(dead_code)] // Reserved for multishot / CQE metadata consumers.
+    pub(crate) flags: u32,
+}
+
+impl Completion {
+    /// Construct a terminal completion with no backend metadata flags.
+    #[inline]
+    pub(crate) fn new(result: io::Result<u32>) -> Self {
+        Self { result, flags: 0 }
+    }
+
+    /// Construct a terminal completion that carries backend metadata flags.
+    #[inline]
+    #[allow(dead_code)] // Used by backends that surface CQE/completion flags.
+    pub(crate) fn with_flags(result: io::Result<u32>, flags: u32) -> Self {
+        Self { result, flags }
+    }
+
+    /// Validate a byte-count completion against the submitted buffer capacity.
+    ///
+    /// Returns an error when the platform reports more bytes than the buffer
+    /// could hold, which would otherwise make `set_init` unsound.
+    pub(crate) fn bytes_transferred(self, capacity: usize) -> io::Result<usize> {
+        let n = self.result? as usize;
+        if n > capacity {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("operation returned more than the submitted buffer capacity ({capacity} bytes)"),
+            ))
+        } else {
+            Ok(n)
+        }
+    }
+}
+
+/// Work deferred until the driver releases its `RefCell` borrow of the backend.
+///
+/// Completing an operation or waking a task may run arbitrary user code, so it
+/// must not happen while the backend is mutably borrowed through the driver.
+pub(crate) struct DeferredAction(Option<Box<dyn FnOnce() + 'static>>);
+
+impl DeferredAction {
+    pub(crate) fn new(action: impl FnOnce() + 'static) -> Self {
+        Self(Some(Box::new(action)))
+    }
+
+    pub(crate) fn run(mut self) {
+        if let Some(action) = self.0.take() {
+            action();
+        }
+    }
+
+    pub(crate) fn run_all(actions: Vec<Self>) {
+        for action in actions {
+            action.run();
+        }
+    }
 }
 
 /// Completion queue shared by a readiness/completion backend and its blocking
@@ -339,12 +569,9 @@ impl BlockingCompletionGuard {
 #[cfg(not(target_os = "linux"))]
 impl Drop for BlockingCompletionGuard {
     fn drop(&mut self) {
-        self.send(Completion {
-            result: Err(io::Error::new(
-                io::ErrorKind::Interrupted,
-                "blocking operation cancelled before completion",
-            )),
-        });
+        self.send(Completion::new(Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "blocking operation cancelled before completion"))));
     }
 }
 
@@ -393,7 +620,7 @@ mod blocking_completion_tests {
         let key = OpTable::new(1).unwrap().insert(()).unwrap();
         let guard = BlockingCompletionGuard::new(key, Arc::clone(&queue), wakeup);
 
-        guard.complete(Completion { result: Ok(7) });
+        guard.complete(Completion::new(Ok(7) ));
 
         let completions = queue.lock().unwrap();
         assert_eq!(completions.len(), 1);
@@ -467,18 +694,53 @@ impl<T: Operation + 'static> Drop for Op<T> {
 /// Captures only `Send` state (paths, raw fds, flags) so the runtime thread can
 /// keep non-`Send` op data (e.g. `SharedIoHandle`) while the syscall runs off-thread.
 /// Used on kqueue Unix targets / Windows; io_uring handles equivalent work in-kernel.
+///
+/// [`BlockingJob::run`] retries `io::ErrorKind::Interrupted` so individual
+/// callers never have to re-enter the readiness state machine for EINTR.
 #[allow(dead_code)]
 pub(crate) struct BlockingJob {
-    work: Box<dyn FnOnce() -> Completion + Send + 'static>,
+    work: Box<dyn FnMut() -> Completion + Send + 'static>,
 }
 
 #[allow(dead_code)] // Used on macOS / Windows; unused on pure io_uring Linux builds.
 impl BlockingJob {
-    pub(crate) fn new(work: impl FnOnce() -> Completion + Send + 'static) -> Self {
+    pub(crate) fn new(work: impl FnMut() -> Completion + Send + 'static) -> Self {
         Self { work: Box::new(work) }
     }
 
-    pub(crate) fn run(self) -> Completion {
-        (self.work)()
+    /// Run the job, retrying only `Interrupted` results.
+    pub(crate) fn run(mut self) -> Completion {
+        loop {
+            let completion = (self.work)();
+            if !matches!(&completion.result, Err(error) if error.kind() == io::ErrorKind::Interrupted) {
+                return completion;
+            }
+        }
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod blocking_job_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn run_retries_interrupted_results() {
+        use std::sync::Arc;
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_job = Arc::clone(&attempts);
+        let job = BlockingJob::new(move || {
+            let n = attempts_job.fetch_add(1, Ordering::Relaxed);
+            if n < 2 {
+                Completion::new(Err(io::Error::new(io::ErrorKind::Interrupted, "eintr")))
+            } else {
+                Completion::new(Ok(9))
+            }
+        });
+
+        let completion = job.run();
+        assert_eq!(completion.result.unwrap(), 9);
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
     }
 }

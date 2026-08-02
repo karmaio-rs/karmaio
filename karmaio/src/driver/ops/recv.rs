@@ -65,20 +65,7 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for Recv<B> {
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut buf = self.buf;
-
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            // Safety: the kernel wrote `n` bytes to the buffer.
-            unsafe {
-                buf.set_init(n);
-            }
-        }
-
-        (res, buf)
+        self.finish(completion_entry)
     }
 }
 
@@ -108,20 +95,7 @@ impl<B: BoundedIoBufMut> KqueueOperation for Recv<B> {
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut buf = self.buf;
-
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            // Safety: the kernel wrote `n` bytes to the buffer.
-            unsafe {
-                buf.set_init(n);
-            }
-        }
-
-        (res, buf)
+        self.finish(completion_entry)
     }
 }
 
@@ -153,19 +127,22 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for Recv<B> {
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut buf = self.buf;
+        self.finish(completion_entry)
+    }
+}
 
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            // Safety: the kernel wrote `n` bytes to the buffer.
-            unsafe {
-                buf.set_init(n);
+impl<B: BoundedIoBufMut> Recv<B> {
+    fn finish(mut self, completion: super::Completion) -> BufResult<usize, B> {
+        let capacity = self.buf.bytes_total();
+        match completion.bytes_transferred(capacity) {
+            Ok(n) => {
+                // Safety: the platform wrote at most `capacity` bytes into the buffer.
+                unsafe {
+                    self.buf.set_init(n);
+                }
+                (Ok(n), self.buf)
             }
+            Err(err) => (Err(err), self.buf),
         }
-
-        (res, buf)
     }
 }

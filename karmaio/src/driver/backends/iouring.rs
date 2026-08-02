@@ -15,8 +15,7 @@ use io_uring::{IoUring, squeue};
 use rustix::event::{EventfdFlags, eventfd};
 use rustix::io::write;
 
-use crate::driver::ops::{Completion, Op};
-use crate::driver::ops::{OpKey, OpTable};
+use crate::driver::ops::{Completion, CompletionKey, DeferredAction, Op, OpKey, OpTable};
 use crate::driver::{Handle, Wakeup};
 
 pub(crate) type Submission = squeue::Entry;
@@ -67,28 +66,34 @@ impl IgnoredOp for Detached {
 }
 
 impl State {
-    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>) {
+    /// Apply a terminal completion.
+    ///
+    /// Returns `(remove_slot, wake, deferred_cleanup)`. Detached cleanup and
+    /// task wakes are returned rather than run immediately so the driver can
+    /// release its backend borrow first.
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>, Option<DeferredAction>) {
         match self {
             State::Submitted => {
                 *self = State::Completed(completion);
-                (false, None)
+                (false, None, None)
             }
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    return (false, Some(waker));
+                    return (false, Some(waker), None);
                 }
-                (false, None)
+                (false, None, None)
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
-                    payload.cleanup(completion);
+                    let action = DeferredAction::new(move || payload.cleanup(completion));
+                    return (true, None, Some(action));
                 }
-                (true, None)
+                (true, None, None)
             }
             // A duplicate CQE is stale input. Keep the first terminal result
             // and let the future consume it normally.
-            State::Completed(..) => (false, None),
+            State::Completed(..) => (false, None, None),
         }
     }
 }
@@ -162,15 +167,11 @@ impl IoUringBackend {
     fn arm_wakeup_read(&mut self) -> Result<()> {
         use io_uring::opcode;
 
-        // Use a special user_data that we recognize in dispatch.
-        // u64::MAX-1 to avoid conflict with cancel (u64::MAX).
-        const WAKE_USERDATA: u64 = u64::MAX - 1;
-
         let buf_ptr = self.wakeup_buf.as_mut().get_mut().as_mut_ptr();
 
         let read_e = opcode::Read::new(io_uring::types::Fd(self.eventfd.fd.as_raw_fd()), buf_ptr, 8)
             .build()
-            .user_data(WAKE_USERDATA);
+            .user_data(CompletionKey::wake_raw() as u64);
 
         // Best effort push; if full we submit first.
         while unsafe { self.uring.submission().push(&read_e).is_err() } {
@@ -209,14 +210,19 @@ impl IoUringBackend {
         Ok(Op::<T>::new(key, data, handle))
     }
 
-    pub(crate) fn remove_op<T: UringOperation + 'static>(&mut self, op: &mut Op<T>) {
+    /// Detach or cancel an operation.
+    ///
+    /// When the operation already has a terminal completion that was never
+    /// polled, returns that completion so the driver can run typed `complete`
+    /// after releasing the backend borrow. The payload remains in `op`.
+    pub(crate) fn remove_op<T: UringOperation + 'static>(&mut self, op: &mut Op<T>) -> Option<Completion> {
         let key = op.key();
         // Get the op state from the driver
         let state = match self.ops.get_mut(key) {
             Some(val) => val,
             None => {
                 // Op already dropped or removed
-                return;
+                return None;
             }
         };
 
@@ -227,25 +233,29 @@ impl IoUringBackend {
             State::Submitted | State::Waiting(..) => {
                 let data = op.take_data().expect("op data missing on detach");
                 *state = State::Ignored(Box::new(data));
+                None
             }
             State::Completed(_) => {
                 // Completion already arrived but the future never polled it.
-                // Run complete so orphan accept/open FDs are closed.
-                if let Some(State::Completed(completion)) = self.ops.remove(key) {
-                    if let Some(data) = op.take_data() {
-                        drop(UringOperation::complete(data, completion));
-                    }
+                match self.ops.remove(key) {
+                    Some(State::Completed(completion)) => Some(completion),
+                    _ => None,
                 }
             }
             State::Ignored(..) => unreachable!("invalid operation state"),
         }
     }
 
+    /// Drive one poll of an io_uring operation.
+    ///
+    /// On `Poll::Ready`, the terminal [`Completion`] is returned and the op
+    /// payload is left in `op` so the driver can run typed `complete` after
+    /// releasing the backend borrow.
     pub(crate) fn poll_op<T: UringOperation + 'static>(
         &mut self,
         op: &mut Op<T>,
         cx: &mut Context<'_>,
-    ) -> Poll<T::Output> {
+    ) -> Poll<Completion> {
         // Get the op state from the driver
         let state = self.ops.get_mut(op.key()).expect("invalid internal state");
 
@@ -265,9 +275,7 @@ impl IoUringBackend {
             }
             // The kernel has completed the op. Resolve the future with the result
             State::Completed(_) => match self.ops.remove(op.key()) {
-                Some(State::Completed(completion)) => {
-                    Poll::Ready(UringOperation::complete(op.take_data().unwrap(), completion))
-                }
+                Some(State::Completed(completion)) => Poll::Ready(completion),
                 _ => unreachable!("invalid operation"),
             },
             // The op has been ignored/cancelled by the caller. It should not be polled again
@@ -285,7 +293,10 @@ impl IoUringBackend {
                     return Ok(());
                 }
                 Err(ref e) if e.raw_os_error() == Some(libc::EBUSY) => {
-                    self.dispatch_completions()?;
+                    // Run deferred work immediately: submit can re-enter while
+                    // the backend is already exclusively owned (no outer Driver
+                    // RefCell borrow on this path).
+                    DeferredAction::run_all(self.dispatch_completions()?);
                 }
                 Err(e) if e.raw_os_error() != Some(libc::EINTR) => {
                     return Err(e);
@@ -317,7 +328,7 @@ impl IoUringBackend {
         }
     }
 
-    pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
+    pub(crate) fn dispatch_completions(&mut self) -> Result<Vec<DeferredAction>> {
         let mut completion_queue = self.uring.completion();
 
         completion_queue.sync();
@@ -325,28 +336,30 @@ impl IoUringBackend {
         // Re-arm the eventfd read after the completion queue borrow is released,
         // since `arm_wakeup_read` needs a mutable borrow of `self`.
         let mut rearm_wakeup = false;
-        let mut wakeups = Vec::new();
+        let mut deferred = Vec::new();
 
         for completion in completion_queue {
-            if completion.user_data() == u64::MAX {
-                // Result of the cancellation action.
-                // There isn't anything we need to do here.
-                // We must wait for the CQE for the operation that was canceled.
-                continue;
-            }
-
-            const WAKE_USERDATA: u64 = u64::MAX - 1;
-            if completion.user_data() == WAKE_USERDATA {
-                // Wakeup from the eventfd. Re-arm another read so future wakes work.
-                // The written counter bytes in wakeup_buf can be ignored.
-                self.wakeup_read_armed = false;
-                rearm_wakeup = !self.shutting_down;
-                continue;
-            }
-
-            let Some(key) = OpKey::from_raw(completion.user_data() as usize) else {
+            let Some(key) = CompletionKey::decode(completion.user_data()) else {
+                // A malformed or stale control value cannot name an operation.
                 continue;
             };
+
+            let key = match key {
+                CompletionKey::Cancel | CompletionKey::WakeCancel => {
+                    // Result of a cancellation SQE. The target operation's own
+                    // CQE is still required before its slot can be retired.
+                    continue;
+                }
+                CompletionKey::Wake => {
+                    // Wakeup from the eventfd. Re-arm another read so future wakes work.
+                    // The written counter bytes in wakeup_buf can be ignored.
+                    self.wakeup_read_armed = false;
+                    rearm_wakeup = !self.shutting_down;
+                    continue;
+                }
+                CompletionKey::Operation(key) => key,
+            };
+
             let res = completion.result();
             let result = if res >= 0 {
                 Ok(res as u32)
@@ -355,9 +368,13 @@ impl IoUringBackend {
             };
 
             if let Some(state) = self.ops.get_mut(key) {
-                let (remove, waker) = state.complete(Completion { result });
+                let (remove, waker, cleanup) =
+                    state.complete(Completion::with_flags(result, completion.flags()));
                 if let Some(waker) = waker {
-                    wakeups.push(waker);
+                    deferred.push(DeferredAction::new(move || waker.wake()));
+                }
+                if let Some(cleanup) = cleanup {
+                    deferred.push(cleanup);
                 }
                 if remove {
                     self.ops.remove(key);
@@ -365,15 +382,14 @@ impl IoUringBackend {
             }
         }
 
+        // Drop the completion queue borrow before re-arming.
+        drop(completion_queue);
+
         if rearm_wakeup {
             self.arm_wakeup_read()?;
         }
 
-        for waker in wakeups {
-            waker.wake();
-        }
-
-        Ok(())
+        Ok(deferred)
     }
 
     pub(crate) fn create_wakeup(&self) -> Wakeup {
@@ -381,7 +397,9 @@ impl IoUringBackend {
         crate::driver::Wakeup::new(move || wakeup.wake())
     }
 
-    pub(crate) fn drain_blocking_completions(&mut self) {}
+    pub(crate) fn drain_blocking_completions(&mut self) -> Vec<DeferredAction> {
+        Vec::new()
+    }
 }
 
 impl AsRawFd for IoUringBackend {
@@ -404,9 +422,9 @@ impl IoUringBackend {
     ///
     /// Runtime teardown calls this explicitly after the blocking pool has
     /// joined. `Drop` remains as a final backstop for standalone backend use.
-    pub(crate) fn shutdown(&mut self) {
+    pub(crate) fn shutdown(&mut self) -> Vec<DeferredAction> {
         if self.shutting_down {
-            return;
+            return Vec::new();
         }
         self.shutting_down = true;
         self.eventfd.close();
@@ -447,7 +465,11 @@ impl IoUringBackend {
                 while self
                     .uring
                     .submission()
-                    .push(&AsyncCancel::new(key.as_u64()).build().user_data(u64::MAX))
+                    .push(
+                        &AsyncCancel::new(key.as_u64())
+                            .build()
+                            .user_data(CompletionKey::cancel_raw() as u64),
+                    )
                     .is_err()
                 {
                     self.uring
@@ -464,7 +486,11 @@ impl IoUringBackend {
                 while self
                     .uring
                     .submission()
-                    .push(&AsyncCancel::new((u64::MAX - 1) as u64).build().user_data(u64::MAX))
+                    .push(
+                        &AsyncCancel::new(CompletionKey::wake_raw() as u64)
+                            .build()
+                            .user_data(CompletionKey::wake_cancel_raw() as u64),
+                    )
                     .is_err()
                 {
                     self.uring
@@ -475,8 +501,10 @@ impl IoUringBackend {
             self.submit().expect("Internal error when cancelling wakeup read");
             while self.wakeup_read_armed {
                 self.wait().expect("Internal error when draining wakeup read");
-                self.dispatch_completions()
-                    .expect("Internal error when draining wakeup read");
+                DeferredAction::run_all(
+                    self.dispatch_completions()
+                        .expect("Internal error when draining wakeup read"),
+                );
             }
         }
 
@@ -499,8 +527,10 @@ impl IoUringBackend {
                     // If waiting fails, ignore the error.
                     // The wait will be attempted again on the next loop.
                     let _ = self.wait();
-                    self.dispatch_completions()
-                        .expect("Internal error when dropping driver");
+                    DeferredAction::run_all(
+                        self.dispatch_completions()
+                            .expect("Internal error when dropping driver"),
+                    );
                 }
                 _ => {
                     // Remove completed ops
@@ -511,12 +541,13 @@ impl IoUringBackend {
 
         // Final sanity check, any ops must be in complete state
         assert!(self.ops.iter().all(|(_, state)| matches!(state, State::Completed(..))));
+        Vec::new()
     }
 }
 
 impl Drop for IoUringBackend {
     fn drop(&mut self) {
-        self.shutdown();
+        let _ = self.shutdown();
     }
 }
 
@@ -554,7 +585,10 @@ mod tests {
     #[test]
     fn completion_before_first_poll_is_retained() {
         let mut state = State::Submitted;
-        assert!(!state.complete(Completion { result: Ok(7) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(7)));
+        assert!(!remove);
+        assert!(wake.is_none());
+        assert!(cleanup.is_none());
         assert!(matches!(state, State::Completed(..)));
     }
 
@@ -563,7 +597,10 @@ mod tests {
         let cleaned = Arc::new(AtomicBool::new(false));
         let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
 
-        assert!(state.complete(Completion { result: Ok(0) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
+        assert!(remove);
+        assert!(wake.is_none());
+        cleanup.expect("detached cleanup should be deferred").run();
         assert!(cleaned.load(Ordering::SeqCst));
     }
 
@@ -573,7 +610,10 @@ mod tests {
         let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
         let mut state = State::Waiting(waker);
 
-        assert!(!state.complete(Completion { result: Ok(0) }).0);
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
+        assert!(!remove);
+        assert!(cleanup.is_none());
+        wake.expect("waiting state should return its waker").wake();
         assert!(woken.load(Ordering::SeqCst));
     }
 }

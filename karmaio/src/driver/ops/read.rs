@@ -83,18 +83,8 @@ unsafe impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> UringOperation f
         opcode::Read::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
 
-    fn complete(mut self, completion: Completion) -> Self::Output {
-        match completion.result {
-            Ok(res) => {
-                let res = res as usize;
-                // Safety: the kernel wrote `res` bytes into the buffer.
-                unsafe {
-                    self.buf.set_init(res);
-                }
-                (Ok(res), self.buf)
-            }
-            Err(err) => (Err(err), self.buf),
-        }
+    fn complete(self, completion: Completion) -> Self::Output {
+        self.finish(completion)
     }
 }
 
@@ -123,18 +113,8 @@ impl<T: AsFd + AsRawFd + 'static, B: BoundedIoBufMut + 'static> KqueueOperation 
         )
     }
 
-    fn complete(mut self, completion: Completion) -> Self::Output {
-        match completion.result {
-            Ok(res) => {
-                let res = res as usize;
-                // Safety: the kernel wrote `res` bytes into the buffer.
-                unsafe {
-                    self.buf.set_init(res);
-                }
-                (Ok(res), self.buf)
-            }
-            Err(err) => (Err(err), self.buf),
-        }
+    fn complete(self, completion: Completion) -> Self::Output {
+        self.finish(completion)
     }
 }
 
@@ -156,15 +136,21 @@ unsafe impl<T: AsRawHandle + 'static, B: BoundedIoBufMut + 'static> IocpOperatio
         })
     }
 
-    fn complete(mut self, completion: Completion) -> Self::Output {
-        match completion.result {
-            Ok(res) => {
-                let res = res as usize;
-                // Safety: the kernel wrote `res` bytes into the buffer.
+    fn complete(self, completion: Completion) -> Self::Output {
+        self.finish(completion)
+    }
+}
+
+impl<T, B: BoundedIoBufMut> Read<T, B> {
+    fn finish(mut self, completion: Completion) -> BufResult<usize, B> {
+        let capacity = self.buf.bytes_total();
+        match completion.bytes_transferred(capacity) {
+            Ok(n) => {
+                // Safety: the platform wrote at most `capacity` bytes into the buffer.
                 unsafe {
-                    self.buf.set_init(res);
+                    self.buf.set_init(n);
                 }
-                (Ok(res), self.buf)
+                (Ok(n), self.buf)
             }
             Err(err) => (Err(err), self.buf),
         }

@@ -147,9 +147,9 @@ unsafe impl IocpOperation for Stat {
         match Metadata::from_handle(self.handle.raw_handle() as HANDLE) {
             Ok(metadata) => {
                 self.result = Some(metadata);
-                IocpSubmission::Ready(Completion { result: Ok(0) })
+                IocpSubmission::Ready(Completion::new(Ok(0) ))
             }
-            Err(err) => IocpSubmission::Ready(Completion { result: Err(err) }),
+            Err(err) => IocpSubmission::Ready(Completion::new(Err(err) )),
         }
     }
 

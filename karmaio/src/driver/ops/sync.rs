@@ -2,8 +2,14 @@
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -59,13 +65,19 @@ unsafe impl UringOperation for Sync {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Sync {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Sync {
     type Output = std::io::Result<()>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         // Capture a raw fd (Send); SharedIoHandle stays on the op for the lifetime of the future.
         let fd = self.handle.raw_fd();
-        macos_syscall_blocking!({ macos_syscall!(libc::fsync(fd)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::fsync(fd)) })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

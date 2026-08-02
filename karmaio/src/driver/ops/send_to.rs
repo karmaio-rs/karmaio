@@ -9,8 +9,14 @@ use socket2::SockAddr;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBuf, BufResult},
@@ -111,25 +117,35 @@ unsafe impl<B: BoundedIoBuf> UringOperation for SendTo<B> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf> PollOperation for SendTo<B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBuf> KqueueOperation for SendTo<B> {
     type Output = BufResult<usize, B>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
-            let ptr = self.buf.stable_read_ptr();
-            let len = self.buf.bytes_init();
-            let name = self.socket_addr.as_ptr() as *const libc::sockaddr;
-            let namelen = self.socket_addr.len();
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Write,
+            {
+                let ptr = self.buf.stable_read_ptr();
+                let len = self.buf.bytes_init();
+                let name = self.socket_addr.as_ptr() as *const libc::sockaddr;
+                let namelen = self.socket_addr.len();
 
-            macos_syscall!(libc::sendto(
-                self.io_handle.raw_fd(),
-                ptr as *const libc::c_void,
-                len,
-                0,
-                name,
-                namelen,
-            ))
-        })
+                kqueue_syscall!(libc::sendto(
+                    self.io_handle.raw_fd(),
+                    ptr as *const libc::c_void,
+                    len,
+                    0,
+                    name,
+                    namelen,
+                ))
+            }
+        )
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {

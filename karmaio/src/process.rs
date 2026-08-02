@@ -8,9 +8,9 @@
 //!
 //! Spawning is synchronous. Piped stdio is driven by the completion driver
 //! so reading/writing a child's pipes never stalls the executor.
-//! Waiting is also asynchronous: on macOS the runtime is notified by the kernel via
-//! kqueue `EVFILT_PROC`/`NOTE_EXIT`, while on other platforms the blocking `wait`
-//! runs on the runtime's blocking pool.
+//! Waiting is also asynchronous where the platform backend provides a native
+//! completion primitive. Linux uses pidfds; on macOS, BSDs, and Windows the
+//! blocking-pool fallback is used for process waits.
 
 pub mod child;
 pub mod command;

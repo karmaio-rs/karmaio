@@ -3,7 +3,7 @@
 //! [`AttachedHandle<T>`] wraps a [`SharedIoHandle<T>`] and associates the
 //! underlying OS handle with the current runtime's I/O driver on construction.
 //! On Windows, this associates the handle with the IOCP completion port. On
-//! Linux/macOS, this is a no-op.
+//! Linux and macOS/BSD kqueue targets, this is a no-op.
 //!
 //! # Usage
 //!
@@ -33,7 +33,7 @@ use crate::runtime::local::CURRENT_DRIVER;
 /// # Platform-specific behavior
 /// - **Windows (IOCP):** Calls `CreateIoCompletionPort` to associate the handle
 ///   with the completion port and disables per-handle event objects.
-/// - **Linux (io-uring) / macOS (kqueue):** No-op (returns `Ok(())`).
+/// - **Linux (io-uring) / macOS and BSDs (kqueue):** No-op (returns `Ok(())`).
 pub(crate) struct AttachedHandle<T> {
     source: SharedIoHandle<T>,
 }
@@ -79,7 +79,7 @@ impl<T: AsFd> AttachedHandle<T> {
     /// Create [`AttachedHandle`]. It tries to associate the source with the
     /// current runtime's driver, and will return [`Err`] if it fails.
     ///
-    /// On Linux (io-uring) / macOS (kqueue), this is a no-op.
+    /// On Linux (io-uring) / macOS and BSDs (kqueue), this is a no-op.
     pub fn new(source: T) -> io::Result<Self> {
         CURRENT_DRIVER.with(|handle| -> io::Result<()> {
             let driver = handle.upgrade().expect("not in a runtime context");

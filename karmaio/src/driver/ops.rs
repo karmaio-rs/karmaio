@@ -344,7 +344,7 @@ impl<T: Operation + 'static> Drop for Op<T> {
 /// must run on the blocking pool.
 /// Captures only `Send` state (paths, raw fds, flags) so the runtime thread can
 /// keep non-`Send` op data (e.g. `SharedIoHandle`) while the syscall runs off-thread.
-/// Used on macOS / Windows; io_uring handles equivalent work in-kernel.
+/// Used on kqueue Unix targets / Windows; io_uring handles equivalent work in-kernel.
 #[allow(dead_code)]
 pub(crate) struct BlockingJob {
     work: Box<dyn FnOnce() -> Completion + Send + 'static>,

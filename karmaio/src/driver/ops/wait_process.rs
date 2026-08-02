@@ -16,9 +16,6 @@ use std::{
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
-
 use crate::driver::ops::{Completion, Op};
 use crate::runtime::local::CURRENT_DRIVER;
 

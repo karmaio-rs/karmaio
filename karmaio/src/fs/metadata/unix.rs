@@ -39,11 +39,11 @@ impl Metadata {
     }
 
     pub(crate) fn modified(&self) -> io::Result<SystemTime> {
-        timespec(self.stat.st_mtime, self.stat.st_mtime_nsec)
+        timespec(self.stat.st_mtime, stat_mtime_nsec(&self.stat))
     }
 
     pub(crate) fn accessed(&self) -> io::Result<SystemTime> {
-        timespec(self.stat.st_atime, self.stat.st_atime_nsec)
+        timespec(self.stat.st_atime, stat_atime_nsec(&self.stat))
     }
 
     pub(crate) fn created(&self) -> io::Result<SystemTime> {
@@ -101,7 +101,7 @@ impl MetadataExt for Metadata {
     }
 
     fn atime_nsec(&self) -> i64 {
-        self.stat.st_atime_nsec as i64
+        stat_atime_nsec(&self.stat)
     }
 
     fn mtime(&self) -> i64 {
@@ -109,7 +109,7 @@ impl MetadataExt for Metadata {
     }
 
     fn mtime_nsec(&self) -> i64 {
-        self.stat.st_mtime_nsec as i64
+        stat_mtime_nsec(&self.stat)
     }
 
     fn ctime(&self) -> i64 {
@@ -117,7 +117,7 @@ impl MetadataExt for Metadata {
     }
 
     fn ctime_nsec(&self) -> i64 {
-        self.stat.st_ctime_nsec as i64
+        stat_ctime_nsec(&self.stat)
     }
 
     fn blksize(&self) -> u64 {
@@ -203,6 +203,36 @@ impl PermissionsExt for Permissions {
             mode: mode as libc::mode_t,
         }
     }
+}
+
+#[cfg(target_os = "netbsd")]
+fn stat_atime_nsec(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_atimensec)
+}
+
+#[cfg(not(target_os = "netbsd"))]
+fn stat_atime_nsec(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_atime_nsec)
+}
+
+#[cfg(target_os = "netbsd")]
+fn stat_mtime_nsec(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_mtimensec)
+}
+
+#[cfg(not(target_os = "netbsd"))]
+fn stat_mtime_nsec(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_mtime_nsec)
+}
+
+#[cfg(target_os = "netbsd")]
+fn stat_ctime_nsec(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_ctimensec)
+}
+
+#[cfg(not(target_os = "netbsd"))]
+fn stat_ctime_nsec(stat: &libc::stat) -> i64 {
+    i64::from(stat.st_ctime_nsec)
 }
 
 fn timespec(secs: libc::time_t, nsecs: libc::c_long) -> io::Result<SystemTime> {

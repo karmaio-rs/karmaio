@@ -7,8 +7,14 @@ use std::os::unix::fs::PermissionsExt;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -42,13 +48,19 @@ impl Op<SetPermissions> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for SetPermissions {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for SetPermissions {
     type Output = io::Result<()>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         let fd = self.handle.raw_fd();
         let mode = self.perm.mode() as libc::mode_t;
-        macos_syscall_blocking!({ macos_syscall!(libc::fchmod(fd, mode)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::fchmod(fd, mode)) })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

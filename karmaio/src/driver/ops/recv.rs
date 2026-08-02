@@ -2,8 +2,14 @@
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
@@ -76,17 +82,27 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for Recv<B> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> PollOperation for Recv<B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBufMut> KqueueOperation for Recv<B> {
     type Output = BufResult<usize, B>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            let ptr = self.buf.stable_write_ptr();
-            let len = self.buf.bytes_total();
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Read,
+            {
+                let ptr = self.buf.stable_write_ptr();
+                let len = self.buf.bytes_total();
 
-            // TODO: Check if we need to get any flags from the user
-            macos_syscall!(libc::recv(self.io_handle.raw_fd(), ptr as *mut libc::c_void, len, 0))
-        })
+                // TODO: Check if we need to get any flags from the user
+                kqueue_syscall!(libc::recv(self.io_handle.raw_fd(), ptr as *mut libc::c_void, len, 0))
+            }
+        )
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {

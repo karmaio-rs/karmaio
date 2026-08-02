@@ -2,8 +2,14 @@
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
@@ -71,10 +77,16 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for ReadAt<B> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> PollOperation for ReadAt<B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBufMut> KqueueOperation for ReadAt<B> {
     type Output = BufResult<usize, B>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         // Regular files always report ready under kqueue, and pread can block on
         // disk I/O — offload to the blocking pool so the runtime thread stays free.
         // Buffer pointers remain valid: the Op (and its buffers) stay alive until
@@ -83,7 +95,7 @@ impl<B: BoundedIoBufMut> PollOperation for ReadAt<B> {
         let ptr = self.buf.stable_write_ptr() as usize;
         let len = self.buf.bytes_total();
         let offset = self.offset as i64;
-        macos_syscall_blocking!({ macos_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset)) })
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {

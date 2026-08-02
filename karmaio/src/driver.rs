@@ -72,7 +72,14 @@ impl Driver {
         self.backend.borrow_mut().poll_op(op, cx)
     }
 
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(
+        target_os = "windows",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
         self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup)
     }
@@ -120,7 +127,7 @@ impl Driver {
     /// Associates a file or socket handle with the driver's I/O mechanism.
     ///
     /// On Windows (IOCP), this calls `CreateIoCompletionPort` and configures
-    /// completion notification behavior. On Linux (io-uring) / macOS
+    /// completion notification behavior. On Linux (io-uring) / macOS and BSDs
     /// (kqueue), this is a no-op.
     #[cfg(windows)]
     pub(crate) fn attach(&self, handle: RawHandle) -> io::Result<()> {
@@ -129,7 +136,7 @@ impl Driver {
 
     /// Associates a file descriptor with the driver's I/O mechanism.
     ///
-    /// On Linux (io-uring) / macOS (kqueue), this is a no-op.
+    /// On Linux (io-uring) / macOS and BSDs (kqueue), this is a no-op.
     #[cfg(unix)]
     pub(crate) fn attach(&self, fd: RawFd) -> io::Result<()> {
         self.backend.borrow().attach(fd)

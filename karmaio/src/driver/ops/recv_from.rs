@@ -9,8 +9,14 @@ use socket2::SockAddr;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
@@ -150,33 +156,43 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for RecvFrom<B> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> PollOperation for RecvFrom<B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
     type Output = BufResult<(usize, SocketAddr), B>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            let ptr = self.buf.stable_write_ptr();
-            let len = self.buf.bytes_total();
-            let mut addrlen = self.socket_addr.len();
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Read,
+            {
+                let ptr = self.buf.stable_write_ptr();
+                let len = self.buf.bytes_total();
+                let mut addrlen = self.socket_addr.len();
 
-            let result = macos_syscall!(libc::recvfrom(
-                self.io_handle.raw_fd(),
-                ptr as *mut libc::c_void,
-                len,
-                0,
-                self.socket_addr.as_ptr() as *mut libc::sockaddr,
-                &mut addrlen,
-            ));
+                let result = kqueue_syscall!(libc::recvfrom(
+                    self.io_handle.raw_fd(),
+                    ptr as *mut libc::c_void,
+                    len,
+                    0,
+                    self.socket_addr.as_ptr() as *mut libc::sockaddr,
+                    &mut addrlen,
+                ));
 
-            if result.is_ok() {
-                // Safety: the kernel wrote `addrlen` bytes of valid address data.
-                unsafe {
-                    self.socket_addr.set_length(addrlen);
+                if result.is_ok() {
+                    // Safety: the kernel wrote `addrlen` bytes of valid address data.
+                    unsafe {
+                        self.socket_addr.set_length(addrlen);
+                    }
                 }
-            }
 
-            result
-        })
+                result
+            }
+        )
     }
 
     // `mut self` is required on Windows (`set_length`); unused on other targets.

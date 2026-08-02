@@ -1,7 +1,7 @@
 //! Blocking thread pool for offloading synchronous syscalls and user work.
 //!
 //! Async runtimes must not run long-blocking work on the executor thread.
-//! Operations such as process waits, path-based filesystem calls on macOS /
+//! Operations such as process waits, path-based filesystem calls on kqueue Unix /
 //! Windows, and DNS lookups are offloaded here via [`crate::runtime::spawn_blocking`].
 //!
 //! # Design

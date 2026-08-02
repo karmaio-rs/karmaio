@@ -7,8 +7,14 @@ use std::os::windows::io::RawHandle;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -108,20 +114,26 @@ unsafe impl UringOperation for Open {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Open {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Open {
     type Output = std::io::Result<File>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return PollAttempt::Ready(Completion { result: Err(e) });
+                return KqueueAttempt::Ready(Completion { result: Err(e) });
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return PollAttempt::Ready(Completion { result: Err(e) });
+                return KqueueAttempt::Ready(Completion { result: Err(e) });
             }
         };
 
@@ -129,7 +141,7 @@ impl PollOperation for Open {
         let path = self.path.clone();
         let mode = self.options.mode as u32;
 
-        macos_syscall_blocking!({ macos_syscall!(libc::open(path.as_c_str().as_ptr(), flags, mode)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::open(path.as_c_str().as_ptr(), flags, mode)) })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

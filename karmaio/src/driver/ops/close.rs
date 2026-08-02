@@ -4,8 +4,14 @@ use std::io;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -46,15 +52,21 @@ unsafe impl UringOperation for Close {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Close {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Close {
     type Output = io::Result<()>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         // Own the raw fd for the pool job (Close owns the handle exclusively).
         let fd = match self.io_handle {
             OsRawHandle::Fd(fd) => fd,
         };
-        macos_syscall_blocking!({ macos_syscall!(libc::close(fd)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::close(fd)) })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

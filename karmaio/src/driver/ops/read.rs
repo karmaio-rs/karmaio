@@ -1,6 +1,6 @@
 //! Offset-less read operations for stream-like file descriptors (pipes, sockets,
 //! char devices). Unlike [`crate::driver::ops::read_at`], these never touch the
-//! offset, which matters on macOS/BSD where the kqueue `PollOperation`
+//! offset, which matters on macOS/BSD where the kqueue `KqueueOperation`
 //! implementations of the offset-based ops use `pread`/`pwrite` and those
 //! syscalls fail (`ESPIPE`) on non-seekable descriptors.
 
@@ -15,8 +15,14 @@ use std::os::windows::io::AsRawHandle;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
@@ -92,15 +98,25 @@ unsafe impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> UringOperation f
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> PollOperation for Read<T, B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> KqueueOperation for Read<T, B> {
     type Output = BufResult<usize, B>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            let ptr = self.buf.stable_write_ptr() as *mut libc::c_void;
-            let len = self.buf.bytes_total();
-            macos_syscall!(libc::read(self.io_handle.raw_fd(), ptr, len))
-        })
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Read,
+            {
+                let ptr = self.buf.stable_write_ptr() as *mut libc::c_void;
+                let len = self.buf.bytes_total();
+                kqueue_syscall!(libc::read(self.io_handle.raw_fd(), ptr, len))
+            }
+        )
     }
 
     fn complete(mut self, completion: Completion) -> Self::Output {

@@ -4,8 +4,14 @@ use std::io;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -20,7 +26,13 @@ pub(crate) struct Stat {
     handle: SharedIoHandle<std::fs::File>,
     #[cfg(target_os = "linux")]
     statx_buf: Box<libc::statx>,
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     /// Filled by the blocking-pool job via shared storage.
     stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<libc::stat>>>>,
     #[cfg(windows)]
@@ -35,7 +47,13 @@ impl Op<Stat> {
             statx_buf: Box::new(unsafe { std::mem::zeroed() }),
         };
 
-        #[cfg(target_os = "macos")]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
         let data = Stat {
             handle: handle.clone(),
             stat_shared: None,
@@ -75,10 +93,16 @@ unsafe impl UringOperation for Stat {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Stat {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Stat {
     type Output = io::Result<Metadata>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         use std::sync::{Arc, Mutex};
 
         // fstat fills a buffer we need after the pool job; share it with the worker.
@@ -86,9 +110,9 @@ impl PollOperation for Stat {
         self.stat_shared = Some(Arc::clone(&slot));
         let fd = self.handle.raw_fd();
 
-        macos_syscall_blocking!({
+        kqueue_syscall_blocking!({
             let mut stat = unsafe { std::mem::zeroed() };
-            let result = macos_syscall!(libc::fstat(fd, &mut stat));
+            let result = kqueue_syscall!(libc::fstat(fd, &mut stat));
             if result.is_ok() {
                 *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(stat);
             }

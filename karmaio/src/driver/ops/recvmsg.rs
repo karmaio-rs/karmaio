@@ -6,8 +6,14 @@ use socket2::SockAddr;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
@@ -167,17 +173,27 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for RecvMsg<B> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> PollOperation for RecvMsg<B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBufMut> KqueueOperation for RecvMsg<B> {
     type Output = BufResult<(usize, SocketAddr), Vec<B>>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            macos_syscall!(libc::recvmsg(
-                self.io_handle.raw_fd(),
-                self.msghdr.as_mut() as *mut libc::msghdr,
-                0,
-            ))
-        })
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Read,
+            {
+                kqueue_syscall!(libc::recvmsg(
+                    self.io_handle.raw_fd(),
+                    self.msghdr.as_mut() as *mut libc::msghdr,
+                    0,
+                ))
+            }
+        )
     }
 
     // `mut self` is required on Windows (`set_length`); unused on other targets.

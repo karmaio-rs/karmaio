@@ -649,7 +649,7 @@ mod tests {
         });
     }
 
-    /// Path FS ops use `Submission::Blocking` on macOS/Windows (pool offload).
+    /// Path FS ops use the blocking-pool fallback on kqueue Unix/Windows.
     #[cfg(feature = "fs")]
     #[test]
     fn blocking_submission_create_and_remove_dir() {

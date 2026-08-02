@@ -19,7 +19,7 @@ use super::open_options;
 /// Metadata information about a file.
 ///
 /// This struct mirrors the API of [`std::fs::Metadata`] but is backed by platform-native stat operations
-/// (io_uring `statx` on Linux, `fstat` on macOS, `GetFileInformationByHandle` on Windows) rather than the stdlib.
+/// (io_uring `statx` on Linux, `fstat` on macOS/BSD, `GetFileInformationByHandle` on Windows) rather than the stdlib.
 #[derive(Clone)]
 pub struct Metadata(sys::Metadata);
 
@@ -29,7 +29,13 @@ impl Metadata {
         Self(sys::Metadata::from_statx(statx))
     }
 
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     pub(crate) fn from_stat(stat: libc::stat) -> Self {
         Self(sys::Metadata::from_stat(stat))
     }

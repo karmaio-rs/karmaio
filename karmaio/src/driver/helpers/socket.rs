@@ -24,13 +24,23 @@ pub(crate) struct Socket {
 
 /// Configure a socket for async use on the current platform.
 ///
-/// Sets non-blocking mode, and on macOS also `CLOEXEC` and `NOSIGPIPE`.
+/// Sets non-blocking mode, and configures close-on-exec on kqueue Unix targets.
+/// Apple targets additionally enable `NOSIGPIPE`.
 /// Used by create, bind, and accept paths so flags stay consistent.
 fn configure_async_socket(socket: &socket2::Socket) -> Result<()> {
     socket.set_nonblocking(true)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
     {
         socket.set_cloexec(true)?;
+    }
+    #[cfg(target_vendor = "apple")]
+    {
         // Avoid SIGPIPE killing the process when writing to a closed socket.
         socket.set_nosigpipe(true)?;
     }

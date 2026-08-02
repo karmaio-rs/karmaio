@@ -7,8 +7,14 @@ use std::os::windows::io::RawSocket;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -81,7 +87,7 @@ unsafe impl UringOperation for Accept {
             handle: unsafe { AttachedHandle::new_unchecked(sock) },
         };
 
-        let _ = socket.set_async_flags();
+        socket.set_async_flags()?;
 
         let (_, addr) = unsafe {
             socket2::SockAddr::try_init(move |addr_storage, len| {
@@ -97,17 +103,27 @@ unsafe impl UringOperation for Accept {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Accept {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Accept {
     type Output = io::Result<(Socket, Option<SocketAddr>)>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_READ, {
-            macos_syscall!(libc::accept(
-                self.io_handle.raw_fd(),
-                &mut self.socketaddr.0 as *mut _ as *mut libc::sockaddr,
-                &mut self.socketaddr.1,
-            ))
-        })
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Read,
+            {
+                kqueue_syscall!(libc::accept(
+                    self.io_handle.raw_fd(),
+                    &mut self.socketaddr.0 as *mut _ as *mut libc::sockaddr,
+                    &mut self.socketaddr.1,
+                ))
+            }
+        )
     }
 
     fn complete(self, completion: Completion) -> Self::Output {
@@ -121,7 +137,7 @@ impl PollOperation for Accept {
             handle: unsafe { AttachedHandle::new_unchecked(sock) },
         };
 
-        let _ = socket.set_async_flags();
+        socket.set_async_flags()?;
 
         let (_, addr) = unsafe {
             socket2::SockAddr::try_init(move |addr_storage, len| {

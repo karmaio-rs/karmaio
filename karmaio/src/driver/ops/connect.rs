@@ -4,8 +4,14 @@ use socket2::SockAddr;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -57,12 +63,18 @@ unsafe impl UringOperation for Connect {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Connect {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Connect {
     type Output = std::io::Result<()>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(connect self.io_handle.raw_fd(), {
-            macos_syscall!(libc::connect(
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(connect self.io_handle.raw_fd(), {
+            kqueue_syscall!(libc::connect(
                 self.io_handle.raw_fd(),
                 self.socket_addr.as_ptr() as *const libc::sockaddr,
                 self.socket_addr.len(),

@@ -1,10 +1,10 @@
-//! macOS/kqueue syscall helpers for `PollOperation` implementations.
+//! Kqueue syscall helpers for `KqueueOperation` implementations.
 
 /// Execute a syscall that returns a non-negative value on success.
 ///
 /// Works for `ssize_t`/`fd` returns as well as `int` syscalls that return `0` on success
 /// and `-1` on error (e.g. `close`, `connect`, `fstat`).
-macro_rules! macos_syscall {
+macro_rules! kqueue_syscall {
     ($e:expr) => {{
         #[allow(unused_unsafe)]
         let res = unsafe { $e };
@@ -17,36 +17,29 @@ macro_rules! macos_syscall {
     }};
 }
 
-macro_rules! __macos_syscall_ready {
+macro_rules! __kqueue_syscall_ready {
     ($result:expr) => {
-        return $crate::driver::backends::kqueue::PollAttempt::Ready($crate::driver::ops::Completion { result: $result })
+        return $crate::driver::backends::kqueue::KqueueAttempt::Ready($crate::driver::ops::Completion {
+            result: $result,
+        })
     };
 }
 
-macro_rules! __macos_syscall_register {
+macro_rules! __kqueue_syscall_register {
     ($fd:expr, $filter:expr) => {
-        return $crate::driver::backends::kqueue::PollAttempt::Register($crate::driver::backends::kqueue::Interest::new(
-            $fd,
-            $filter,
-            libc::EV_ADD | libc::EV_ONESHOT,
-        ))
+        return $crate::driver::backends::kqueue::KqueueAttempt::Register(
+            $crate::driver::backends::kqueue::Interest::new($fd, $filter),
+        )
     };
 }
 
-/// Package a synchronous syscall as [`PollAttempt::Blocking`] for the thread pool.
+/// Package a synchronous syscall as [`KqueueAttempt::Blocking`] for the thread pool.
 ///
 /// Captures outer locals with `move`. Prefer this for path-based FS ops and other
 /// syscalls that cannot use kqueue readiness (open, mkdir, rename, fstat, …).
-///
-/// ```ignore
-/// let path = self.path.clone();
-/// macos_syscall_blocking!({
-///     macos_syscall!(libc::mkdir(path.as_c_str().as_ptr(), mode))
-/// })
-/// ```
-macro_rules! macos_syscall_blocking {
+macro_rules! kqueue_syscall_blocking {
     ($block:block) => {{
-        $crate::driver::backends::kqueue::PollAttempt::Blocking($crate::driver::ops::BlockingJob::new(move || {
+        $crate::driver::backends::kqueue::KqueueAttempt::Blocking($crate::driver::ops::BlockingJob::new(move || {
             loop {
                 match { $block } {
                     Ok(val) => {
@@ -62,78 +55,64 @@ macro_rules! macos_syscall_blocking {
     }};
 }
 
-/// Retry a syscall on `EINTR` and return a `PollAttempt`.
+/// Retry a syscall on `EINTR` and return a `KqueueAttempt`.
 ///
-/// # Forms
-///
-/// Synchronous syscall (no kqueue registration) — **runs on the runtime thread**.
-/// Prefer [`macos_syscall_blocking`] for FS and other true-blocking calls:
-/// ```ignore
-/// macos_syscall_submit!({ macos_syscall!(...) })
-/// ```
-///
-/// Non-blocking I/O — register on `EAGAIN`/`WouldBlock`:
-/// ```ignore
-/// macos_syscall_submit!($fd, $kqueue_filter, { macos_syscall!(...) })
-/// ```
-///
-/// `connect(2)` — treat `EISCONN` as success, register on `EINPROGRESS`:
-/// ```ignore
-/// macos_syscall_submit!(connect $fd, { macos_syscall!(...) })
-/// ```
-macro_rules! macos_syscall_submit {
+/// The non-blocking form registers a one-shot kqueue filter on `EAGAIN`/`WouldBlock`.
+/// The `connect` form treats `EISCONN` as success and registers a write filter while
+/// the connection is in progress.
+macro_rules! kqueue_syscall_submit {
     ($block:block) => {
-        macos_syscall_submit!(@loop $block)
+        kqueue_syscall_submit!(@loop $block)
     };
     ($fd:expr, $filter:expr, $block:block) => {
-        macos_syscall_submit!(@loop $block;
+        kqueue_syscall_submit!(@loop $block;
             register ($fd, $filter)
         )
     };
     (connect $fd:expr, $block:block) => {
-        macos_syscall_submit!(@loop $block;
+        kqueue_syscall_submit!(@loop $block;
             connect $fd
         )
     };
     (@loop $block:block) => {{
         loop {
             match { $block } {
-                Ok(val) => __macos_syscall_ready!(Ok(val)),
+                Ok(val) => __kqueue_syscall_ready!(Ok(val)),
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(err) => __macos_syscall_ready!(Err(err)),
+                Err(err) => __kqueue_syscall_ready!(Err(err)),
             }
         }
     }};
     (@loop $block:block; register ($fd:expr, $filter:expr)) => {{
         loop {
             match { $block } {
-                Ok(val) => __macos_syscall_ready!(Ok(val)),
+                Ok(val) => __kqueue_syscall_ready!(Ok(val)),
                 Err(err)
                     if err.kind() == std::io::ErrorKind::WouldBlock
                         || err.raw_os_error() == Some(libc::EAGAIN) =>
                 {
-                    __macos_syscall_register!($fd, $filter);
+                    __kqueue_syscall_register!($fd, $filter);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(err) => __macos_syscall_ready!(Err(err)),
+                Err(err) => __kqueue_syscall_ready!(Err(err)),
             }
         }
     }};
     (@loop $block:block; connect $fd:expr) => {{
         loop {
             match { $block } {
-                Ok(val) => __macos_syscall_ready!(Ok(val)),
+                Ok(val) => __kqueue_syscall_ready!(Ok(val)),
                 Err(err) if err.raw_os_error() == Some(libc::EISCONN) => {
-                    __macos_syscall_ready!(Ok(0));
+                    __kqueue_syscall_ready!(Ok(0));
                 }
                 Err(err)
                     if err.raw_os_error() == Some(libc::EINPROGRESS)
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
-                    __macos_syscall_register!($fd, libc::EVFILT_WRITE);
+                    __kqueue_syscall_register!($fd, $crate::driver::backends::kqueue::Direction::Write);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(err) => __macos_syscall_ready!(Err(err)),
+                Err(err) => __kqueue_syscall_ready!(Err(err)),
             }
         }
     }};

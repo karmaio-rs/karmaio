@@ -4,8 +4,14 @@ use std::io;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     driver::{
@@ -45,13 +51,19 @@ unsafe impl UringOperation for Truncate {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Truncate {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Truncate {
     type Output = io::Result<()>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         let fd = self.handle.raw_fd();
         let size = self.size as libc::off_t;
-        macos_syscall_blocking!({ macos_syscall!(libc::ftruncate(fd, size)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::ftruncate(fd, size)) })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

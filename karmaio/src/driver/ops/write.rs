@@ -13,8 +13,14 @@ use std::os::windows::io::AsRawHandle;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBuf, BufResult},
@@ -83,15 +89,25 @@ unsafe impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> UringOperation for 
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> PollOperation for Write<T, B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> KqueueOperation for Write<T, B> {
     type Output = BufResult<usize, B>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
-            let ptr = self.buf.stable_read_ptr() as *const libc::c_void;
-            let len = self.buf.bytes_init();
-            macos_syscall!(libc::write(self.io_handle.raw_fd(), ptr, len))
-        })
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Write,
+            {
+                let ptr = self.buf.stable_read_ptr() as *const libc::c_void;
+                let len = self.buf.bytes_init();
+                kqueue_syscall!(libc::write(self.io_handle.raw_fd(), ptr, len))
+            }
+        )
     }
 
     fn complete(self, completion: Completion) -> Self::Output {

@@ -9,8 +9,14 @@ use socket2::SockAddr;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBuf, BufResult},
@@ -146,17 +152,27 @@ unsafe impl<B: BoundedIoBuf, C: BoundedIoBuf> UringOperation for SendMsg<B, C> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBuf, C: BoundedIoBuf> PollOperation for SendMsg<B, C> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBuf, C: BoundedIoBuf> KqueueOperation for SendMsg<B, C> {
     type Output = BufResult<(usize, Option<C>), Vec<B>>;
-    fn attempt(&mut self) -> PollAttempt {
-        macos_syscall_submit!(self.io_handle.raw_fd(), libc::EVFILT_WRITE, {
-            macos_syscall!(libc::sendmsg(
-                self.io_handle.raw_fd(),
-                self.msghdr.as_ref() as *const libc::msghdr,
-                0,
-            ))
-        })
+    fn attempt(&mut self) -> KqueueAttempt {
+        kqueue_syscall_submit!(
+            self.io_handle.raw_fd(),
+            crate::driver::backends::kqueue::Direction::Write,
+            {
+                kqueue_syscall!(libc::sendmsg(
+                    self.io_handle.raw_fd(),
+                    self.msghdr.as_ref() as *const libc::msghdr,
+                    0,
+                ))
+            }
+        )
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {

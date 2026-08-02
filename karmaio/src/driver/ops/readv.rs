@@ -4,8 +4,14 @@ use std::io;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
     buf::{BoundedIoBufMut, BufResult},
@@ -122,17 +128,23 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for Readv<B> {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl<B: BoundedIoBufMut> PollOperation for Readv<B> {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl<B: BoundedIoBufMut> KqueueOperation for Readv<B> {
     type Output = BufResult<usize, Vec<B>>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         // Same rationale as ReadAt: kqueue is useless for regular files and
         // preadv may block. Keep iovecs/buffers alive in the Op while the pool runs.
         let fd = self.io_handle.raw_fd();
         let iovs = self.iovs.as_ptr() as usize;
         let iovcnt = self.iovs.len() as i32;
         let offset = self.offset as i64;
-        macos_syscall_blocking!({ macos_syscall!(libc::preadv(fd, iovs as *const libc::iovec, iovcnt, offset)) })
+        kqueue_syscall_blocking!({ kqueue_syscall!(libc::preadv(fd, iovs as *const libc::iovec, iovcnt, offset)) })
     }
 
     fn complete(self, completion_entry: Completion) -> Self::Output {

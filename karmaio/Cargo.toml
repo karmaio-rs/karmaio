@@ -53,6 +53,10 @@ karmaio-macros = { path = "../karmaio-macros", version = "0.1.0", optional = tru
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Kqueue backend dependencies (macOS and the BSD family).
+[target.'cfg(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd", target_os = "dragonfly"))'.dependencies]
+rustix = { version = "1.0.5", default-features = false, features = ["event", "fs", "std"] }
+
 # Linux platform dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

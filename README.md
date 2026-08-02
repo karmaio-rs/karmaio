@@ -1,7 +1,7 @@
 # karmaio
 
 A modern fast multi-threaded share-nothing asynchronous runtime for Rust,
-using io-uring on Linux, IOCP on Windows, and kqueue on macOS.
+using io-uring on Linux, IOCP on Windows, and kqueue on macOS and BSDs.
 
 ### Currently in progress.
 

@@ -1,79 +1,80 @@
+//! Rustix-backed kqueue driver for macOS and the BSD family.
+//!
+//! The backend keeps the readiness protocol local to kqueue. Operation futures
+//! retain their typed payloads, while this module owns only lifecycle state,
+//! readiness interests, and terminal completions.
+
 use std::{
     collections::VecDeque,
-    io::{Error, Result},
-    os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd},
+    io::{self, Error, Result},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crate::driver::ops::{BlockingJob, Completion, Op};
-use crate::driver::ops::{OpKey, OpTable};
+use rustix::{
+    buffer::spare_capacity,
+    event::{Timespec, kqueue},
+    io::{Errno, FdFlags, fcntl_setfd},
+};
+
+use crate::driver::ops::{BlockingJob, Completion, Op, OpKey, OpTable};
 use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
 
-// Newtype around `libc::kevent` for type safety and zero-cost conversion.
-//
-// If the syscall will block, we need to register an intrest in kqueue to listen for completion
-// The op will return the data we need to register that intrest in the driver
-//
-// The `udata` field is deliberately left as `0` here; the driver fills it
-// with the slab index right before the syscall.
-#[derive(Debug)]
-#[repr(transparent)]
-pub(crate) struct Interest(libc::kevent);
+/// The readiness direction represented by a kqueue filter.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum Direction {
+    Read,
+    Write,
+}
+
+/// A small, backend-owned readiness interest.
+///
+/// The key is deliberately not stored here. The driver adds the current
+/// generational key only when it builds the rustix event, making stale-event
+/// validation explicit and keeping the operation result independent of the
+/// kqueue representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct Interest {
+    fd: RawFd,
+    direction: Direction,
+}
 
 impl Interest {
-    // Construct a registration interest for the common case.
-    //
-    // `flags` is usually `EV_ADD | EV_ONESHOT` (recommended for one-shot ops).
-    pub const fn new(fd: RawFd, filter: i16, flags: u16) -> Self {
-        Self(libc::kevent {
-            ident: fd as libc::uintptr_t,
-            filter,
-            flags,
-            fflags: 0,
-            data: 0,
-            udata: std::ptr::null_mut(), // driver will overwrite
-        })
+    /// Construct an interest for the given readiness direction. The resulting
+    /// value contains no platform event struct.
+    pub(crate) const fn new(fd: RawFd, direction: Direction) -> Self {
+        Self { fd, direction }
     }
 
-    // Low-level accessor used only by the kqueue driver.
-    #[inline]
-    pub(crate) fn as_kevent_mut(&mut self) -> &mut libc::kevent {
-        &mut self.0
-    }
-
-    #[inline]
-    fn matches(&self, event: &libc::kevent) -> bool {
-        self.0.ident == event.ident && self.0.filter == event.filter
+    fn event(self, key: OpKey, flags: kqueue::EventFlags) -> kqueue::Event {
+        let filter = match self.direction {
+            Direction::Read => kqueue::EventFilter::Read(self.fd),
+            Direction::Write => kqueue::EventFilter::Write(self.fd),
+        };
+        kqueue::Event::new(filter, flags, key.raw() as *mut std::ffi::c_void)
     }
 }
 
-// Kqueue is an event notification based system.
-// You make the syscall in a non blocking mode, and it will return to you two possiblities -
-// 1. The syscall completed and returned you the `Completion` result.
-// 2. The syscall will block, in which case you registed a notification and wait
-// 3. The work must run on the blocking pool (`Blocking`).
-pub(crate) enum PollAttempt {
+/// Results of attempting a kqueue operation on the runtime thread.
+pub(crate) enum KqueueAttempt {
     Ready(Completion),
     Register(Interest),
-    /// Offload a Send closure to the runtime blocking pool.
+    /// Offload a synchronous operation to the runtime blocking pool.
     Blocking(BlockingJob),
 }
 
 /// Backend-local readiness operation protocol.
-///
-/// A readiness operation must only retain resources that are safe to retry
-/// after the registered descriptor/filter becomes ready.
-pub(crate) trait PollOperation: 'static {
+pub(crate) trait KqueueOperation: 'static {
     type Output;
 
     /// Attempt the operation without blocking the runtime thread.
-    fn attempt(&mut self) -> PollAttempt;
+    fn attempt(&mut self) -> KqueueAttempt;
 
     /// Convert a terminal syscall or blocking-pool result into the typed output.
     fn complete(self, completion: Completion) -> Self::Output;
@@ -91,9 +92,9 @@ trait IgnoredOp: 'static {
     fn cleanup(self: Box<Self>, completion: Completion);
 }
 
-impl<T: PollOperation + 'static> IgnoredOp for T {
+impl<T: KqueueOperation + 'static> IgnoredOp for T {
     fn cleanup(self: Box<Self>, completion: Completion) {
-        drop(PollOperation::complete(*self, completion));
+        drop(KqueueOperation::complete(*self, completion));
     }
 }
 
@@ -107,9 +108,10 @@ impl State {
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Completed(completion));
                 if let State::Waiting(waker) = old {
-                    return (false, Some(waker));
+                    (false, Some(waker))
+                } else {
+                    (false, None)
                 }
-                (false, None)
             }
             State::Ignored(_) => {
                 if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
@@ -132,9 +134,10 @@ impl State {
             State::Waiting(_) => {
                 let old = std::mem::replace(self, State::Ready);
                 if let State::Waiting(waker) = old {
-                    return (false, Some(waker));
+                    (false, Some(waker))
+                } else {
+                    (false, None)
                 }
-                (false, None)
             }
             State::Ignored(..) => (true, None),
             State::Ready | State::Completed(..) => (false, None),
@@ -147,91 +150,361 @@ struct Slot {
     interest: Option<Interest>,
 }
 
-pub(crate) struct KqueueBackend {
-    kqueue: Arc<KqueueWakeup>,
-    ops: OpTable<Slot>,
-    events: Vec<libc::kevent>,
-    /// Completions produced by blocking-pool workers (index, result).
-    blocking_done: Arc<Mutex<VecDeque<(OpKey, Completion)>>>,
+/// A decoded operation readiness event.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KqueueEvent {
+    key: OpKey,
+    fd: RawFd,
+    direction: Direction,
+    readable: bool,
+    writable: bool,
 }
 
-/// Special ident/udata used for cross-thread wakeups via EVFILT_USER.
-/// Chosen to not collide with slab indices (which start small).
-const WAKEUP_IDENT: libc::uintptr_t = libc::uintptr_t::MAX;
-const WAKEUP_UDATA: *mut libc::c_void = libc::uintptr_t::MAX as *mut libc::c_void;
-
-struct KqueueWakeup {
-    fd: OwnedFd,
-    closed: AtomicBool,
+/// Low-level kqueue owner: descriptor, reusable event storage, and wakeup.
+struct Kqueue {
+    fd: Arc<OwnedFd>,
+    events: Vec<kqueue::Event>,
+    wakeup: KqueueWakeup,
 }
 
-impl AsRawFd for KqueueWakeup {
+impl Kqueue {
+    fn new(capacity: usize) -> io::Result<Self> {
+        if capacity == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "kqueue event capacity must be greater than zero",
+            ));
+        }
+
+        let fd = Arc::new(kqueue::kqueue()?);
+        fcntl_setfd(fd.as_ref(), FdFlags::CLOEXEC)?;
+
+        let wakeup = KqueueWakeup {
+            state: Arc::new(WakeupState {
+                fd: Arc::clone(&fd),
+                kind: WakeupKind::new()?,
+                closed: AtomicBool::new(false),
+                notified: AtomicBool::new(false),
+            }),
+        };
+
+        let queue = Self {
+            fd,
+            events: Vec::with_capacity(capacity),
+            wakeup,
+        };
+        queue.wakeup.state.kind.register(queue.fd.as_ref())?;
+        Ok(queue)
+    }
+
+    fn wakeup(&self) -> KqueueWakeup {
+        self.wakeup.clone()
+    }
+
+    fn close_wakeup(&self) {
+        self.wakeup.close();
+    }
+
+    fn arm(&self, interest: Interest, key: OpKey) -> io::Result<()> {
+        submit_changes(
+            self.fd.as_ref(),
+            &[interest.event(
+                key,
+                kqueue::EventFlags::ADD | kqueue::EventFlags::ONESHOT | kqueue::EventFlags::RECEIPT,
+            )],
+        )
+    }
+
+    fn delete(&self, interest: Interest, key: OpKey) -> io::Result<()> {
+        submit_changes(
+            self.fd.as_ref(),
+            &[interest.event(key, kqueue::EventFlags::DELETE | kqueue::EventFlags::RECEIPT)],
+        )
+    }
+
+    fn wait(&mut self, timeout: Option<Duration>) -> io::Result<usize> {
+        let deadline = timeout.and_then(|duration| Instant::now().checked_add(duration));
+
+        loop {
+            self.events.clear();
+            let timeout = deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
+            let timeout = timeout.and_then(|duration| Timespec::try_from(duration).ok());
+
+            let result = unsafe {
+                kqueue::kevent_timespec(
+                    self.fd.as_ref(),
+                    &[],
+                    spare_capacity(&mut self.events),
+                    timeout.as_ref(),
+                )
+            };
+
+            match result {
+                Ok(_) => {
+                    // A pipe wakeup is one-shot, so drain it and install the
+                    // next filter before allowing another notification.
+                    self.wakeup.state.notified.store(false, Ordering::SeqCst);
+                    self.wakeup.state.kind.reregister(self.fd.as_ref())?;
+                    return Ok(self.events.len());
+                }
+                Err(Errno::INTR) => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+    }
+
+    fn events(&self) -> impl Iterator<Item = KqueueEvent> + '_ {
+        self.events.iter().filter_map(decode_event)
+    }
+}
+
+impl AsFd for Kqueue {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.fd.as_ref().as_fd()
+    }
+}
+
+impl AsRawFd for Kqueue {
     fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }
 }
 
-impl KqueueWakeup {
-    fn close(&self) {
-        self.closed.store(true, Ordering::Release);
+impl Drop for Kqueue {
+    fn drop(&mut self) {
+        self.wakeup.close();
+        let _ = self.wakeup.state.kind.deregister(self.fd.as_ref());
     }
+}
 
+/// Cloneable cross-thread wakeup token for the kqueue backend.
+#[derive(Clone)]
+struct KqueueWakeup {
+    state: Arc<WakeupState>,
+}
+
+impl KqueueWakeup {
     fn wake(&self) {
-        if self.closed.load(Ordering::Acquire) {
+        if self.state.closed.load(Ordering::Acquire) {
             return;
         }
 
-        let mut ev: libc::kevent = unsafe { std::mem::zeroed() };
-        ev.ident = WAKEUP_IDENT;
-        ev.filter = libc::EVFILT_USER;
-        ev.fflags = libc::NOTE_TRIGGER;
-        let _ = unsafe { libc::kevent(self.fd.as_raw_fd(), &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+        if self
+            .state
+            .notified
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            // A full pipe means a notification is already pending. Other
+            // failures are harmless during teardown; Wakeup is infallible.
+            let _ = self.state.kind.notify(self.state.fd.as_ref());
+        }
     }
+
+    fn close(&self) {
+        self.state.closed.store(true, Ordering::Release);
+    }
+}
+
+struct WakeupState {
+    fd: Arc<OwnedFd>,
+    kind: WakeupKind,
+    closed: AtomicBool,
+    notified: AtomicBool,
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+fn readiness_change(fd: RawFd, direction: Direction, flags: kqueue::EventFlags, token: usize) -> kqueue::Event {
+    let filter = match direction {
+        Direction::Read => kqueue::EventFilter::Read(fd),
+        Direction::Write => kqueue::EventFilter::Write(fd),
+    };
+    kqueue::Event::new(filter, flags, token as *mut std::ffi::c_void)
+}
+
+fn submit_changes(fd: &OwnedFd, changes: &[kqueue::Event]) -> io::Result<()> {
+    let mut receipts = Vec::with_capacity(changes.len());
+
+    unsafe {
+        kqueue::kevent_timespec(fd, changes, spare_capacity(&mut receipts), None)?;
+    }
+
+    for receipt in receipts {
+        let data = receipt.data();
+        if receipt.flags().contains(kqueue::EventFlags::ERROR)
+            && data != 0
+            && data != Errno::NOENT.raw_os_error() as i64
+            && data != Errno::PIPE.raw_os_error() as i64
+        {
+            return Err(io::Error::from_raw_os_error(data as i32));
+        }
+    }
+
+    Ok(())
+}
+
+fn decode_event(event: &kqueue::Event) -> Option<KqueueEvent> {
+    let key = OpKey::from_raw(event.udata() as usize)?;
+    let (fd, direction, readable, writable) = match event.filter() {
+        kqueue::EventFilter::Read(fd) => (
+            fd,
+            Direction::Read,
+            true,
+            event.flags().contains(kqueue::EventFlags::EOF),
+        ),
+        kqueue::EventFilter::Write(fd) => (fd, Direction::Write, false, true),
+        _ => return None,
+    };
+
+    Some(KqueueEvent {
+        key,
+        fd,
+        direction,
+        readable,
+        writable,
+    })
+}
+
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
+struct WakeupKind;
+
+#[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
+impl WakeupKind {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    fn register(&self, fd: &OwnedFd) -> io::Result<()> {
+        submit_changes(
+            fd,
+            &[kqueue::Event::new(
+                kqueue::EventFilter::User {
+                    ident: 0,
+                    flags: kqueue::UserFlags::empty(),
+                    user_flags: kqueue::UserDefinedFlags::new(0),
+                },
+                kqueue::EventFlags::ADD | kqueue::EventFlags::RECEIPT | kqueue::EventFlags::CLEAR,
+                usize::MAX as *mut std::ffi::c_void,
+            )],
+        )
+    }
+
+    fn reregister(&self, _fd: &OwnedFd) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn notify(&self, fd: &OwnedFd) -> io::Result<()> {
+        submit_changes(
+            fd,
+            &[kqueue::Event::new(
+                kqueue::EventFilter::User {
+                    ident: 0,
+                    flags: kqueue::UserFlags::TRIGGER,
+                    user_flags: kqueue::UserDefinedFlags::new(0),
+                },
+                kqueue::EventFlags::ADD | kqueue::EventFlags::RECEIPT,
+                usize::MAX as *mut std::ffi::c_void,
+            )],
+        )
+    }
+
+    fn deregister(&self, fd: &OwnedFd) -> io::Result<()> {
+        submit_changes(
+            fd,
+            &[kqueue::Event::new(
+                kqueue::EventFilter::User {
+                    ident: 0,
+                    flags: kqueue::UserFlags::empty(),
+                    user_flags: kqueue::UserDefinedFlags::new(0),
+                },
+                kqueue::EventFlags::DELETE | kqueue::EventFlags::RECEIPT,
+                usize::MAX as *mut std::ffi::c_void,
+            )],
+        )
+    }
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+struct WakeupKind {
+    read: std::os::unix::net::UnixStream,
+    write: std::os::unix::net::UnixStream,
+}
+
+#[cfg(any(target_os = "netbsd", target_os = "openbsd"))]
+impl WakeupKind {
+    fn new() -> io::Result<Self> {
+        let (read, write) = std::os::unix::net::UnixStream::pair()?;
+        read.set_nonblocking(true)?;
+        write.set_nonblocking(true)?;
+        Ok(Self { read, write })
+    }
+
+    fn register(&self, fd: &OwnedFd) -> io::Result<()> {
+        submit_changes(
+            fd,
+            &[readiness_change(
+                self.read.as_raw_fd(),
+                Direction::Read,
+                kqueue::EventFlags::ADD | kqueue::EventFlags::ONESHOT | kqueue::EventFlags::RECEIPT,
+                usize::MAX,
+            )],
+        )
+    }
+
+    fn reregister(&self, fd: &OwnedFd) -> io::Result<()> {
+        use io::Read;
+
+        let mut buffer = [0_u8; 64];
+        loop {
+            match (&self.read).read(&mut buffer) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {}
+                Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+                Err(err) => return Err(err),
+            }
+        }
+
+        self.register(fd)
+    }
+
+    fn notify(&self, _fd: &OwnedFd) -> io::Result<()> {
+        use io::Write;
+        (&self.write).write_all(&[1])
+    }
+
+    fn deregister(&self, fd: &OwnedFd) -> io::Result<()> {
+        submit_changes(
+            fd,
+            &[readiness_change(
+                self.read.as_raw_fd(),
+                Direction::Read,
+                kqueue::EventFlags::DELETE | kqueue::EventFlags::RECEIPT,
+                usize::MAX,
+            )],
+        )
+    }
+}
+
+/// Kqueue backend with a readiness-native lifecycle state machine.
+pub(crate) struct KqueueBackend {
+    kqueue: Kqueue,
+    ops: OpTable<Slot>,
+    /// Completions produced by blocking-pool workers (key, result).
+    blocking_done: Arc<Mutex<VecDeque<(OpKey, Completion)>>>,
 }
 
 impl KqueueBackend {
     pub(crate) fn new(capacity: usize) -> Result<Self> {
-        let raw_kqueue = unsafe { libc::kqueue() };
-        if raw_kqueue < 0 {
-            return Err(Error::last_os_error());
-        }
-
-        let backend = Self {
-            kqueue: Arc::new(KqueueWakeup {
-                fd: unsafe { OwnedFd::from_raw_fd(raw_kqueue) },
-                closed: AtomicBool::new(false),
-            }),
-            // `capacity` is configurable via the runtime builder's driver capacity.
+        Ok(Self {
+            kqueue: Kqueue::new(capacity)?,
             ops: OpTable::new(capacity)?,
-            events: vec![unsafe { std::mem::zeroed() }; capacity],
             blocking_done: Arc::new(Mutex::new(VecDeque::new())),
-        };
-
-        // Register a user event (EVFILT_USER) that can be triggered from any
-        // thread to wake a blocking kevent() call. This enables the remote task
-        // queue to promptly wake the runtime without a fixed timeout.
-        let ev = libc::kevent {
-            ident: WAKEUP_IDENT,
-            filter: libc::EVFILT_USER,
-            flags: libc::EV_ADD | libc::EV_CLEAR,
-            fflags: 0,
-            data: 0,
-            udata: WAKEUP_UDATA,
-        };
-        let result = unsafe { libc::kevent(raw_kqueue, &ev, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
-        if result < 0 {
-            return Err(Error::last_os_error());
-        }
-
-        Ok(backend)
+        })
     }
 
-    fn delete_interest(kqueue: RawFd, mut interest: Interest) {
-        interest.as_kevent_mut().flags = libc::EV_DELETE;
-
-        let kevent = [interest.0];
-
-        let _ = unsafe { libc::kevent(kqueue, kevent.as_ptr(), 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+    fn delete_interest(&self, key: OpKey, interest: Interest) {
+        let _ = self.kqueue.delete(interest, key);
     }
 
     fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
@@ -248,10 +521,8 @@ impl KqueueBackend {
             wakeup.wake();
         }))
     }
-}
 
-impl KqueueBackend {
-    pub(crate) fn submit_op<T: PollOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+    pub(crate) fn submit_op<T: KqueueOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
         let key = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
@@ -260,47 +531,40 @@ impl KqueueBackend {
         Ok(Op::<T>::new(key, data, handle))
     }
 
-    pub(crate) fn remove_op<T: PollOperation + 'static>(&mut self, op: &mut Op<T>) {
+    pub(crate) fn remove_op<T: KqueueOperation + 'static>(&mut self, op: &mut Op<T>) {
         let key = op.key();
-        let slot = match self.ops.get_mut(key) {
-            Some(val) => val,
-            None => {
-                // Op already dropped or removed
-                return;
-            }
+        let Some(slot) = self.ops.get_mut(key) else {
+            return;
         };
 
         match &slot.state {
             State::Submitted => {
-                // Never polled — no in-flight work and no produced resource.
                 self.ops.remove(key);
                 let _ = op.take_data();
             }
             State::Waiting(..) => {
                 if let Some(interest) = slot.interest.take() {
-                    // Register-path cancel: EV_DELETE is synchronous. The
-                    // non-blocking syscall has not produced a resource yet.
-                    Self::delete_interest(self.kqueue.as_raw_fd(), interest);
+                    // EV_DELETE is synchronous. The non-blocking syscall has
+                    // not produced a resource yet.
+                    self.delete_interest(key, interest);
                     self.ops.remove(key);
                     let _ = op.take_data();
                 } else {
-                    // Blocking-pool job still running. Keep payload so a late
-                    // completion can cleanup produced FDs (e.g. open).
+                    // A blocking-pool job still owns the operation payload so
+                    // late completion can clean up resources it produces.
                     let data = op.take_data().expect("op data missing on detach");
                     slot.state = State::Ignored(Box::new(data));
                 }
             }
             State::Completed(_) => {
-                // Completion already stored but never polled — cleanup now.
                 let slot = self.ops.remove(key).expect("completed operation disappeared");
                 if let State::Completed(completion) = slot.state
                     && let Some(data) = op.take_data()
                 {
-                    drop(PollOperation::complete(data, completion));
+                    drop(KqueueOperation::complete(data, completion));
                 }
             }
             State::Ready => {
-                // Ready to re-issue syscall; nothing produced yet.
                 self.ops.remove(key);
                 let _ = op.take_data();
             }
@@ -308,7 +572,7 @@ impl KqueueBackend {
         }
     }
 
-    pub(crate) fn poll_op<T: PollOperation + 'static>(
+    pub(crate) fn poll_op<T: KqueueOperation + 'static>(
         &mut self,
         op: &mut Op<T>,
         cx: &mut Context<'_>,
@@ -316,74 +580,47 @@ impl KqueueBackend {
         wakeup: &Wakeup,
     ) -> Poll<T::Output> {
         let key = op.key();
-
-        let Some(slot) = self.ops.get_mut(key) else {
-            // This means the op has already being removed. Should not happen in normal circumstances
-            unreachable!("invalid operation state")
+        let current_state = {
+            let slot = self.ops.get_mut(key).expect("invalid internal operation state");
+            std::mem::replace(&mut slot.state, State::Submitted)
         };
-
-        // Take the state out so we can freely mutate it and call kevent
-        // without overlapping mutable borrows of `self.ops`.
-        let current_state = std::mem::replace(&mut slot.state, State::Submitted);
 
         match current_state {
             State::Completed(completion) => {
-                let data = op.take_data().expect("Op data consumed");
-                let result = PollOperation::complete(data, completion);
+                let data = op.take_data().expect("op data consumed");
+                let result = KqueueOperation::complete(data, completion);
                 self.ops.remove(key);
                 Poll::Ready(result)
             }
             State::Ready | State::Submitted => {
-                // Kernel says ready (or first poll) → run the non-blocking syscall
-                // or dispatch blocking work to the pool.
-                let data = op.data_mut().expect("Op data consumed");
-
-                match PollOperation::attempt(data) {
-                    PollAttempt::Ready(completion) => {
-                        // Synchronous completion
-                        let data = op.take_data().expect("Op data consumed");
-                        let result = PollOperation::complete(data, completion);
+                let data = op.data_mut().expect("op data consumed");
+                match KqueueOperation::attempt(data) {
+                    KqueueAttempt::Ready(completion) => {
+                        let data = op.take_data().expect("op data consumed");
+                        let result = KqueueOperation::complete(data, completion);
                         self.ops.remove(key);
                         Poll::Ready(result)
                     }
-
-                    PollAttempt::Register(mut interest) => {
-                        // Would-block → register and park
-                        interest.as_kevent_mut().udata = key.raw() as *mut libc::c_void;
-
-                        let kevent = [interest.0];
-                        let res = unsafe {
-                            libc::kevent(
-                                self.kqueue.as_raw_fd(),
-                                kevent.as_ptr(),
-                                1,
-                                std::ptr::null_mut(),
-                                0,
-                                std::ptr::null(),
-                            )
-                        };
-
-                        // This means registering the kevent errored out.
-                        // In that case, we get the error and mark the op as completed with error
-                        if res < 0 {
-                            let err = std::io::Error::last_os_error();
-                            let data = op.take_data().expect("Op data consumed");
-                            let result = PollOperation::complete(data, Completion { result: Err(err) });
+                    KqueueAttempt::Register(interest) => {
+                        if let Err(error) = self.kqueue.arm(interest, key) {
+                            let data = op.take_data().expect("op data consumed");
+                            let result = KqueueOperation::complete(data, Completion { result: Err(error) });
                             self.ops.remove(key);
                             return Poll::Ready(result);
                         }
 
+                        let slot = self.ops.get_mut(key).expect("operation removed while registering");
                         slot.interest = Some(interest);
                         slot.state = State::Waiting(cx.waker().clone());
                         Poll::Pending
                     }
-
-                    PollAttempt::Blocking(job) => {
+                    KqueueAttempt::Blocking(job) => {
+                        let slot = self.ops.get_mut(key).expect("operation removed while dispatching");
                         slot.state = State::Waiting(cx.waker().clone());
                         if let Err(error) = self.push_blocking(key, job, blocking, wakeup) {
-                            let data = op.take_data().expect("Op data consumed");
+                            let data = op.take_data().expect("op data consumed");
                             self.ops.remove(key);
-                            Poll::Ready(PollOperation::complete(data, Completion { result: Err(error) }))
+                            Poll::Ready(KqueueOperation::complete(data, Completion { result: Err(error) }))
                         } else {
                             Poll::Pending
                         }
@@ -391,96 +628,35 @@ impl KqueueBackend {
                 }
             }
             State::Waiting(mut waker) => {
-                // Keep waiting for the event, but make sure readiness wakes
-                // the currently polling task if the future moved executors.
                 if !waker.will_wake(cx.waker()) {
                     waker.clone_from(cx.waker());
                 }
-
-                slot.state = State::Waiting(waker);
+                self.ops.get_mut(key).expect("operation removed while waiting").state = State::Waiting(waker);
                 Poll::Pending
             }
-            // The op has been ignored/cancelled by the caller. It should not be polled again
-            State::Ignored(..) => {
-                unreachable!("invalid operation")
-            }
+            State::Ignored(..) => unreachable!("invalid operation state"),
         }
     }
 
     pub(crate) fn submit(&mut self) -> Result<()> {
-        // kqueue has no batched submission queue — everything is done synchronously in poll_op.
+        // kqueue has no batched submission queue; registration happens in poll_op.
         Ok(())
     }
 
     pub(crate) fn wait(&mut self) -> Result<usize> {
-        let n = unsafe {
-            libc::kevent(
-                self.kqueue.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                self.events.as_mut_ptr(),
-                // Use capacity, not len. `dispatch_completions` clears the vec (len = 0) after each round;
-                // kevent with nevents=0 returns immediately and would busy-spin.
-                self.events.capacity() as i32,
-                std::ptr::null(), // infinite timeout
-            )
-        };
-
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(0); // common in reactors — just retry
-            }
-            return Err(err);
-        }
-
-        let n = n as usize;
-        // Since the buffer is written to by the kernel, Vec does not know its new length
-        // So we set length to the number of events the kernel reported
-        unsafe {
-            self.events.set_len(n);
-        };
-        Ok(n)
+        self.kqueue.wait(None)
     }
 
     pub(crate) fn wait_with_duration(&mut self, duration: Duration) -> Result<usize> {
-        let timeout = duration_to_timespec(duration);
-        let n = unsafe {
-            libc::kevent(
-                self.kqueue.as_raw_fd(),
-                std::ptr::null(),
-                0,
-                self.events.as_mut_ptr(),
-                // Use capacity, not len. `dispatch_completions` clears the vec (len = 0) after each round;
-                // kevent with nevents=0 returns immediately and would busy-spin.
-                self.events.capacity() as i32,
-                &timeout,
-            )
-        };
-
-        if n < 0 {
-            let err = std::io::Error::last_os_error();
-            if err.kind() == std::io::ErrorKind::Interrupted {
-                return Ok(0);
-            }
-            return Err(err);
-        }
-
-        let n = n as usize;
-        // Since the buffer is written to by the kernel, Vec does not know its new length
-        // So we set length to the number of events the kernel reported
-        unsafe {
-            self.events.set_len(n);
-        };
-        Ok(n)
+        self.kqueue.wait(Some(duration))
     }
 
     pub(crate) fn drain_blocking_completions(&mut self) {
-        // Called by the runtime after wait* (see Runtime::block_on).
         let completions: Vec<_> = {
             let mut pending = self.blocking_done.lock().unwrap_or_else(|e| e.into_inner());
             pending.drain(..).collect()
         };
+
         let mut wakeups = Vec::new();
         for (key, completion) in completions {
             if let Some(slot) = self.ops.get_mut(key) {
@@ -499,61 +675,86 @@ impl KqueueBackend {
     }
 
     pub(crate) fn dispatch_completions(&mut self) -> Result<()> {
+        let events: Vec<_> = self.kqueue.events().collect();
         let mut wakeups = Vec::new();
-        for event in &self.events {
-            // Cross-thread wakeup (EVFILT_USER) — not an I/O op.
-            if event.filter == libc::EVFILT_USER {
+
+        for event in events {
+            // A deleted registration can still be present in the userspace
+            // event batch. Validate both generation and descriptor/filter
+            // before consuming the operation's current interest.
+            if !self.is_current_interest(event.key, event.fd, event.direction) {
                 continue;
             }
 
-            let Some(key) = OpKey::from_raw(event.udata as usize) else {
-                continue;
-            };
+            self.mark_ready(event.key, event.fd, event.direction, &mut wakeups);
 
-            if let Some(slot) = self.ops.get_mut(key) {
-                // Only Register-path ops install interest. Blocking-pool ops leave
-                // interest as None; a wake packet must never call `ready()` on them
-                // (especially after they are already `Completed`).
-                let Some(interest) = slot.interest.as_ref() else {
-                    continue;
-                };
-
-                // A deleted registration can still leave a stale event in
-                // the userspace batch. Only consume events matching the
-                // descriptor/filter currently installed in this slot.
-                if !interest.matches(event) {
-                    continue;
-                }
-                let _ = slot.interest.take();
-
-                let (should_drop, waker) = slot.state.ready();
-                if let Some(waker) = waker {
-                    wakeups.push(waker);
-                }
-                if should_drop {
-                    self.ops.remove(key);
+            // EOF on a read filter means the descriptor cannot make useful
+            // progress for a pending write either. Wake the independently
+            // registered write operation so its syscall can observe EPIPE or
+            // the platform's terminal result. Its own descriptor/filter is
+            // validated before it is transitioned.
+            if event.readable && event.writable {
+                let write_key = self.ops.iter().find_map(|(key, slot)| {
+                    (slot.interest == Some(Interest::new(event.fd, Direction::Write))).then_some(key)
+                });
+                if let Some(write_key) = write_key {
+                    self.mark_ready(write_key, event.fd, Direction::Write, &mut wakeups);
                 }
             }
-            // else: event belongs to a canceled op → ignore (safe)
         }
 
-        // All completions have been processed, so we clear the vec for the next round
-        // Note: This does not deallocate the vec, so we still have the existing capacity
-        self.events.clear();
+        // Kqueue's event storage retains capacity while the next wait fills it.
+        self.kqueue.events.clear();
         for waker in wakeups {
             waker.wake();
         }
         Ok(())
     }
 
+    fn is_current_interest(&mut self, key: OpKey, fd: RawFd, direction: Direction) -> bool {
+        self.ops
+            .get_mut(key)
+            .and_then(|slot| slot.interest)
+            .is_some_and(|interest| interest == Interest::new(fd, direction))
+    }
+
+    fn mark_ready(&mut self, key: OpKey, fd: RawFd, direction: Direction, wakeups: &mut Vec<Waker>) {
+        let Some(slot) = self.ops.get_mut(key) else {
+            return;
+        };
+        if slot.interest != Some(Interest::new(fd, direction)) {
+            return;
+        }
+        let _ = slot.interest.take();
+
+        let (should_drop, waker) = slot.state.ready();
+        if let Some(waker) = waker {
+            wakeups.push(waker);
+        }
+        if should_drop {
+            self.ops.remove(key);
+        }
+    }
+
     pub(crate) fn create_wakeup(&self) -> Wakeup {
-        let wakeup = Arc::clone(&self.kqueue);
-        crate::driver::Wakeup::new(move || wakeup.wake())
+        let wakeup = self.kqueue.wakeup();
+        Wakeup::new(move || wakeup.wake())
     }
 
     pub(crate) fn attach(&self, _fd: RawFd) -> Result<()> {
-        // No-op on kqueue: handles don't need explicit registration.
         Ok(())
+    }
+}
+
+#[cfg(test)]
+impl Interest {
+    fn matches_event(self, event: KqueueEvent) -> bool {
+        self.fd == event.fd
+            && self.direction == event.direction
+            && match self.direction {
+                Direction::Read => event.readable,
+                Direction::Write => event.writable,
+            }
     }
 }
 
@@ -565,29 +766,40 @@ impl AsRawFd for KqueueBackend {
 
 impl Drop for KqueueBackend {
     fn drop(&mut self) {
-        self.kqueue.close();
-        // Cancel any still-registered interests synchronously.
-        // This is the kqueue equivalent of submitting `AsyncCancel` in io_uring.
-        // (EV_DELETE is immediate and safe even if the event has already fired.)
-        for (_, slot) in self.ops.iter_mut() {
-            if let Some(interest) = slot.interest.take() {
-                Self::delete_interest(self.kqueue.as_raw_fd(), interest);
+        self.kqueue.close_wakeup();
+
+        // Readiness deletion is synchronous, so no kernel-owned operation
+        // state survives the table clear. Keep this pass separate from the
+        // mutable table borrow to make the ownership boundary obvious.
+        let interests: Vec<_> = self
+            .ops
+            .iter_mut()
+            .filter_map(|(key, slot)| slot.interest.take().map(|interest| (key, interest)))
+            .collect();
+        for (key, interest) in interests {
+            self.delete_interest(key, interest);
+        }
+
+        // The blocking pool is dropped before the driver by Runtime, so any
+        // jobs that completed during pool shutdown are already in this queue.
+        // Apply them before removing detached payloads, otherwise a successful
+        // open/accept result could be dropped without running its typed cleanup.
+        self.drain_blocking_completions();
+
+        let leftovers: Vec<_> = self.ops.iter().map(|(key, _)| key).collect();
+        for key in leftovers {
+            let Some(slot) = self.ops.remove(key) else {
+                continue;
+            };
+            if let State::Ignored(payload) = slot.state {
+                payload.cleanup(Completion {
+                    result: Err(Error::other("kqueue backend shut down before operation completion")),
+                });
             }
         }
 
-        // We can simply clear the slab now.
-        // Unlike io_uring, the kernel no longer owns any resources associated with these indexes after EV_DELETE.
         self.ops.clear();
-
-        // Final sanity check
-        debug_assert!(self.ops.is_empty(), "kqueue driver shutdown left ops in the slab");
-    }
-}
-
-fn duration_to_timespec(duration: Duration) -> libc::timespec {
-    libc::timespec {
-        tv_sec: duration.as_secs().min(libc::time_t::MAX as u64) as libc::time_t,
-        tv_nsec: duration.subsec_nanos() as libc::c_long,
+        debug_assert!(self.ops.is_empty(), "kqueue driver shutdown left ops in the table");
     }
 }
 
@@ -602,11 +814,11 @@ mod tests {
 
     struct CleanupMarker(Arc<AtomicBool>);
 
-    impl PollOperation for CleanupMarker {
+    impl KqueueOperation for CleanupMarker {
         type Output = ();
 
-        fn attempt(&mut self) -> PollAttempt {
-            PollAttempt::Ready(Completion { result: Ok(0) })
+        fn attempt(&mut self) -> KqueueAttempt {
+            KqueueAttempt::Ready(Completion { result: Ok(0) })
         }
 
         fn complete(self, _completion: Completion) -> Self::Output {
@@ -649,5 +861,130 @@ mod tests {
         waker.expect("waiting state should return its waker").wake();
         assert!(woken.load(Ordering::SeqCst));
         assert!(matches!(state, State::Ready));
+    }
+
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    mod kqueue_tests {
+        use super::*;
+        use rustix::io::{FdFlags, fcntl_getfd};
+        use std::{io::Write, os::fd::AsRawFd, os::unix::net::UnixStream};
+
+        fn test_key() -> OpKey {
+            OpTable::new(1).unwrap().insert(()).unwrap()
+        }
+
+        #[test]
+        fn queue_is_close_on_exec() {
+            let queue = Kqueue::new(8).expect("create kqueue");
+            let flags = fcntl_getfd(&queue).expect("read descriptor flags");
+            assert!(flags.contains(FdFlags::CLOEXEC));
+        }
+
+        #[test]
+        fn readiness_event_round_trips_key_and_descriptor() {
+            let mut queue = Kqueue::new(8).expect("create kqueue");
+            let (reader, mut writer) = UnixStream::pair().expect("create socket pair");
+            reader.set_nonblocking(true).unwrap();
+            writer.set_nonblocking(true).unwrap();
+            let key = test_key();
+
+            queue
+                .arm(Interest::new(reader.as_raw_fd(), Direction::Read), key)
+                .unwrap();
+            writer.write_all(&[1]).unwrap();
+            assert!(queue.wait(Some(Duration::from_secs(1))).unwrap() > 0);
+            assert!(
+                queue
+                    .events()
+                    .any(|event| { event.key == key && event.fd == reader.as_raw_fd() && event.readable })
+            );
+        }
+
+        #[test]
+        fn missing_filter_delete_is_benign() {
+            let queue = Kqueue::new(8).expect("create kqueue");
+            let (reader, _) = UnixStream::pair().unwrap();
+            queue
+                .delete(Interest::new(reader.as_raw_fd(), Direction::Read), test_key())
+                .unwrap();
+        }
+
+        #[test]
+        fn stale_descriptor_and_filter_events_are_rejected() {
+            let interest = Interest::new(17, Direction::Read);
+            let key = test_key();
+
+            assert!(!interest.matches_event(KqueueEvent {
+                key,
+                fd: 18,
+                direction: Direction::Read,
+                readable: true,
+                writable: false,
+            }));
+            assert!(!interest.matches_event(KqueueEvent {
+                key,
+                fd: 17,
+                direction: Direction::Write,
+                readable: false,
+                writable: true,
+            }));
+        }
+
+        #[test]
+        fn read_eof_also_releases_pending_write_interest() {
+            let mut backend = KqueueBackend::new(8).expect("create backend");
+            let read_key = backend
+                .ops
+                .insert(Slot {
+                    state: State::Waiting(std::task::Waker::noop().clone()),
+                    interest: Some(Interest::new(42, Direction::Read)),
+                })
+                .unwrap();
+            let write_key = backend
+                .ops
+                .insert(Slot {
+                    state: State::Waiting(std::task::Waker::noop().clone()),
+                    interest: Some(Interest::new(42, Direction::Write)),
+                })
+                .unwrap();
+
+            backend.kqueue.events.push(kqueue::Event::new(
+                kqueue::EventFilter::Read(42),
+                kqueue::EventFlags::EOF,
+                read_key.raw() as *mut std::ffi::c_void,
+            ));
+            backend.dispatch_completions().unwrap();
+
+            assert!(backend.ops.get_mut(read_key).unwrap().interest.is_none());
+            assert!(backend.ops.get_mut(write_key).unwrap().interest.is_none());
+            assert!(matches!(backend.ops.get_mut(read_key).unwrap().state, State::Ready));
+            assert!(matches!(backend.ops.get_mut(write_key).unwrap().state, State::Ready));
+        }
+
+        #[test]
+        fn repeated_wakeups_are_coalesced() {
+            let mut queue = Kqueue::new(8).expect("create kqueue");
+            let wakeup = queue.wakeup();
+            wakeup.wake();
+            wakeup.wake();
+            assert!(queue.wait(Some(Duration::from_secs(1))).unwrap() > 0);
+            assert_eq!(queue.events().count(), 0);
+            assert_eq!(queue.wait(Some(Duration::ZERO)).unwrap(), 0);
+        }
+
+        #[test]
+        fn wake_after_close_is_a_no_op() {
+            let mut queue = Kqueue::new(8).expect("create kqueue");
+            let wakeup = queue.wakeup();
+            queue.close_wakeup();
+            wakeup.wake();
+            assert_eq!(queue.wait(Some(Duration::ZERO)).unwrap(), 0);
+        }
     }
 }

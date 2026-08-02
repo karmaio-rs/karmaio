@@ -5,8 +5,14 @@ use std::path::Path;
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
-#[cfg(target_os = "macos")]
-use crate::driver::backends::kqueue::{PollAttempt, PollOperation};
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::driver::helpers::cstr::{OsPath, cstr};
 use crate::driver::ops::{Completion, Op};
@@ -49,13 +55,21 @@ unsafe impl UringOperation for Hardlink {
     }
 }
 
-#[cfg(target_os = "macos")]
-impl PollOperation for Hardlink {
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+impl KqueueOperation for Hardlink {
     type Output = io::Result<()>;
-    fn attempt(&mut self) -> PollAttempt {
+    fn attempt(&mut self) -> KqueueAttempt {
         let original = self.original.clone();
         let link = self.link.clone();
-        macos_syscall_blocking!({ macos_syscall!(libc::link(original.as_c_str().as_ptr(), link.as_c_str().as_ptr(),)) })
+        kqueue_syscall_blocking!({
+            kqueue_syscall!(libc::link(original.as_c_str().as_ptr(), link.as_c_str().as_ptr(),))
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

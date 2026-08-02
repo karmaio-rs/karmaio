@@ -65,9 +65,23 @@ impl Interest {
 /// Results of attempting a kqueue operation on the runtime thread.
 pub(crate) enum KqueueAttempt {
     Ready(Completion),
-    Register(Interest),
+    Register {
+        interest: Interest,
+        on_ready: KqueueReadyAction,
+    },
     /// Offload a synchronous operation to the runtime blocking pool.
     Blocking(BlockingJob),
+}
+
+/// Action to perform when a registered kqueue filter becomes ready.
+///
+/// Most operations retry their nonblocking syscall. A nonblocking connect is
+/// different: writable readiness means that the connect reached a terminal
+/// state, whose result must be read from `SO_ERROR`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum KqueueReadyAction {
+    Retry,
+    CompleteSocketError,
 }
 
 /// Backend-local readiness operation protocol.
@@ -146,9 +160,15 @@ impl State {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct Registration {
+    interest: Interest,
+    on_ready: KqueueReadyAction,
+}
+
 struct Slot {
     state: State,
-    interest: Option<Interest>,
+    registration: Option<Registration>,
 }
 
 /// A decoded operation readiness event.
@@ -366,6 +386,19 @@ fn decode_event(event: &kqueue::Event) -> Option<KqueueEvent> {
     })
 }
 
+fn socket_error_completion(fd: RawFd) -> Completion {
+    // SAFETY: the operation's typed payload retains the descriptor while its
+    // registration is active. Stale events are rejected before this function
+    // is called, and cancellation synchronously removes active registrations.
+    let fd = unsafe { BorrowedFd::borrow_raw(fd) };
+    let result = match rustix::net::sockopt::socket_error(fd) {
+        Ok(Ok(())) => Ok(0),
+        Ok(Err(error)) => Err(io::Error::from(error)),
+        Err(error) => Err(io::Error::from(error)),
+    };
+    Completion { result }
+}
+
 #[cfg(any(target_os = "macos", target_os = "freebsd", target_os = "dragonfly"))]
 struct WakeupKind;
 
@@ -493,6 +526,7 @@ pub(crate) struct KqueueBackend {
     ops: OpTable<Slot>,
     /// Completions produced by blocking-pool workers (key, result).
     blocking_done: BlockingCompletionQueue,
+    shutting_down: bool,
 }
 
 impl KqueueBackend {
@@ -501,11 +535,18 @@ impl KqueueBackend {
             kqueue: Kqueue::new(capacity)?,
             ops: OpTable::new(capacity)?,
             blocking_done: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            shutting_down: false,
         })
     }
 
     fn delete_interest(&self, key: OpKey, interest: Interest) {
         let _ = self.kqueue.delete(interest, key);
+    }
+
+    fn has_interest(&self, interest: Interest) -> bool {
+        self.ops
+            .iter()
+            .any(|(_, slot)| slot.registration.map(|registration| registration.interest) == Some(interest))
     }
 
     fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
@@ -521,9 +562,13 @@ impl KqueueBackend {
     }
 
     pub(crate) fn submit_op<T: KqueueOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+        if self.shutting_down {
+            return Err(Error::new(io::ErrorKind::BrokenPipe, "kqueue backend is shutting down"));
+        }
+
         let key = self.ops.insert(Slot {
             state: State::Submitted,
-            interest: None,
+            registration: None,
         })?;
 
         Ok(Op::<T>::new(key, data, handle))
@@ -541,10 +586,10 @@ impl KqueueBackend {
                 let _ = op.take_data();
             }
             State::Waiting(..) => {
-                if let Some(interest) = slot.interest.take() {
+                if let Some(registration) = slot.registration.take() {
                     // EV_DELETE is synchronous. The non-blocking syscall has
                     // not produced a resource yet.
-                    self.delete_interest(key, interest);
+                    self.delete_interest(key, registration.interest);
                     self.ops.remove(key);
                     let _ = op.take_data();
                 } else {
@@ -599,7 +644,26 @@ impl KqueueBackend {
                         self.ops.remove(key);
                         Poll::Ready(result)
                     }
-                    KqueueAttempt::Register(interest) => {
+                    KqueueAttempt::Register { interest, on_ready } => {
+                        // kqueue identifies a filter only by `(fd, filter)`.
+                        // A second operation for the same pair would replace
+                        // the first operation's udata, so reject it before
+                        // issuing EV_ADD rather than silently losing a waiter.
+                        if self.has_interest(interest) {
+                            let data = op.take_data().expect("op data consumed");
+                            let result = KqueueOperation::complete(
+                                data,
+                                Completion {
+                                    result: Err(Error::new(
+                                        io::ErrorKind::AlreadyExists,
+                                        "kqueue descriptor/filter already has a waiter",
+                                    )),
+                                },
+                            );
+                            self.ops.remove(key);
+                            return Poll::Ready(result);
+                        }
+
                         if let Err(error) = self.kqueue.arm(interest, key) {
                             let data = op.take_data().expect("op data consumed");
                             let result = KqueueOperation::complete(data, Completion { result: Err(error) });
@@ -608,7 +672,7 @@ impl KqueueBackend {
                         }
 
                         let slot = self.ops.get_mut(key).expect("operation removed while registering");
-                        slot.interest = Some(interest);
+                        slot.registration = Some(Registration { interest, on_ready });
                         slot.state = State::Waiting(cx.waker().clone());
                         Poll::Pending
                     }
@@ -693,7 +757,9 @@ impl KqueueBackend {
             // validated before it is transitioned.
             if event.readable && event.writable {
                 let write_key = self.ops.iter().find_map(|(key, slot)| {
-                    (slot.interest == Some(Interest::new(event.fd, Direction::Write))).then_some(key)
+                    (slot.registration.map(|registration| registration.interest)
+                        == Some(Interest::new(event.fd, Direction::Write)))
+                    .then_some(key)
                 });
                 if let Some(write_key) = write_key {
                     self.mark_ready(write_key, event.fd, Direction::Write, &mut wakeups);
@@ -712,20 +778,26 @@ impl KqueueBackend {
     fn is_current_interest(&mut self, key: OpKey, fd: RawFd, direction: Direction) -> bool {
         self.ops
             .get_mut(key)
-            .and_then(|slot| slot.interest)
-            .is_some_and(|interest| interest == Interest::new(fd, direction))
+            .and_then(|slot| slot.registration)
+            .is_some_and(|registration| registration.interest == Interest::new(fd, direction))
     }
 
     fn mark_ready(&mut self, key: OpKey, fd: RawFd, direction: Direction, wakeups: &mut Vec<Waker>) {
         let Some(slot) = self.ops.get_mut(key) else {
             return;
         };
-        if slot.interest != Some(Interest::new(fd, direction)) {
+        let Some(registration) = slot.registration else {
+            return;
+        };
+        if registration.interest != Interest::new(fd, direction) {
             return;
         }
-        let _ = slot.interest.take();
 
-        let (should_drop, waker) = slot.state.ready();
+        slot.registration = None;
+        let (should_drop, waker) = match registration.on_ready {
+            KqueueReadyAction::Retry => slot.state.ready(),
+            KqueueReadyAction::CompleteSocketError => slot.state.complete(socket_error_completion(fd)),
+        };
         if let Some(waker) = waker {
             wakeups.push(waker);
         }
@@ -760,6 +832,19 @@ impl AsRawFd for KqueueBackend {
 
 impl Drop for KqueueBackend {
     fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+impl KqueueBackend {
+    /// Stop accepting work, remove readiness filters, and release detached
+    /// blocking-operation payloads. Runtime teardown calls this explicitly
+    /// after the blocking pool has joined; `Drop` is the final backstop.
+    pub(crate) fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
         self.kqueue.close_wakeup();
 
         // Readiness deletion is synchronous, so no kernel-owned operation
@@ -768,15 +853,19 @@ impl Drop for KqueueBackend {
         let interests: Vec<_> = self
             .ops
             .iter_mut()
-            .filter_map(|(key, slot)| slot.interest.take().map(|interest| (key, interest)))
+            .filter_map(|(key, slot)| {
+                slot.registration
+                    .take()
+                    .map(|registration| (key, registration.interest))
+            })
             .collect();
         for (key, interest) in interests {
             self.delete_interest(key, interest);
         }
 
-        // The blocking pool is dropped before the driver by Runtime, so any
-        // jobs that completed during pool shutdown are already in this queue.
-        // Apply them before removing detached payloads, otherwise a successful
+        // Runtime joins the blocking pool before this phase, so any jobs that
+        // completed during pool shutdown are already in this queue. Apply
+        // them before removing detached payloads, otherwise a successful
         // open/accept result could be dropped without running its typed cleanup.
         self.drain_blocking_completions();
 
@@ -931,20 +1020,53 @@ mod tests {
         }
 
         #[test]
+        fn socket_error_completion_reports_getsockopt_failures() {
+            let file = std::fs::File::open("/dev/null").expect("open test descriptor");
+            let completion = socket_error_completion(file.as_raw_fd());
+            assert!(completion.result.is_err());
+        }
+
+        #[test]
+        fn duplicate_descriptor_filter_waiters_are_detected() {
+            let mut backend = KqueueBackend::new(8).expect("create backend");
+            let interest = Interest::new(42, Direction::Read);
+            backend
+                .ops
+                .insert(Slot {
+                    state: State::Waiting(std::task::Waker::noop().clone()),
+                    registration: Some(Registration {
+                        interest,
+                        on_ready: KqueueReadyAction::Retry,
+                    }),
+                })
+                .unwrap();
+
+            assert!(backend.has_interest(interest));
+            assert!(!backend.has_interest(Interest::new(42, Direction::Write)));
+            assert!(!backend.has_interest(Interest::new(43, Direction::Read)));
+        }
+
+        #[test]
         fn read_eof_also_releases_pending_write_interest() {
             let mut backend = KqueueBackend::new(8).expect("create backend");
             let read_key = backend
                 .ops
                 .insert(Slot {
                     state: State::Waiting(std::task::Waker::noop().clone()),
-                    interest: Some(Interest::new(42, Direction::Read)),
+                    registration: Some(Registration {
+                        interest: Interest::new(42, Direction::Read),
+                        on_ready: KqueueReadyAction::Retry,
+                    }),
                 })
                 .unwrap();
             let write_key = backend
                 .ops
                 .insert(Slot {
                     state: State::Waiting(std::task::Waker::noop().clone()),
-                    interest: Some(Interest::new(42, Direction::Write)),
+                    registration: Some(Registration {
+                        interest: Interest::new(42, Direction::Write),
+                        on_ready: KqueueReadyAction::Retry,
+                    }),
                 })
                 .unwrap();
 
@@ -955,8 +1077,8 @@ mod tests {
             ));
             backend.dispatch_completions().unwrap();
 
-            assert!(backend.ops.get_mut(read_key).unwrap().interest.is_none());
-            assert!(backend.ops.get_mut(write_key).unwrap().interest.is_none());
+            assert!(backend.ops.get_mut(read_key).unwrap().registration.is_none());
+            assert!(backend.ops.get_mut(write_key).unwrap().registration.is_none());
             assert!(matches!(backend.ops.get_mut(read_key).unwrap().state, State::Ready));
             assert!(matches!(backend.ops.get_mut(write_key).unwrap().state, State::Ready));
         }

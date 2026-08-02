@@ -104,19 +104,26 @@ pub(crate) enum IocpSubmission {
     Blocking(BlockingJob),
 }
 
+#[inline]
+fn cancel_error_is_already_complete(error: &Error) -> bool {
+    error.raw_os_error() == Some(ERROR_NOT_FOUND as i32)
+}
+
 fn cancel_pending(interest: &Interest) {
     let result = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
 
     if result == 0 {
         let error = Error::last_os_error();
-        // ERROR_NOT_FOUND means the request has already completed or Windows
-        // has already queued its terminal packet. In both cases the slot must
-        // remain alive until dispatch_completions observes that packet.
-        debug_assert_eq!(
-            error.raw_os_error(),
-            Some(ERROR_NOT_FOUND as i32),
-            "CancelIoEx failed: {error}"
-        );
+        if cancel_error_is_already_complete(&error) {
+            // The request already completed or its terminal packet is queued.
+            // Keep the slot until that packet is dispatched.
+        } else {
+            // Cancellation is best effort. The detached operation remains in
+            // the backend slot, including its OVERLAPPED and payload, so a
+            // non-benign failure cannot turn into a use-after-free. The
+            // eventual completion packet is still the ownership boundary.
+            return;
+        }
     }
 }
 
@@ -352,6 +359,7 @@ pub(crate) struct IocpBackend {
     entries: Vec<OVERLAPPED_ENTRY>,
     /// Completions produced by blocking-pool workers (index, result).
     blocking_done: BlockingCompletionQueue,
+    shutting_down: bool,
 }
 
 impl IocpBackend {
@@ -374,6 +382,7 @@ impl IocpBackend {
             pending_by_overlapped: HashMap::with_capacity(capacity),
             entries: vec![unsafe { std::mem::zeroed() }; capacity],
             blocking_done: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
+            shutting_down: false,
         })
     }
 
@@ -391,6 +400,13 @@ impl IocpBackend {
 
 impl IocpBackend {
     pub(crate) fn submit_op<T: IocpOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+        if self.shutting_down {
+            return Err(Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "IOCP backend is shutting down",
+            ));
+        }
+
         let key = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
@@ -634,8 +650,17 @@ impl IocpBackend {
     }
 }
 
-impl Drop for IocpBackend {
-    fn drop(&mut self) {
+impl IocpBackend {
+    /// Stop accepting work, cancel pending overlapped requests, and drain the
+    /// completion port until every kernel-owned operation is released.
+    ///
+    /// Runtime teardown calls this explicitly after the blocking pool has
+    /// joined. `Drop` remains as a final backstop for standalone backend use.
+    pub(crate) fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
+        self.shutting_down = true;
         self.wakeup.close();
         for (_, slot) in self.ops.iter_mut() {
             match slot.state {
@@ -645,7 +670,7 @@ impl Drop for IocpBackend {
                     // Preserve an existing Ignored cleanup when present; otherwise
                     // install Detached (Op::drop should already have moved data).
                     if let Some(interest) = slot.interest.as_ref() {
-                        let _ = unsafe { CancelIoEx(interest.handle(), interest.as_ptr()) };
+                        cancel_pending(interest);
                     }
                     if !matches!(slot.state, State::Ignored(..)) {
                         slot.state = State::Ignored(Box::new(Detached));
@@ -677,6 +702,12 @@ impl Drop for IocpBackend {
         }
 
         self.ops.clear();
+    }
+}
+
+impl Drop for IocpBackend {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -750,5 +781,17 @@ mod tests {
 
         assert!(!state.complete(Completion { result: Ok(0) }).0);
         assert!(woken.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn only_not_found_is_a_benign_cancel_race() {
+        use windows_sys::Win32::Foundation::ERROR_INVALID_HANDLE;
+
+        assert!(cancel_error_is_already_complete(&Error::from_raw_os_error(
+            ERROR_NOT_FOUND as i32
+        )));
+        assert!(!cancel_error_is_already_complete(&Error::from_raw_os_error(
+            ERROR_INVALID_HANDLE as i32
+        )));
     }
 }

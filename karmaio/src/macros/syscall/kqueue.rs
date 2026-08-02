@@ -27,9 +27,22 @@ macro_rules! __kqueue_syscall_ready {
 
 macro_rules! __kqueue_syscall_register {
     ($fd:expr, $filter:expr) => {
-        return $crate::driver::backends::kqueue::KqueueAttempt::Register(
-            $crate::driver::backends::kqueue::Interest::new($fd, $filter),
-        )
+        return $crate::driver::backends::kqueue::KqueueAttempt::Register {
+            interest: $crate::driver::backends::kqueue::Interest::new($fd, $filter),
+            on_ready: $crate::driver::backends::kqueue::KqueueReadyAction::Retry,
+        }
+    };
+}
+
+macro_rules! __kqueue_syscall_register_connect {
+    ($fd:expr) => {
+        return $crate::driver::backends::kqueue::KqueueAttempt::Register {
+            interest: $crate::driver::backends::kqueue::Interest::new(
+                $fd,
+                $crate::driver::backends::kqueue::Direction::Write,
+            ),
+            on_ready: $crate::driver::backends::kqueue::KqueueReadyAction::CompleteSocketError,
+        }
     };
 }
 
@@ -58,8 +71,8 @@ macro_rules! kqueue_syscall_blocking {
 /// Retry a syscall on `EINTR` and return a `KqueueAttempt`.
 ///
 /// The non-blocking form registers a one-shot kqueue filter on `EAGAIN`/`WouldBlock`.
-/// The `connect` form treats `EISCONN` as success and registers a write filter while
-/// the connection is in progress.
+/// The `connect` form treats `EISCONN` as success and registers a write filter
+/// whose readiness result is read from `SO_ERROR`.
 macro_rules! kqueue_syscall_submit {
     ($block:block) => {
         kqueue_syscall_submit!(@loop $block)
@@ -109,7 +122,7 @@ macro_rules! kqueue_syscall_submit {
                     if err.raw_os_error() == Some(libc::EINPROGRESS)
                         || err.kind() == std::io::ErrorKind::WouldBlock =>
                 {
-                    __kqueue_syscall_register!($fd, $crate::driver::backends::kqueue::Direction::Write);
+                    __kqueue_syscall_register_connect!($fd);
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(err) => __kqueue_syscall_ready!(Err(err)),

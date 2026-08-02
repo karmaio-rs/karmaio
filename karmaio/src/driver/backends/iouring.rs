@@ -184,6 +184,13 @@ impl IoUringBackend {
 
 impl IoUringBackend {
     pub(crate) fn submit_op<T: UringOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+        if self.shutting_down {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "io_uring backend is shutting down",
+            ));
+        }
+
         // Allocate a new entry in the driver
         let key = self.ops.insert(State::Submitted)?;
 
@@ -391,8 +398,16 @@ impl AsRawFd for IoUringBackend {
 // but this should only be possible in the case of [`std::process::exit`].
 //
 // This depends on us knowing when ops are completed and done firing.
-impl Drop for IoUringBackend {
-    fn drop(&mut self) {
+impl IoUringBackend {
+    /// Stop accepting work, cancel in-flight requests, and drain their CQEs
+    /// before releasing kernel-visible buffers and operation payloads.
+    ///
+    /// Runtime teardown calls this explicitly after the blocking pool has
+    /// joined. `Drop` remains as a final backstop for standalone backend use.
+    pub(crate) fn shutdown(&mut self) {
+        if self.shutting_down {
+            return;
+        }
         self.shutting_down = true;
         self.eventfd.close();
 
@@ -496,6 +511,12 @@ impl Drop for IoUringBackend {
 
         // Final sanity check, any ops must be in complete state
         assert!(self.ops.iter().all(|(_, state)| matches!(state, State::Completed(..))));
+    }
+}
+
+impl Drop for IoUringBackend {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 

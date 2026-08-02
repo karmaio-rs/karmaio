@@ -117,6 +117,13 @@ impl Driver {
         self.backend.borrow_mut().drain_blocking_completions();
     }
 
+    /// Complete the platform shutdown phase after the blocking pool has
+    /// stopped producing work. This keeps backend cleanup independent of Rust
+    /// field-drop order and leaves `Drop` as an idempotent backstop.
+    pub(crate) fn shutdown(&self) {
+        self.backend.borrow_mut().shutdown();
+    }
+
     /// Apply platform I/O completions (kevent / IOCP / io_uring CQEs).
     pub(crate) fn dispatch_completions(&self) -> io::Result<()> {
         self.backend.borrow_mut().dispatch_completions()

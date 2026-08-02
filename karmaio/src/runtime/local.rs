@@ -56,6 +56,7 @@ scoped_thread_local!(pub(crate) static CURRENT_TIMER: Rc<RefCell<Timer>>);
 pub struct Runtime {
     pub(crate) scheduler: Scheduler,
     pub(crate) timer: Rc<RefCell<Timer>>,
+    /// Joined before the driver performs its final platform cleanup.
     _blocking: BlockingPool,
     pub(crate) driver: Driver,
 }
@@ -72,6 +73,10 @@ impl Drop for Runtime {
         // Drain the final batch before backend Drop performs platform cleanup.
         self._blocking.shutdown_and_join();
         self.driver.drain_blocking_completions();
+
+        // The backend is now the final owner of platform I/O state. Shut it
+        // down explicitly rather than relying on struct field-drop order.
+        self.driver.shutdown();
     }
 }
 

@@ -60,7 +60,7 @@ impl Metadata {
 
 impl MetadataExt for Metadata {
     fn dev(&self) -> u64 {
-        libc::makedev(self.statx.stx_dev_major, self.statx.stx_dev_minor) as u64
+        rustix::fs::makedev(self.statx.stx_dev_major, self.statx.stx_dev_minor) as u64
     }
 
     fn ino(&self) -> u64 {
@@ -84,7 +84,7 @@ impl MetadataExt for Metadata {
     }
 
     fn rdev(&self) -> u64 {
-        libc::makedev(self.statx.stx_rdev_major, self.statx.stx_rdev_minor) as u64
+        rustix::fs::makedev(self.statx.stx_rdev_major, self.statx.stx_rdev_minor) as u64
     }
 
     fn size(&self) -> u64 {

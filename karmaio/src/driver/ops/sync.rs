@@ -77,7 +77,12 @@ impl KqueueOperation for Sync {
     fn attempt(&mut self) -> KqueueAttempt {
         // Capture a raw fd (Send); SharedIoHandle stays on the op for the lifetime of the future.
         let fd = self.handle.raw_fd();
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::fsync(fd)) })
+        kqueue_syscall_blocking!({
+            // Safety: the operation retains the owning file handle until this
+            // blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            rustix::fs::fsync(fd).map(|()| 0_u32).map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

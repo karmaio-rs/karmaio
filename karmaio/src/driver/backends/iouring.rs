@@ -1,4 +1,4 @@
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::{
     io::Result,
     pin::Pin,
@@ -12,6 +12,8 @@ use std::{
 
 use io_uring::opcode::AsyncCancel;
 use io_uring::{IoUring, squeue};
+use rustix::event::{EventfdFlags, eventfd};
+use rustix::io::write;
 
 use crate::driver::ops::{Completion, Op};
 use crate::driver::ops::{OpKey, OpTable};
@@ -103,13 +105,7 @@ impl EventFdWakeup {
         }
 
         let val: u64 = 1;
-        let _ = unsafe {
-            libc::write(
-                self.fd.as_raw_fd(),
-                &val as *const u64 as *const libc::c_void,
-                std::mem::size_of::<u64>(),
-            )
-        };
+        let _ = write(&self.fd, &val.to_ne_bytes());
     }
 
     fn close(&self) {
@@ -137,16 +133,10 @@ pub(crate) struct IoUringBackend {
 
 impl IoUringBackend {
     pub(crate) fn new(capacity: usize) -> Result<Self> {
-        let eventfd = unsafe {
-            let fd = libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK);
-            if fd < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Arc::new(EventFdWakeup {
-                fd: OwnedFd::from_raw_fd(fd),
-                closed: AtomicBool::new(false),
-            })
-        };
+        let eventfd = Arc::new(EventFdWakeup {
+            fd: eventfd(0, EventfdFlags::CLOEXEC | EventfdFlags::NONBLOCK)?,
+            closed: AtomicBool::new(false),
+        });
 
         let wakeup_buf = Box::pin([0u8; 8]);
 

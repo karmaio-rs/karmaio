@@ -1,5 +1,13 @@
 use std::{io, net::SocketAddr};
 
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use std::os::fd::OwnedFd;
 #[cfg(windows)]
 use std::os::windows::io::RawSocket;
 
@@ -32,17 +40,25 @@ const ACCEPT_ADDR_BUF_LEN: usize = ACCEPT_ADDR_LEN as usize * 2;
 
 pub(crate) struct Accept {
     io_handle: SharedIoHandle<socket2::Socket>,
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     socketaddr: Box<(libc::sockaddr_storage, libc::socklen_t)>,
     #[cfg(windows)]
     accepted_socket: Option<RawSocket>,
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    accepted: Option<(OwnedFd, Option<rustix::net::SocketAddrAny>)>,
     #[cfg(windows)]
     socketaddr: Box<[u8; ACCEPT_ADDR_BUF_LEN]>,
 }
 
 impl Op<Accept> {
     pub(crate) fn accept(io_handle: &SharedIoHandle<socket2::Socket>) -> io::Result<Self> {
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         let socketaddr = Box::new((
             unsafe { std::mem::zeroed() },
             std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t,
@@ -55,6 +71,15 @@ impl Op<Accept> {
             io_handle: io_handle.clone(),
             #[cfg(windows)]
             accepted_socket: None,
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            accepted: None,
+            #[cfg(any(target_os = "linux", windows))]
             socketaddr,
         };
 
@@ -113,43 +138,37 @@ unsafe impl UringOperation for Accept {
 impl KqueueOperation for Accept {
     type Output = io::Result<(Socket, Option<SocketAddr>)>;
     fn attempt(&mut self) -> KqueueAttempt {
+        use rustix::net::acceptfrom;
+
         kqueue_syscall_submit!(
             self.io_handle.raw_fd(),
             crate::driver::backends::kqueue::Direction::Read,
             {
-                kqueue_syscall!(libc::accept(
-                    self.io_handle.raw_fd(),
-                    &mut self.socketaddr.0 as *mut _ as *mut libc::sockaddr,
-                    &mut self.socketaddr.1,
-                ))
+                acceptfrom(&self.io_handle)
+                    .map(|accepted| {
+                        self.accepted = Some(accepted);
+                        0_u32
+                    })
+                    .map_err(std::io::Error::from)
             }
         )
     }
 
-    fn complete(self, completion: Completion) -> Self::Output {
-        use std::os::fd::{FromRawFd, RawFd};
-
-        let raw_fd = completion.result? as RawFd;
-        // Safety: accept returned a new open socket fd; ownership transfers here.
-        let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+    fn complete(mut self, completion: Completion) -> Self::Output {
+        let _ = completion.result?;
+        let (accepted, address) = self
+            .accepted
+            .take()
+            .ok_or_else(|| io::Error::other("accepted socket missing after successful accept"))?;
+        let sock = socket2::Socket::from(accepted);
         let socket = Socket {
-            // SAFETY: The socket was just accepted and will be used within the runtime context.
             handle: unsafe { AttachedHandle::new_unchecked(sock) },
         };
 
         socket.set_async_flags()?;
+        let address = address.map(SocketAddr::try_from).transpose().map_err(io::Error::from)?;
 
-        let (_, addr) = unsafe {
-            socket2::SockAddr::try_init(move |addr_storage, len| {
-                let storage = &mut *addr_storage;
-                let libc_storage = storage.view_as::<libc::sockaddr_storage>();
-                *libc_storage = self.socketaddr.0;
-                *len = self.socketaddr.1;
-                Ok(())
-            })?
-        };
-
-        Ok((socket, addr.as_socket()))
+        Ok((socket, address))
     }
 }
 

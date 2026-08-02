@@ -62,8 +62,15 @@ impl KqueueOperation for Truncate {
     type Output = io::Result<()>;
     fn attempt(&mut self) -> KqueueAttempt {
         let fd = self.handle.raw_fd();
-        let size = self.size as libc::off_t;
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::ftruncate(fd, size)) })
+        let size = self.size;
+        kqueue_syscall_blocking!({
+            // Safety: the operation retains the owning file handle until this
+            // blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            rustix::fs::ftruncate(fd, size)
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

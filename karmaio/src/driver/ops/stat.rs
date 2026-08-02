@@ -34,7 +34,7 @@ pub(crate) struct Stat {
         target_os = "dragonfly"
     ))]
     /// Filled by the blocking-pool job via shared storage.
-    stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<libc::stat>>>>,
+    stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<rustix::fs::Stat>>>>,
     #[cfg(windows)]
     result: Option<Metadata>,
 }
@@ -106,17 +106,21 @@ impl KqueueOperation for Stat {
         use std::sync::{Arc, Mutex};
 
         // fstat fills a buffer we need after the pool job; share it with the worker.
-        let slot = Arc::new(Mutex::new(None::<libc::stat>));
+        let slot = Arc::new(Mutex::new(None::<rustix::fs::Stat>));
         self.stat_shared = Some(Arc::clone(&slot));
         let fd = self.handle.raw_fd();
 
         kqueue_syscall_blocking!({
-            let mut stat = unsafe { std::mem::zeroed() };
-            let result = kqueue_syscall!(libc::fstat(fd, &mut stat));
-            if result.is_ok() {
-                *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(stat);
+            // Safety: the operation retains the owning file handle until this
+            // blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            match rustix::fs::fstat(fd) {
+                Ok(stat) => {
+                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(stat);
+                    Ok(0_u32)
+                }
+                Err(err) => Err(std::io::Error::from(err)),
             }
-            result
         })
     }
 

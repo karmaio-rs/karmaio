@@ -87,8 +87,16 @@ impl<B: BoundedIoBuf> KqueueOperation for WriteAt<B> {
         let fd = self.io_handle.raw_fd();
         let ptr = self.buf.stable_read_ptr() as usize;
         let len = self.buf.bytes_init();
-        let offset = self.offset as i64;
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::pwrite(fd, ptr as *const libc::c_void, len, offset)) })
+        let offset = self.offset;
+        kqueue_syscall_blocking!({
+            // Safety: the operation retains the owning file handle and buffer
+            // until this blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let buf = unsafe { std::slice::from_raw_parts(ptr as *const u8, len) };
+            rustix::io::pwrite(fd, buf, offset)
+                .map(|n| n as u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {

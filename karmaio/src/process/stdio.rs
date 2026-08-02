@@ -13,12 +13,12 @@
 use std::io;
 
 #[cfg(unix)]
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{FromRawFd, IntoRawFd, OwnedFd};
 #[cfg(windows)]
 use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
 
 #[cfg(unix)]
-use libc::{F_GETFL, F_SETFL, O_NONBLOCK, fcntl};
+use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
@@ -53,11 +53,8 @@ fn take_pipe_fd(io: impl IntoRawFd) -> PipeHandle {
     let fd = unsafe { OwnedFd::from_raw_fd(io.into_raw_fd()) };
     // Set non-blocking mode for async I/O readiness notifications (kqueue, epoll, etc.)
     // This is required for readiness-based backends to work correctly.
-    unsafe {
-        let flags = fcntl(fd.as_raw_fd(), F_GETFL);
-        if flags >= 0 {
-            let _ = fcntl(fd.as_raw_fd(), F_SETFL, flags | O_NONBLOCK);
-        }
+    if let Ok(flags) = fcntl_getfl(&fd) {
+        let _ = fcntl_setfl(&fd, flags | OFlags::NONBLOCK);
     }
     SharedIoHandle::new(fd)
 }

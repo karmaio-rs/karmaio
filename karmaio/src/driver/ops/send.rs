@@ -83,10 +83,12 @@ impl<B: BoundedIoBuf> KqueueOperation for Send<B> {
             self.io_handle.raw_fd(),
             crate::driver::backends::kqueue::Direction::Write,
             {
-                let ptr = self.buf.stable_read_ptr();
-                let len = self.buf.bytes_init();
-
-                kqueue_syscall!(libc::send(self.io_handle.raw_fd(), ptr as *const libc::c_void, len, 0,))
+                // Safety: the operation owns this buffer for the duration of the
+                // syscall, and the slice covers exactly its initialized bytes.
+                let buf = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
+                rustix::net::send(&self.io_handle, buf, rustix::net::SendFlags::empty())
+                    .map(|n| n as u32)
+                    .map_err(std::io::Error::from)
             }
         )
     }

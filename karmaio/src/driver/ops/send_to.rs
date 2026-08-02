@@ -131,19 +131,22 @@ impl<B: BoundedIoBuf> KqueueOperation for SendTo<B> {
             self.io_handle.raw_fd(),
             crate::driver::backends::kqueue::Direction::Write,
             {
-                let ptr = self.buf.stable_read_ptr();
-                let len = self.buf.bytes_init();
-                let name = self.socket_addr.as_ptr() as *const libc::sockaddr;
-                let namelen = self.socket_addr.len();
-
-                kqueue_syscall!(libc::sendto(
-                    self.io_handle.raw_fd(),
-                    ptr as *const libc::c_void,
-                    len,
-                    0,
-                    name,
-                    namelen,
-                ))
+                // Safety: `SockAddr` owns valid sockaddr storage for its
+                // reported length, and the address is borrowed only for this
+                // syscall.
+                let address = unsafe {
+                    rustix::net::SocketAddrAny::read(
+                        self.socket_addr.as_ptr().cast::<rustix::net::addr::SocketAddrStorage>(),
+                        self.socket_addr.len() as _,
+                    )
+                };
+                // Safety: the operation owns the buffer for the duration of
+                // the syscall, and the slice covers exactly its initialized
+                // bytes.
+                let buf = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
+                rustix::net::sendto(&self.io_handle, buf, rustix::net::SendFlags::empty(), &address)
+                    .map(|n| n as u32)
+                    .map_err(std::io::Error::from)
             }
         )
     }

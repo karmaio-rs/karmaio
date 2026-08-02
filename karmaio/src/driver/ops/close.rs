@@ -66,7 +66,12 @@ impl KqueueOperation for Close {
         let fd = match self.io_handle {
             OsRawHandle::Fd(fd) => fd,
         };
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::close(fd)) })
+        kqueue_syscall_blocking!({
+            // Safety: `Close` owns this descriptor exclusively and consumes it.
+            unsafe { rustix::io::try_close(fd) }
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

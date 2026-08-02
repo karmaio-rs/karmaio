@@ -6,11 +6,11 @@ use std::{
 
 #[derive(Clone)]
 pub(crate) struct Metadata {
-    stat: libc::stat,
+    stat: rustix::fs::Stat,
 }
 
 impl Metadata {
-    pub(crate) fn from_stat(stat: libc::stat) -> Self {
+    pub(crate) fn from_stat(stat: rustix::fs::Stat) -> Self {
         Self { stat }
     }
 
@@ -205,34 +205,16 @@ impl PermissionsExt for Permissions {
     }
 }
 
-#[cfg(target_os = "netbsd")]
-fn stat_atime_nsec(stat: &libc::stat) -> i64 {
-    i64::from(stat.st_atimensec)
+fn stat_atime_nsec(stat: &rustix::fs::Stat) -> i64 {
+    stat.st_atime_nsec as i64
 }
 
-#[cfg(not(target_os = "netbsd"))]
-fn stat_atime_nsec(stat: &libc::stat) -> i64 {
-    i64::from(stat.st_atime_nsec)
+fn stat_mtime_nsec(stat: &rustix::fs::Stat) -> i64 {
+    stat.st_mtime_nsec as i64
 }
 
-#[cfg(target_os = "netbsd")]
-fn stat_mtime_nsec(stat: &libc::stat) -> i64 {
-    i64::from(stat.st_mtimensec)
-}
-
-#[cfg(not(target_os = "netbsd"))]
-fn stat_mtime_nsec(stat: &libc::stat) -> i64 {
-    i64::from(stat.st_mtime_nsec)
-}
-
-#[cfg(target_os = "netbsd")]
-fn stat_ctime_nsec(stat: &libc::stat) -> i64 {
-    i64::from(stat.st_ctimensec)
-}
-
-#[cfg(not(target_os = "netbsd"))]
-fn stat_ctime_nsec(stat: &libc::stat) -> i64 {
-    i64::from(stat.st_ctime_nsec)
+fn stat_ctime_nsec(stat: &rustix::fs::Stat) -> i64 {
+    stat.st_ctime_nsec as i64
 }
 
 fn timespec(secs: libc::time_t, nsecs: libc::c_long) -> io::Result<SystemTime> {

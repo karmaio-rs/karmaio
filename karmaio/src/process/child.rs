@@ -20,7 +20,7 @@ use crate::{
 #[cfg(target_os = "linux")]
 use crate::driver::ops::Op;
 #[cfg(target_os = "linux")]
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::os::fd::OwnedFd;
 
 /// A handle to a spawned child process.
 ///
@@ -243,12 +243,7 @@ async fn read_to_end<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>
 /// which case the caller falls back to the blocking pool.
 #[cfg(target_os = "linux")]
 fn pidfd_for_child(pid: u32) -> io::Result<OwnedFd> {
-    // SAFETY: `pidfd_open` is a Linux syscall; `pid` is a live child we own and
-    // have not yet reaped, so the pidfd it returns is valid.
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: `fd` is a freshly opened pidfd owned by this process.
-    Ok(unsafe { OwnedFd::from_raw_fd(fd as i32) })
+    let pid = rustix::process::Pid::from_raw(pid as _)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid child process id"))?;
+    rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).map_err(io::Error::from)
 }

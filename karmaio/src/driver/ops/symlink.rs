@@ -98,7 +98,9 @@ impl KqueueOperation for Symlink {
         let original = self.original.clone();
         let link = self.link.clone();
         kqueue_syscall_blocking!({
-            kqueue_syscall!(libc::symlink(original.as_c_str().as_ptr(), link.as_c_str().as_ptr(),))
+            rustix::fs::symlink(original.as_c_str(), link.as_c_str())
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
         })
     }
 

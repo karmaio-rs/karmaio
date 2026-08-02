@@ -74,11 +74,13 @@ impl KqueueOperation for Unlink {
         let path = self.path.clone();
         let remove_dir = self.remove_dir;
         kqueue_syscall_blocking!({
-            kqueue_syscall!(if remove_dir {
-                libc::rmdir(path.as_c_str().as_ptr())
+            if remove_dir {
+                rustix::fs::rmdir(path.as_c_str())
             } else {
-                libc::unlink(path.as_c_str().as_ptr())
-            })
+                rustix::fs::unlink(path.as_c_str())
+            }
+            .map(|()| 0_u32)
+            .map_err(std::io::Error::from)
         })
     }
 

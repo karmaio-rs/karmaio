@@ -96,11 +96,13 @@ impl<B: BoundedIoBufMut> KqueueOperation for Recv<B> {
             self.io_handle.raw_fd(),
             crate::driver::backends::kqueue::Direction::Read,
             {
-                let ptr = self.buf.stable_write_ptr();
-                let len = self.buf.bytes_total();
-
-                // TODO: Check if we need to get any flags from the user
-                kqueue_syscall!(libc::recv(self.io_handle.raw_fd(), ptr as *mut libc::c_void, len, 0))
+                // Safety: the operation owns this buffer for the duration of the
+                // syscall, and the slice covers exactly its writable capacity.
+                let buf =
+                    unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_total()) };
+                rustix::net::recv(&self.io_handle, buf, rustix::net::RecvFlags::empty())
+                    .map(|(_, n)| n as u32)
+                    .map_err(std::io::Error::from)
             }
         )
     }

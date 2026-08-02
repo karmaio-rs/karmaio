@@ -94,8 +94,16 @@ impl<B: BoundedIoBufMut> KqueueOperation for ReadAt<B> {
         let fd = self.io_handle.raw_fd();
         let ptr = self.buf.stable_write_ptr() as usize;
         let len = self.buf.bytes_total();
-        let offset = self.offset as i64;
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::pread(fd, ptr as *mut libc::c_void, len, offset)) })
+        let offset = self.offset;
+        kqueue_syscall_blocking!({
+            // Safety: the operation retains the owning file handle and buffer
+            // until this blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let buf = unsafe { std::slice::from_raw_parts_mut(ptr as *mut u8, len) };
+            rustix::io::pread(fd, buf, offset)
+                .map(|n| n as u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, completion_entry: super::Completion) -> Self::Output {

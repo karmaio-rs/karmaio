@@ -386,12 +386,13 @@ mod tests {
     }
 
     fn raise_after_delay(signum: libc::c_int) {
-        let pid = unsafe { libc::getpid() };
+        let pid = rustix::process::getpid();
+        // Safety: the signal number comes from one of the validated
+        // `SignalKind` constants used by these tests.
+        let signal = unsafe { rustix::process::Signal::from_raw_unchecked(signum) };
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(20));
-            unsafe {
-                libc::kill(pid, signum);
-            }
+            let _ = rustix::process::kill_process(pid, signal);
         });
     }
 

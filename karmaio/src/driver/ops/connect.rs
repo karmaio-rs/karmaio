@@ -74,11 +74,19 @@ impl KqueueOperation for Connect {
     type Output = std::io::Result<()>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(connect self.io_handle.raw_fd(), {
-            kqueue_syscall!(libc::connect(
-                self.io_handle.raw_fd(),
-                self.socket_addr.as_ptr() as *const libc::sockaddr,
-                self.socket_addr.len(),
-            ))
+            // Safety: `SockAddr` owns valid sockaddr storage for its reported
+            // length, and the address is borrowed only for this syscall.
+            let address = unsafe {
+                rustix::net::SocketAddrAny::read(
+                    self.socket_addr
+                        .as_ptr()
+                        .cast::<rustix::net::addr::SocketAddrStorage>(),
+                    self.socket_addr.len() as _,
+                )
+            };
+            rustix::net::connect(&self.io_handle, &address)
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
         })
     }
 

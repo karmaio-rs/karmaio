@@ -59,8 +59,15 @@ impl KqueueOperation for SetPermissions {
     type Output = io::Result<()>;
     fn attempt(&mut self) -> KqueueAttempt {
         let fd = self.handle.raw_fd();
-        let mode = self.perm.mode() as libc::mode_t;
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::fchmod(fd, mode)) })
+        let mode = self.perm.mode();
+        kqueue_syscall_blocking!({
+            // Safety: the operation retains the owning file handle until this
+            // blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            rustix::fs::fchmod(fd, rustix::fs::Mode::from_raw_mode(mode as _))
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {
@@ -78,21 +85,19 @@ unsafe impl UringOperation for SetPermissions {
         // the operation synchronously here (like kqueue path) and deliver the
         // result via a NOP submission so the uring backend can track it.
         loop {
-            let ret = unsafe { libc::fchmod(self.handle.raw_fd(), self.perm.mode() as libc::mode_t) };
-
-            if ret == 0 {
-                self.result = Some(Ok(()));
-                return opcode::Nop::new().build();
+            match rustix::fs::fchmod(&self.handle, rustix::fs::Mode::from_raw_mode(self.perm.mode() as _))
+                .map_err(std::io::Error::from)
+            {
+                Ok(()) => {
+                    self.result = Some(Ok(()));
+                    return opcode::Nop::new().build();
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                Err(err) => {
+                    self.result = Some(Err(err));
+                    return opcode::Nop::new().build();
+                }
             }
-
-            let err = io::Error::last_os_error();
-
-            if err.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-
-            self.result = Some(Err(err));
-            return opcode::Nop::new().build();
         }
     }
 

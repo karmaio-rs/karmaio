@@ -67,7 +67,11 @@ impl KqueueOperation for Rename {
     fn attempt(&mut self) -> KqueueAttempt {
         let from = self.from.clone();
         let to = self.to.clone();
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::rename(from.as_c_str().as_ptr(), to.as_c_str().as_ptr())) })
+        kqueue_syscall_blocking!({
+            rustix::fs::rename(from.as_c_str(), to.as_c_str())
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

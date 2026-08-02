@@ -36,7 +36,7 @@ impl Metadata {
         target_os = "openbsd",
         target_os = "dragonfly"
     ))]
-    pub(crate) fn from_stat(stat: libc::stat) -> Self {
+    pub(crate) fn from_stat(stat: rustix::fs::Stat) -> Self {
         Self(sys::Metadata::from_stat(stat))
     }
 

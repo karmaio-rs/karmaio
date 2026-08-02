@@ -7,7 +7,7 @@
 use std::io;
 
 #[cfg(unix)]
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 #[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
 
@@ -45,7 +45,7 @@ pub(crate) struct Read<T, B> {
 #[cfg(unix)]
 impl<T, B> Op<Read<T, B>>
 where
-    T: AsRawFd + 'static,
+    T: AsFd + AsRawFd + 'static,
     B: BoundedIoBufMut + 'static,
 {
     pub(crate) fn read(io_handle: &SharedIoHandle<T>, buf: B) -> io::Result<Op<Read<T, B>>> {
@@ -105,16 +105,20 @@ unsafe impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> UringOperation f
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<T: AsRawFd + 'static, B: BoundedIoBufMut + 'static> KqueueOperation for Read<T, B> {
+impl<T: AsFd + AsRawFd + 'static, B: BoundedIoBufMut + 'static> KqueueOperation for Read<T, B> {
     type Output = BufResult<usize, B>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(
             self.io_handle.raw_fd(),
             crate::driver::backends::kqueue::Direction::Read,
             {
-                let ptr = self.buf.stable_write_ptr() as *mut libc::c_void;
-                let len = self.buf.bytes_total();
-                kqueue_syscall!(libc::read(self.io_handle.raw_fd(), ptr, len))
+                // Safety: the operation owns this buffer for the duration of the
+                // syscall, and the slice covers exactly its writable capacity.
+                let buf =
+                    unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_total()) };
+                rustix::io::read(&self.io_handle, buf)
+                    .map(|n| n as u32)
+                    .map_err(std::io::Error::from)
             }
         )
     }

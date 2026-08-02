@@ -3,6 +3,7 @@ use std::{io, net::SocketAddr};
 #[cfg(target_os = "linux")]
 use std::io::IoSliceMut;
 
+#[cfg(any(target_os = "linux", windows))]
 use socket2::SockAddr;
 
 #[cfg(windows)]
@@ -35,6 +36,7 @@ pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
     io_handle: SharedIoHandle<socket2::Socket>,
+    #[cfg(any(target_os = "linux", windows))]
     pub(crate) socket_addr: Box<SockAddr>,
 
     // Reference to the in-flight buffer.
@@ -57,11 +59,22 @@ pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
     // The kernel writes to this asynchronously via the overlapped I/O path.
     #[cfg(windows)]
     socket_addr_len: Box<i32>,
+
+    // Address returned by the synchronous Kqueue recvfrom attempt.
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd",
+        target_os = "dragonfly"
+    ))]
+    received_address: Option<rustix::net::SocketAddrAny>,
 }
 
 impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
     #![allow(unused_mut)] // The linux code uses mutablity
     pub(crate) fn recv_from(io_handle: &SharedIoHandle<socket2::Socket>, mut buf: B) -> io::Result<Op<RecvFrom<B>>> {
+        #[cfg(any(target_os = "linux", windows))]
         let socket_addr = Box::new(unsafe { SockAddr::try_init(|_, _| Ok(()))?.1 });
 
         #[cfg(target_os = "linux")]
@@ -87,6 +100,7 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
 
         let data = RecvFrom {
             io_handle: io_handle.clone(),
+            #[cfg(any(target_os = "linux", windows))]
             socket_addr,
             buf,
             #[cfg(target_os = "linux")]
@@ -97,6 +111,14 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
             wsa_buf: Box::new(wsa_buf),
             #[cfg(windows)]
             socket_addr_len: Box::new(0),
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            received_address: None,
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -170,62 +192,31 @@ impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
             self.io_handle.raw_fd(),
             crate::driver::backends::kqueue::Direction::Read,
             {
-                let ptr = self.buf.stable_write_ptr();
-                let len = self.buf.bytes_total();
-                let mut addrlen = self.socket_addr.len();
-
-                let result = kqueue_syscall!(libc::recvfrom(
-                    self.io_handle.raw_fd(),
-                    ptr as *mut libc::c_void,
-                    len,
-                    0,
-                    self.socket_addr.as_ptr() as *mut libc::sockaddr,
-                    &mut addrlen,
-                ));
-
-                if result.is_ok() {
-                    // Safety: the kernel wrote `addrlen` bytes of valid address data.
-                    unsafe {
-                        self.socket_addr.set_length(addrlen);
-                    }
-                }
-
-                result
+                // Safety: the operation owns the buffer for the duration of
+                // the syscall, and the slice covers exactly its writable
+                // capacity.
+                let buf =
+                    unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_total()) };
+                rustix::net::recvfrom(&self.io_handle, buf, rustix::net::RecvFlags::empty())
+                    .map(|(_, n, address)| {
+                        self.received_address = address;
+                        n as u32
+                    })
+                    .map_err(std::io::Error::from)
             }
         )
     }
 
-    // `mut self` is required on Windows (`set_length`); unused on other targets.
-    #[allow(unused_mut)]
     fn complete(mut self, completion_result: Completion) -> Self::Output {
         let res = completion_result.result.map(|v| v as usize);
         let mut buf = self.buf;
 
-        #[cfg(windows)]
-        {
-            let address_len = match usize::try_from(*self.socket_addr_len) {
-                Ok(length) if length <= self.socket_addr.len() as usize => length,
-                _ => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid socket address length",
-                        )),
-                        buf,
-                    );
-                }
-            };
-            // Sync the address length that the kernel wrote through the
-            // stable `lpFromlen` pointer during the overlapped operation.
-            unsafe {
-                self.socket_addr.set_length(address_len as _);
-            }
-        }
-
         let res = res.and_then(|bytes_written| {
-            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "kernel returned an invalid socket address")
-            })?;
+            let socket_addr = self
+                .received_address
+                .take()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "kernel returned no socket address"))?;
+            let socket_addr = SocketAddr::try_from(socket_addr).map_err(io::Error::from)?;
 
             // The kernel wrote `bytes_written` bytes to the buffer.
             unsafe {

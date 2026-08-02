@@ -73,7 +73,11 @@ impl KqueueOperation for CreateDir {
     fn attempt(&mut self) -> KqueueAttempt {
         let path = self.path.clone();
         let mode = self.mode;
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::mkdir(path.as_c_str().as_ptr(), mode)) })
+        kqueue_syscall_blocking!({
+            rustix::fs::mkdir(path.as_c_str(), rustix::fs::Mode::from_raw_mode(mode as _))
+                .map(|()| 0_u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

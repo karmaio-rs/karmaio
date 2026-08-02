@@ -142,9 +142,24 @@ impl<B: BoundedIoBufMut> KqueueOperation for Readv<B> {
         // preadv may block. Keep iovecs/buffers alive in the Op while the pool runs.
         let fd = self.io_handle.raw_fd();
         let iovs = self.iovs.as_ptr() as usize;
-        let iovcnt = self.iovs.len() as i32;
-        let offset = self.offset as i64;
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::preadv(fd, iovs as *const libc::iovec, iovcnt, offset)) })
+        let iovcnt = self.iovs.len();
+        let offset = self.offset;
+        kqueue_syscall_blocking!({
+            // Safety: the operation retains the owning file and all buffers
+            // until this blocking job completes.
+            let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+            let iovs = unsafe { std::slice::from_raw_parts(iovs as *const libc::iovec, iovcnt) };
+            let mut bufs = iovs
+                .iter()
+                .map(|iov| {
+                    let buf = unsafe { std::slice::from_raw_parts_mut(iov.iov_base.cast::<u8>(), iov.iov_len) };
+                    std::io::IoSliceMut::new(buf)
+                })
+                .collect::<Vec<_>>();
+            rustix::io::preadv(fd, &mut bufs, offset)
+                .map(|n| n as u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, completion_entry: Completion) -> Self::Output {

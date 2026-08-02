@@ -28,8 +28,23 @@ use crate::{
     runtime::local::CURRENT_DRIVER,
 };
 
-#[cfg(unix)]
+#[cfg(any(
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
 use std::os::fd::FromRawFd;
+#[cfg(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd",
+    target_os = "dragonfly"
+))]
+use std::os::fd::IntoRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 
@@ -124,6 +139,8 @@ unsafe impl UringOperation for Open {
 impl KqueueOperation for Open {
     type Output = std::io::Result<File>;
     fn attempt(&mut self) -> KqueueAttempt {
+        use rustix::fs::{Mode, OFlags};
+
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
@@ -137,11 +154,18 @@ impl KqueueOperation for Open {
             }
         };
 
-        let flags = libc::O_CLOEXEC | access_mode | creation_mode | (self.options.custom_flags & !libc::O_ACCMODE);
+        let flags = OFlags::CLOEXEC
+            | OFlags::from_bits_retain(
+                (access_mode | creation_mode | (self.options.custom_flags & !libc::O_ACCMODE)) as _,
+            );
         let path = self.path.clone();
-        let mode = self.options.mode as u32;
+        let mode = Mode::from_raw_mode(self.options.mode as _);
 
-        kqueue_syscall_blocking!({ kqueue_syscall!(libc::open(path.as_c_str().as_ptr(), flags, mode)) })
+        kqueue_syscall_blocking!({
+            rustix::fs::open(path.as_c_str(), flags, mode)
+                .map(|fd| fd.into_raw_fd() as u32)
+                .map_err(std::io::Error::from)
+        })
     }
 
     fn complete(self, cqe: Completion) -> Self::Output {

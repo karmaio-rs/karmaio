@@ -134,47 +134,8 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for RecvFrom<B> {
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
     }
 
-    // `mut self` is required on Windows (`set_length`); unused on other targets.
-    #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Output {
-        let res = completion_result.result.map(|v| v as usize);
-        let mut buf = self.buf;
-
-        #[cfg(windows)]
-        {
-            let address_len = match usize::try_from(*self.socket_addr_len) {
-                Ok(length) if length <= self.socket_addr.len() as usize => length,
-                _ => {
-                    return (
-                        Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            "invalid socket address length",
-                        )),
-                        buf,
-                    );
-                }
-            };
-            // Sync the address length that the kernel wrote through the
-            // stable `lpFromlen` pointer during the overlapped operation.
-            unsafe {
-                self.socket_addr.set_length(address_len as _);
-            }
-        }
-
-        let res = res.and_then(|bytes_written| {
-            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "kernel returned an invalid socket address")
-            })?;
-
-            // The kernel wrote `bytes_written` bytes to the buffer.
-            unsafe {
-                buf.set_init(bytes_written);
-            }
-
-            Ok((bytes_written, socket_addr))
-        });
-
-        (res, buf)
+    fn complete(self, completion_result: Completion) -> Self::Output {
+        self.finish(completion_result)
     }
 }
 
@@ -207,26 +168,8 @@ impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
         )
     }
 
-    fn complete(mut self, completion_result: Completion) -> Self::Output {
-        let res = completion_result.result.map(|v| v as usize);
-        let mut buf = self.buf;
-
-        let res = res.and_then(|bytes_written| {
-            let socket_addr = self
-                .received_address
-                .take()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "kernel returned no socket address"))?;
-            let socket_addr = SocketAddr::try_from(socket_addr).map_err(io::Error::from)?;
-
-            // The kernel wrote `bytes_written` bytes to the buffer.
-            unsafe {
-                buf.set_init(bytes_written);
-            }
-
-            Ok((bytes_written, socket_addr))
-        });
-
-        (res, buf)
+    fn complete(self, completion_result: Completion) -> Self::Output {
+        self.finish(completion_result)
     }
 }
 
@@ -262,11 +205,18 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
         })
     }
 
-    // `mut self` is required on Windows (`set_length`); unused on other targets.
-    #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Output {
-        let res = completion_result.result.map(|v| v as usize);
-        let mut buf = self.buf;
+    fn complete(self, completion_result: Completion) -> Self::Output {
+        self.finish(completion_result)
+    }
+}
+
+impl<B: BoundedIoBufMut> RecvFrom<B> {
+    fn finish(mut self, completion_result: Completion) -> BufResult<(usize, SocketAddr), B> {
+        let capacity = self.buf.bytes_total();
+        let bytes_written = match completion_result.bytes_transferred(capacity) {
+            Ok(n) => n,
+            Err(err) => return (Err(err), self.buf),
+        };
 
         #[cfg(windows)]
         {
@@ -278,7 +228,7 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
                             io::ErrorKind::InvalidData,
                             "invalid socket address length",
                         )),
-                        buf,
+                        self.buf,
                     );
                 }
             };
@@ -289,19 +239,54 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
             }
         }
 
-        let res = res.and_then(|bytes_written| {
-            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "kernel returned an invalid socket address")
-            })?;
-
-            // The kernel wrote `bytes_written` bytes to the buffer.
-            unsafe {
-                buf.set_init(bytes_written);
+        let socket_addr = {
+            #[cfg(any(
+                target_os = "macos",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                let address = match self.received_address.take() {
+                    Some(address) => address,
+                    None => {
+                        return (
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "kernel returned no socket address",
+                            )),
+                            self.buf,
+                        );
+                    }
+                };
+                match SocketAddr::try_from(address) {
+                    Ok(addr) => addr,
+                    Err(err) => return (Err(io::Error::from(err)), self.buf),
+                }
             }
+            #[cfg(any(target_os = "linux", windows))]
+            {
+                match self.socket_addr.as_socket() {
+                    Some(addr) => addr,
+                    None => {
+                        return (
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "kernel returned an invalid socket address",
+                            )),
+                            self.buf,
+                        );
+                    }
+                }
+            }
+        };
 
-            Ok((bytes_written, socket_addr))
-        });
+        // Safety: the platform wrote at most `capacity` bytes into the buffer.
+        unsafe {
+            self.buf.set_init(bytes_written);
+        }
 
-        (res, buf)
+        (Ok((bytes_written, socket_addr)), self.buf)
     }
 }

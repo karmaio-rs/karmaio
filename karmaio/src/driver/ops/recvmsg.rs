@@ -110,66 +110,8 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for RecvMsg<B> {
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
     }
 
-    // `mut self` is required on Windows (`set_length`); unused on other targets.
-    #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Output {
-        let res = completion_result.result.map(|v| v as usize);
-        let mut bufs = self.bufs;
-
-        #[cfg(windows)]
-        {
-            let address_len = match usize::try_from(*self.socket_addr_len) {
-                Ok(length) if length <= self.socket_addr.len() as usize => length,
-                _ => {
-                    return (
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "invalid socket address length",
-                        )),
-                        bufs,
-                    );
-                }
-            };
-            unsafe {
-                self.socket_addr.set_length(address_len as _);
-            }
-        }
-
-        let res = res.and_then(|total_bytes_written| {
-            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "kernel returned an invalid socket address",
-                )
-            })?;
-
-            // The kernel wrote `total_bytes_written` bytes to the buffers.
-            // The kernel fills buffers to their capacity one after the other
-            // So we do a loop to correctly update buffer lengths on our end.
-            let mut remaining = total_bytes_written;
-
-            for buf in &mut bufs {
-                // Grab the filled capacity of the buffer
-                let bytes_written = std::cmp::min(remaining, buf.bytes_total());
-
-                unsafe {
-                    // Set the length of the buffers
-                    buf.set_init(bytes_written);
-                }
-                // Find the remaining bytes
-                remaining -= bytes_written;
-
-                // The current buffer is the last filled buffer.
-                // We can return. The rest of the buffers are empty
-                if remaining == 0 {
-                    break;
-                }
-            }
-
-            Ok((total_bytes_written, socket_addr))
-        });
-
-        (res, bufs)
+    fn complete(self, completion_result: Completion) -> Self::Output {
+        self.finish(completion_result)
     }
 }
 
@@ -196,66 +138,8 @@ impl<B: BoundedIoBufMut> KqueueOperation for RecvMsg<B> {
         )
     }
 
-    // `mut self` is required on Windows (`set_length`); unused on other targets.
-    #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Output {
-        let res = completion_result.result.map(|v| v as usize);
-        let mut bufs = self.bufs;
-
-        #[cfg(windows)]
-        {
-            let address_len = match usize::try_from(*self.socket_addr_len) {
-                Ok(length) if length <= self.socket_addr.len() as usize => length,
-                _ => {
-                    return (
-                        Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "invalid socket address length",
-                        )),
-                        bufs,
-                    );
-                }
-            };
-            unsafe {
-                self.socket_addr.set_length(address_len as _);
-            }
-        }
-
-        let res = res.and_then(|total_bytes_written| {
-            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "kernel returned an invalid socket address",
-                )
-            })?;
-
-            // The kernel wrote `total_bytes_written` bytes to the buffers.
-            // The kernel fills buffers to their capacity one after the other
-            // So we do a loop to correctly update buffer lengths on our end.
-            let mut remaining = total_bytes_written;
-
-            for buf in &mut bufs {
-                // Grab the filled capacity of the buffer
-                let bytes_written = std::cmp::min(remaining, buf.bytes_total());
-
-                unsafe {
-                    // Set the length of the buffers
-                    buf.set_init(bytes_written);
-                }
-                // Find the remaining bytes
-                remaining -= bytes_written;
-
-                // The current buffer is the last filled buffer.
-                // We can return. The rest of the buffers are empty
-                if remaining == 0 {
-                    break;
-                }
-            }
-
-            Ok((total_bytes_written, socket_addr))
-        });
-
-        (res, bufs)
+    fn complete(self, completion_result: Completion) -> Self::Output {
+        self.finish(completion_result)
     }
 }
 
@@ -290,11 +174,18 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvMsg<B> {
         })
     }
 
-    // `mut self` is required on Windows (`set_length`); unused on other targets.
-    #[allow(unused_mut)]
-    fn complete(mut self, completion_result: Completion) -> Self::Output {
-        let res = completion_result.result.map(|v| v as usize);
-        let mut bufs = self.bufs;
+    fn complete(self, completion_result: Completion) -> Self::Output {
+        self.finish(completion_result)
+    }
+}
+
+impl<B: BoundedIoBufMut> RecvMsg<B> {
+    fn finish(mut self, completion_result: Completion) -> BufResult<(usize, SocketAddr), Vec<B>> {
+        let capacity: usize = self.bufs.iter().map(|buf| buf.bytes_total()).sum();
+        let total_bytes_written = match completion_result.bytes_transferred(capacity) {
+            Ok(n) => n,
+            Err(err) => return (Err(err), self.bufs),
+        };
 
         #[cfg(windows)]
         {
@@ -306,7 +197,7 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvMsg<B> {
                             std::io::ErrorKind::InvalidData,
                             "invalid socket address length",
                         )),
-                        bufs,
+                        self.bufs,
                     );
                 }
             };
@@ -315,40 +206,34 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvMsg<B> {
             }
         }
 
-        let res = res.and_then(|total_bytes_written| {
-            let socket_addr: SocketAddr = self.socket_addr.as_socket().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "kernel returned an invalid socket address",
-                )
-            })?;
-
-            // The kernel wrote `total_bytes_written` bytes to the buffers.
-            // The kernel fills buffers to their capacity one after the other
-            // So we do a loop to correctly update buffer lengths on our end.
-            let mut remaining = total_bytes_written;
-
-            for buf in &mut bufs {
-                // Grab the filled capacity of the buffer
-                let bytes_written = std::cmp::min(remaining, buf.bytes_total());
-
-                unsafe {
-                    // Set the length of the buffers
-                    buf.set_init(bytes_written);
-                }
-                // Find the remaining bytes
-                remaining -= bytes_written;
-
-                // The current buffer is the last filled buffer.
-                // We can return. The rest of the buffers are empty
-                if remaining == 0 {
-                    break;
-                }
+        let socket_addr = match self.socket_addr.as_socket() {
+            Some(addr) => addr,
+            None => {
+                return (
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "kernel returned an invalid socket address",
+                    )),
+                    self.bufs,
+                );
             }
+        };
 
-            Ok((total_bytes_written, socket_addr))
-        });
+        // The kernel fills buffers to capacity one after another.
+        let mut remaining = total_bytes_written;
+        for buf in &mut self.bufs {
+            let bytes_written = std::cmp::min(remaining, buf.bytes_total());
+            // Safety: `bytes_transferred` capped the total to the sum of capacities.
+            unsafe {
+                buf.set_init(bytes_written);
+            }
+            remaining -= bytes_written;
+            if remaining == 0 {
+                break;
+            }
+        }
+        debug_assert_eq!(remaining, 0);
 
-        (res, bufs)
+        (Ok((total_bytes_written, socket_addr)), self.bufs)
     }
 }

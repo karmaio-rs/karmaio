@@ -102,29 +102,7 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for Readv<B> {
     }
 
     fn complete(self, completion_entry: Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut bufs = self.bufs;
-
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            let mut count = n;
-            for buf in bufs.iter_mut() {
-                let sz = std::cmp::min(count, buf.bytes_total() - buf.bytes_init());
-                let pos = buf.bytes_init() + sz;
-                // Safety: the kernel returns bytes written, and we have ensured that `pos` is
-                // valid for current buffer.
-                unsafe { buf.set_init(pos) };
-                count -= sz;
-                if count == 0 {
-                    break;
-                }
-            }
-            assert_eq!(count, 0);
-        }
-
-        (res, bufs)
+        self.finish(completion_entry)
     }
 }
 
@@ -163,29 +141,7 @@ impl<B: BoundedIoBufMut> KqueueOperation for Readv<B> {
     }
 
     fn complete(self, completion_entry: Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut bufs = self.bufs;
-
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            let mut count = n;
-            for buf in bufs.iter_mut() {
-                let sz = std::cmp::min(count, buf.bytes_total() - buf.bytes_init());
-                let pos = buf.bytes_init() + sz;
-                // Safety: the kernel returns bytes written, and we have ensured that `pos` is
-                // valid for current buffer.
-                unsafe { buf.set_init(pos) };
-                count -= sz;
-                if count == 0 {
-                    break;
-                }
-            }
-            assert_eq!(count, 0);
-        }
-
-        (res, bufs)
+        self.finish(completion_entry)
     }
 }
 
@@ -224,28 +180,34 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for Readv<B> {
     }
 
     fn complete(self, completion_entry: Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-        // Recover the buffer
-        let mut bufs = self.bufs;
+        self.finish(completion_entry)
+    }
+}
 
-        // If the operation was successful, advance the initialized cursor.
-        if let Ok(n) = res {
-            let mut count = n;
-            for buf in bufs.iter_mut() {
-                let sz = std::cmp::min(count, buf.bytes_total() - buf.bytes_init());
-                let pos = buf.bytes_init() + sz;
-                // Safety: the kernel returns bytes written, and we have ensured that `pos` is
-                // valid for current buffer.
-                unsafe { buf.set_init(pos) };
-                count -= sz;
-                if count == 0 {
-                    break;
+impl<B: BoundedIoBufMut> Readv<B> {
+    fn finish(mut self, completion_entry: Completion) -> BufResult<usize, Vec<B>> {
+        let capacity: usize = self
+            .bufs
+            .iter()
+            .map(|buf| buf.bytes_total().saturating_sub(buf.bytes_init()))
+            .sum();
+        match completion_entry.bytes_transferred(capacity) {
+            Ok(n) => {
+                let mut count = n;
+                for buf in self.bufs.iter_mut() {
+                    let sz = std::cmp::min(count, buf.bytes_total() - buf.bytes_init());
+                    let pos = buf.bytes_init() + sz;
+                    // Safety: `bytes_transferred` capped `n` to the remaining capacity.
+                    unsafe { buf.set_init(pos) };
+                    count -= sz;
+                    if count == 0 {
+                        break;
+                    }
                 }
+                debug_assert_eq!(count, 0);
+                (Ok(n), self.bufs)
             }
-            assert_eq!(count, 0);
+            Err(err) => (Err(err), self.bufs),
         }
-
-        (res, bufs)
     }
 }

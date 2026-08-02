@@ -27,6 +27,13 @@ pub(crate) type Submission = squeue::Entry;
 /// the typed [`Op`] future, or by the exceptional detached cleanup record,
 /// until [`UringOperation::complete`] has run.
 ///
+/// # Lifecycle
+///
+/// [`UringOperation::submit`] is called from `IoUringBackend::submit_op` when
+/// the future is constructed. The SQE is pushed (and flushed if the SQ is full)
+/// before `submit_op` returns. [`UringOperation::complete`] runs after the
+/// terminal CQE, outside the driver's backend borrow.
+///
 /// # Safety
 ///
 /// Implementations must ensure that every pointer embedded in the returned
@@ -35,7 +42,7 @@ pub(crate) type Submission = squeue::Entry;
 pub(crate) unsafe trait UringOperation: 'static {
     type Output;
 
-    /// Build the one-shot SQE for this operation.
+    /// Build the one-shot SQE for this operation (invoked during `submit_op`).
     fn submit(&mut self) -> Submission;
 
     /// Convert the terminal CQE into the operation's typed result.

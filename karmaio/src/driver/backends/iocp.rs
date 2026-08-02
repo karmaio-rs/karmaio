@@ -132,6 +132,13 @@ fn cancel_pending(interest: &Interest) {
 /// Implementations must keep all memory referenced by the returned overlapped
 /// request valid until Windows delivers its terminal completion packet.
 ///
+/// # Lifecycle
+///
+/// [`IocpOperation::submit`] is called from `IocpBackend::submit_op`. A
+/// `Pending` result parks the OVERLAPPED in the slab until the completion
+/// packet arrives. A `Blocking` result is dispatched on first `poll_op`.
+/// Typed `complete` runs outside the driver's backend borrow.
+///
 /// # Safety
 ///
 /// Implementations must ensure that the returned pending submission keeps its
@@ -140,8 +147,8 @@ fn cancel_pending(interest: &Interest) {
 pub(crate) unsafe trait IocpOperation: 'static {
     type Output;
 
-    /// Start the operation. A pending submission owns its stable `OVERLAPPED`
-    /// storage until Windows delivers the terminal completion packet.
+    /// Start the operation (invoked during `submit_op`). A pending submission
+    /// owns its stable `OVERLAPPED` until Windows delivers the terminal packet.
     fn submit(&mut self) -> IocpSubmission;
 
     /// Convert a terminal IOCP packet into the operation's typed result.

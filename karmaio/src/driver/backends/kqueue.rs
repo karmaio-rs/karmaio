@@ -3,6 +3,13 @@
 //! The backend keeps the readiness protocol local to kqueue. Operation futures
 //! retain their typed payloads, while this module owns only lifecycle state,
 //! readiness interests, and terminal completions.
+//!
+//! # Lifecycle
+//!
+//! `submit_op` only allocates a slab slot. [`KqueueOperation::attempt`] runs on
+//! first `poll_op` (and again after readiness re-arms): it may complete
+//! immediately, register a one-shot filter, or offload to the blocking pool.
+//! Typed `complete` runs outside the driver's backend borrow.
 
 use std::{
     collections::HashMap,
@@ -87,10 +94,14 @@ pub(crate) enum KqueueReadyAction {
 }
 
 /// Backend-local readiness operation protocol.
+///
+/// [`KqueueOperation::attempt`] is invoked from `poll_op` (not `submit_op`).
+/// `submit_op` only reserves a slab slot; the first poll runs the non-blocking
+/// syscall or registers interest / blocking work.
 pub(crate) trait KqueueOperation: 'static {
     type Output;
 
-    /// Attempt the operation without blocking the runtime thread.
+    /// Attempt the operation without blocking the runtime thread (on `poll_op`).
     fn attempt(&mut self) -> KqueueAttempt;
 
     /// Convert a terminal syscall or blocking-pool result into the typed output.

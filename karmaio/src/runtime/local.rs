@@ -2,7 +2,7 @@ use std::{
     cell::RefCell,
     future::Future,
     io,
-    pin::pin,
+    num::NonZeroU32,
     task::{Context, Waker},
     time::Duration,
 };
@@ -12,9 +12,9 @@ use std::rc::Rc;
 use crate::{
     builder::{RuntimeBuilder, RuntimeConfig},
     driver::{Driver, Handle},
-    runtime::blocking::{spawn_blocking_task, BlockingPool},
+    runtime::blocking::{BlockingPool, spawn_blocking_task},
     runtime::local::scheduler::Scheduler,
-    task::{join::JoinHandle, new_task},
+    task::join::JoinHandle,
     time::Timer,
 };
 
@@ -31,19 +31,20 @@ scoped_thread_local!(pub(crate) static CURRENT_TIMER: Rc<RefCell<Timer>>);
 /// # Shutdown
 ///
 /// Dropping a [`Runtime`] tears down the scheduler, I/O driver, and blocking
-/// pool. Tasks still sitting in run queues are dropped; in-flight driver ops
-/// are cancelled or drained by the platform backend.
+/// pool. Local tasks are cancelled and their futures are dropped on the runtime
+/// thread; in-flight driver ops are cancelled or drained by the platform
+/// backend.
 ///
 /// To shut down cleanly:
 ///
 /// 1. Finish (or drop) the future passed to [`Runtime::block_on`].
-/// 2. Drop or fully await every [`JoinHandle`] you still care about **before**
-///    dropping the runtime.
+/// 2. Fully await work that must finish successfully before shutdown.
 /// 3. Then drop the [`Runtime`].
 ///
-/// Awaiting a [`JoinHandle`] *after* its runtime has been dropped will hang:
-/// the task is no longer polled. Dropping a [`JoinHandle`] does **not** abort
-/// the task (use [`JoinHandle::abort`]).
+/// A retained [`JoinHandle`] for an unfinished local task observes a cancellation
+/// error after the runtime is dropped. Dropping a [`JoinHandle`] while the
+/// runtime is still running does **not** abort its task (use
+/// [`JoinHandle::abort`]).
 ///
 /// # I/O cancellation
 ///
@@ -60,6 +61,7 @@ pub struct Runtime {
     /// Joined before the driver performs its final platform cleanup.
     _blocking: BlockingPool,
     pub(crate) driver: Driver,
+    event_interval: NonZeroU32,
 }
 
 impl Drop for Runtime {
@@ -106,6 +108,7 @@ impl Runtime {
             timer: Rc::new(RefCell::new(Timer::new())),
             _blocking: blocking,
             driver,
+            event_interval: config.event_interval,
         })
     }
 
@@ -116,18 +119,17 @@ impl Runtime {
     /// When this method returns, the main future has finished, but other
     /// tasks spawned during the call may still be queued or waiting on I/O.
     /// See [Shutdown](Runtime#shutdown) before dropping the runtime.
-    pub fn block_on<F: Future + 'static>(&mut self, future: F) -> F::Output {
+    pub fn block_on<F: Future>(&mut self, future: F) -> F::Output {
         assert!(!CURRENT_SCHEDULER.is_set(), "Can not start a runtime inside a runtime");
 
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
         let handle: Handle = (&self.driver).into();
+        let root_waker = Waker::from(std::sync::Arc::new(self.driver.wakeup()));
+        let mut root_context = Context::from_waker(&root_waker);
+        let mut root = std::pin::pin!(future);
 
         CURRENT_TIMER.set(&self.timer, || {
             CURRENT_SCHEDULER.set(&self.scheduler, || {
                 CURRENT_DRIVER.set(&handle, || {
-                    let mut join_handle = pin!(future);
-
                     loop {
                         loop {
                             // Start of scheduler tick: drain remote first.
@@ -136,22 +138,18 @@ impl Runtime {
                             // Expire any timers whose deadlines have passed.
                             self.timer.borrow_mut().wake();
 
-                            // Consume tasks (max rounds ≈ 2 × current length after drain
-                            // to prevent I/O starvation from a single yielding task).
-                            let mut max_round = self.scheduler.tasks.len() * 2;
-                            while let Some(t) = self.scheduler.tasks.pop_front() {
-                                t.run();
-                                if max_round == 0 {
-                                    // maybe there's a looping task
+                            // Bound each scheduler batch so a self-waking task
+                            // cannot prevent the driver from servicing I/O.
+                            for _ in 0..self.event_interval.get() {
+                                let Some(t) = self.scheduler.tasks.pop_front() else {
                                     break;
-                                } else {
-                                    max_round -= 1;
-                                }
+                                };
+                                self.scheduler.run_task(t);
                             }
 
                             // Check main future
-                            if let std::task::Poll::Ready(t) = join_handle.as_mut().poll(&mut cx) {
-                                return t;
+                            if let std::task::Poll::Ready(output) = root.as_mut().poll(&mut root_context) {
+                                return output;
                             }
 
                             if self.scheduler.tasks.is_empty() {
@@ -159,28 +157,17 @@ impl Runtime {
                                 break;
                             }
 
-                            // Cold path: tasks remain after a batch, so flush
-                            // the submission queue without parking. Prevents io_uring SQEs from
-                            // sitting in userspace until the SQ fills or we wait.
-                            let _ = self.driver.submit();
+                            // Runnable work remains. Poll the driver without
+                            // parking before beginning another task batch.
+                            self.driver
+                                .turn(Some(Duration::ZERO))
+                                .expect("Failed to poll I/O events");
                         }
 
                         // Wait for I/O (or a cross-thread wake from the remote
                         // scheduler / blocking pool), then apply completions.
                         let timeout = self.timer.borrow().min_timeout();
-                        let _completed = match timeout {
-                            Some(duration) => self
-                                .driver
-                                .wait_with_duration(duration)
-                                .expect("Failed to wait for I/O events"),
-                            None => self.driver.wait().expect("Failed to wait for I/O events"),
-                        };
-                        // Runtime owns the blocking pool: drain its completions
-                        // as an explicit phase, then platform I/O completions.
-                        self.driver.drain_blocking_completions();
-                        self.driver
-                            .dispatch_completions()
-                            .expect("Failed to dispatch I/O completions");
+                        self.driver.turn(timeout).expect("Failed to wait for I/O events");
                         self.timer.borrow_mut().wake();
                         // Note: we do *not* drain the remote task queue here. The
                         // next iteration of the inner loop drains at tick start.
@@ -196,14 +183,10 @@ impl Runtime {
     /// to detach (the task keeps running). Dropping the handle does not cancel
     /// the task; call [`JoinHandle::abort`] for cooperative cancellation.
     ///
-    /// The runtime must outlive any handle you still intend to poll. See
-    /// [Shutdown](Runtime#shutdown).
+    /// If the runtime is dropped before the task finishes, the handle resolves
+    /// with a cancellation error. See [Shutdown](Runtime#shutdown).
     pub fn spawn<F: Future + 'static>(&self, future: F) -> JoinHandle<F::Output> {
-        let (task, join_handle) = new_task(future, self.scheduler.handle());
-
-        self.scheduler.tasks.push_back(task);
-
-        join_handle
+        self.scheduler.spawn(future)
     }
 
     /// Runs the provided closure on a thread dedicated to blocking operations.
@@ -319,11 +302,7 @@ where
         "spawn_local called outside of a runtime context"
     );
 
-    CURRENT_SCHEDULER.with(|scheduler| {
-        let (task, join_handle) = new_task(future, scheduler.handle());
-        scheduler.tasks.push_back(task);
-        join_handle
-    })
+    CURRENT_SCHEDULER.with(|scheduler| scheduler.spawn(future))
 }
 
 #[cfg(test)]
@@ -572,6 +551,107 @@ mod tests {
     }
 
     #[test]
+    fn block_on_accepts_a_borrowed_future() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let value = String::from("borrowed");
+
+        let length = runtime.block_on(async { value.len() });
+
+        assert_eq!(length, value.len());
+    }
+
+    #[test]
+    fn root_future_wake_unparks_runtime() {
+        struct RemoteWake {
+            ready: Arc<AtomicBool>,
+            waker_tx: Option<mpsc::Sender<Waker>>,
+        }
+
+        impl Future for RemoteWake {
+            type Output = ();
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+                if self.ready.load(Ordering::Acquire) {
+                    return Poll::Ready(());
+                }
+
+                if let Some(waker_tx) = self.waker_tx.take() {
+                    waker_tx.send(cx.waker().clone()).expect("send root waker");
+                }
+                Poll::Pending
+            }
+        }
+
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let ready = Arc::new(AtomicBool::new(false));
+        let (waker_tx, waker_rx) = mpsc::channel::<Waker>();
+        let wake_ready = Arc::clone(&ready);
+        let wake_thread = thread::spawn(move || {
+            let waker = waker_rx.recv().expect("receive root waker");
+            wake_ready.store(true, Ordering::Release);
+            waker.wake();
+        });
+
+        // This timer bounds the regression test. A no-op root waker would leave
+        // the runtime asleep until this deadline instead of waking promptly.
+        let _watchdog = runtime.spawn(async {
+            crate::time::sleep(std::time::Duration::from_secs(2)).await;
+        });
+        let start = std::time::Instant::now();
+        runtime.block_on(RemoteWake {
+            ready,
+            waker_tx: Some(waker_tx),
+        });
+
+        wake_thread.join().expect("wake thread should finish");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    fn same_thread_wake_stays_with_its_runtime() {
+        struct CapturedWake {
+            ready: Arc<AtomicBool>,
+            waker_tx: Option<mpsc::Sender<Waker>>,
+        }
+
+        impl Future for CapturedWake {
+            type Output = usize;
+
+            fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<usize> {
+                if self.ready.load(Ordering::Acquire) {
+                    return Poll::Ready(17);
+                }
+
+                if let Some(waker_tx) = self.waker_tx.take() {
+                    waker_tx.send(cx.waker().clone()).expect("capture task waker");
+                }
+                Poll::Pending
+            }
+        }
+
+        let mut first = Runtime::new().expect("first runtime should start");
+        let mut second = Runtime::new().expect("second runtime should start");
+        let ready = Arc::new(AtomicBool::new(false));
+        let (waker_tx, waker_rx) = mpsc::channel::<Waker>();
+        let task = first.spawn(CapturedWake {
+            ready: Arc::clone(&ready),
+            waker_tx: Some(waker_tx),
+        });
+
+        first.block_on(async {});
+        let waker = waker_rx.recv().expect("receive captured waker");
+        ready.store(true, Ordering::Release);
+
+        // Invoke a waker belonging to the first runtime while the second
+        // runtime is scoped on the same OS thread.
+        second.block_on(async move { waker.wake_by_ref() });
+        assert!(!task.is_finished());
+
+        let output = first.block_on(async move { task.await });
+        assert_eq!(output.expect("task should finish on its own runtime"), 17);
+    }
+
+    #[test]
     fn sleep_waits_for_duration() {
         use std::time::Duration;
 
@@ -695,6 +775,52 @@ mod tests {
     }
 
     #[test]
+    fn shutdown_drops_non_send_future_on_owner_thread() {
+        use std::rc::Rc;
+
+        struct DropThread {
+            dropped_on: mpsc::Sender<thread::ThreadId>,
+            _local: Rc<()>,
+        }
+
+        impl Drop for DropThread {
+            fn drop(&mut self) {
+                self.dropped_on
+                    .send(thread::current().id())
+                    .expect("report future drop thread");
+            }
+        }
+
+        let owner = thread::current().id();
+        let (dropped_on_tx, dropped_on_rx) = mpsc::channel();
+        let runtime = Runtime::new().expect("runtime should start");
+        let drop_thread = DropThread {
+            dropped_on: dropped_on_tx,
+            _local: Rc::new(()),
+        };
+        let task = runtime.spawn(async move {
+            let _drop_thread = drop_thread;
+            pending::<usize>().await
+        });
+
+        drop(runtime);
+
+        assert!(task.is_finished());
+        assert_eq!(
+            dropped_on_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("future should be dropped during runtime shutdown"),
+            owner
+        );
+
+        // The handle is Send because its output is Send, but the local future
+        // has already been consumed safely on the owner thread.
+        thread::spawn(move || drop(task))
+            .join()
+            .expect("remote handle drop should succeed");
+    }
+
+    #[test]
     fn spawn_blocking_returns_value() {
         let mut runtime = Runtime::new().expect("runtime should start");
         let handle = runtime.spawn_blocking(|| 42usize);
@@ -736,6 +862,39 @@ mod tests {
             assert!(start.elapsed() < Duration::from_millis(60));
             assert_eq!(blocking.await.expect("blocking ok"), 1);
         });
+    }
+
+    #[cfg(feature = "net")]
+    #[test]
+    fn self_waking_task_does_not_starve_io() {
+        use crate::{
+            net::tcp::TcpListener,
+            time::{Duration, timeout},
+        };
+
+        let listener =
+            TcpListener::bind("127.0.0.1:0".parse().expect("valid loopback address")).expect("bind loopback listener");
+        let address = listener.local_addr().expect("read listener address");
+        let connector = thread::spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(25));
+            std::net::TcpStream::connect(address).expect("connect to loopback listener")
+        });
+
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let accepted = runtime.block_on(async move {
+            let spinner = super::spawn_local(std::future::poll_fn(|cx| {
+                cx.waker().wake_by_ref();
+                Poll::<()>::Pending
+            }));
+            let accepted = timeout(Duration::from_secs(1), listener.accept()).await;
+            spinner.abort();
+            accepted
+        });
+
+        let _client = connector.join().expect("connector thread should finish");
+        let (_stream, _peer) = accepted
+            .expect("I/O should complete despite the runnable task")
+            .expect("accept should succeed");
     }
 
     #[test]

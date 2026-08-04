@@ -112,21 +112,27 @@ impl Driver {
         }
     }
 
-    /// Flush the backend submission queue without waiting for completions.
-    ///
-    /// On io_uring this submits pending SQEs. On kqueue / IOCP this is a no-op
-    /// (those backends submit synchronously in `poll_op` / `submit_op`).
-    /// Called from the runtime cold path when tasks remain after a batch.
-    pub(crate) fn submit(&self) -> io::Result<()> {
-        self.backend.borrow_mut().submit()
-    }
-
     pub(crate) fn wait(&self) -> io::Result<usize> {
         self.backend.borrow_mut().wait()
     }
 
     pub(crate) fn wait_with_duration(&self, duration: std::time::Duration) -> io::Result<usize> {
         self.backend.borrow_mut().wait_with_duration(duration)
+    }
+
+    /// Perform one platform-driver turn and apply all resulting completions.
+    ///
+    /// `None` waits until at least one platform event arrives. A duration of
+    /// zero performs a nonblocking turn, which lets the scheduler service I/O
+    /// without yielding the core while runnable tasks remain.
+    pub(crate) fn turn(&self, timeout: Option<std::time::Duration>) -> io::Result<usize> {
+        let completed = match timeout {
+            Some(duration) => self.wait_with_duration(duration)?,
+            None => self.wait()?,
+        };
+        self.drain_blocking_completions();
+        self.dispatch_completions()?;
+        Ok(completed)
     }
 
     /// Apply completions from the blocking thread pool.
@@ -240,6 +246,16 @@ impl Wakeup {
     }
 
     pub(crate) fn wake(&self) {
+        (self.inner)();
+    }
+}
+
+impl std::task::Wake for Wakeup {
+    fn wake(self: Arc<Self>) {
+        (self.inner)();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
         (self.inner)();
     }
 }

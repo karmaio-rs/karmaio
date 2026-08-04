@@ -732,11 +732,6 @@ impl KqueueBackend {
         }
     }
 
-    pub(crate) fn submit(&mut self) -> Result<()> {
-        // kqueue has no batched submission queue; registration happens in poll_op.
-        Ok(())
-    }
-
     pub(crate) fn wait(&mut self) -> Result<usize> {
         self.kqueue.wait(None)
     }

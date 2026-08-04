@@ -89,10 +89,11 @@ impl std::error::Error for JoinError {}
 ///
 /// # Runtime lifetime
 ///
-/// The handle is only useful while its
-/// [`Runtime`](crate::runtime::Runtime) is still alive and driving the
-/// scheduler. Awaiting after the runtime has been dropped will hang. Prefer
-/// finishing or aborting work before dropping the runtime (see
+/// For locally scheduled tasks, dropping the associated
+/// [`Runtime`](crate::runtime::Runtime) cancels unfinished work and the handle
+/// resolves with a cancellation error. Blocking tasks follow the blocking
+/// pool's shutdown policy instead. Work that must finish successfully should be
+/// awaited before dropping the runtime (see
 /// [Runtime shutdown](crate::runtime::Runtime#shutdown)).
 pub struct JoinHandle<T> {
     raw: RawTask,

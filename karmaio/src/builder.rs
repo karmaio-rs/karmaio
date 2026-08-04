@@ -6,7 +6,7 @@
 //!
 //! Every knob has a sensible default value if don't wish to provide one.
 
-use std::time::Duration;
+use std::{num::NonZeroU32, time::Duration};
 
 use crate::runtime::local::Runtime;
 
@@ -23,6 +23,8 @@ pub struct RuntimeConfig {
     pub(crate) blocking_keep_alive: Duration,
     /// Capacity of the platform driver's op slab + I/O entries/events.
     pub(crate) driver_capacity: usize,
+    /// Number of task polls between nonblocking driver turns.
+    pub(crate) event_interval: NonZeroU32,
 }
 
 impl Default for RuntimeConfig {
@@ -31,6 +33,7 @@ impl Default for RuntimeConfig {
             blocking_threads: 256,
             blocking_keep_alive: Duration::from_secs(60),
             driver_capacity: 1024,
+            event_interval: NonZeroU32::new(61).expect("default event interval is nonzero"),
         }
     }
 }
@@ -50,6 +53,7 @@ impl Default for RuntimeConfig {
 ///     .blocking_threads(128)
 ///     .blocking_keep_alive(Duration::from_secs(30))
 ///     .driver_capacity(2048)
+///     .event_interval(31)
 ///     .build()
 ///     .unwrap();
 ///
@@ -103,6 +107,22 @@ impl RuntimeBuilder {
         self
     }
 
+    /// Set the number of task polls between checks for external events.
+    ///
+    /// Smaller values reduce I/O and timer latency under sustained runnable
+    /// work. Larger values reduce the syscall overhead of nonblocking driver
+    /// turns. The default is `61`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `interval` is zero.
+    #[must_use]
+    #[track_caller]
+    pub fn event_interval(mut self, interval: u32) -> Self {
+        self.config.event_interval = NonZeroU32::new(interval).expect("event interval must be greater than zero");
+        self
+    }
+
     /// Build the configured [`Runtime`].
     pub fn build(self) -> std::io::Result<Runtime> {
         Runtime::from_config(self.config)
@@ -147,5 +167,19 @@ mod tests {
         assert_eq!(config.blocking_threads, 256);
         assert_eq!(config.blocking_keep_alive, Duration::from_secs(60));
         assert_eq!(config.driver_capacity, 1024);
+        assert_eq!(config.event_interval.get(), 61);
+    }
+
+    #[test]
+    fn event_interval_is_configurable() {
+        let builder = RuntimeBuilder::new().event_interval(31);
+
+        assert_eq!(builder.config.event_interval.get(), 31);
+    }
+
+    #[test]
+    #[should_panic(expected = "event interval must be greater than zero")]
+    fn zero_event_interval_is_rejected() {
+        let _ = RuntimeBuilder::new().event_interval(0);
     }
 }

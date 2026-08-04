@@ -21,9 +21,11 @@ impl Clone for RawTask {
 
 impl Copy for RawTask {}
 
-// SAFETY: `RawTask` is an erased task handle. The pointed-to allocation is
-// kept alive by the packed reference count, and all cross-thread coordination
-// goes through the task state machine and scheduler vtable.
+// SAFETY: `RawTask` is an erased task handle. Unowned tasks contain only Send
+// futures and outputs. Local tasks retain a scheduler-owned reference until
+// their future has been consumed on its owner thread. All remaining
+// cross-thread coordination goes through the atomic task state and a Send +
+// Sync scheduler.
 unsafe impl Send for RawTask {}
 // SAFETY: Shared access to `RawTask` only permits atomic state transitions or
 // vtable calls that uphold the task's synchronization invariants.
@@ -45,6 +47,10 @@ impl RawTask {
 
     pub(crate) fn header(&self) -> &Header {
         unsafe { self.task_ptr.as_ref() }
+    }
+
+    pub(crate) fn task_ptr(self) -> NonNull<Header> {
+        self.task_ptr
     }
 
     /// Safety: mutual exclusion is required to call this function.

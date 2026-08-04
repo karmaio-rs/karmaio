@@ -7,7 +7,7 @@ pub use crate::task::{JoinError, JoinHandle};
 pub use blocking::{BlockingPool, BlockingPoolHandle};
 pub use local::{Runtime, spawn_blocking, spawn_local};
 
-pub(crate) trait Schedule: Sized + 'static {
+pub(crate) trait Schedule: Send + Sync + Sized + 'static {
     /// Schedule the task
     fn schedule(&self, task: Task<Self>);
 

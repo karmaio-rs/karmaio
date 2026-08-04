@@ -64,12 +64,4 @@ impl<S: Schedule> LocalTaskQueue<S> {
         let queue = unsafe { &mut *self.queue.get() };
         queue.is_empty()
     }
-
-    pub(crate) fn len(&self) -> usize {
-        // SAFETY:
-        // Exclusive mutable access because this local queue is only read by
-        // the owning runtime thread.
-        let queue = unsafe { &mut *self.queue.get() };
-        queue.len()
-    }
 }

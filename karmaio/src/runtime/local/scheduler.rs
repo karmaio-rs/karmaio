@@ -1,9 +1,8 @@
 use std::{
-    collections::VecDeque,
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    cell::RefCell,
+    collections::{HashMap, VecDeque},
+    future::Future,
+    sync::{Arc, Mutex},
     thread::{self, ThreadId},
 };
 
@@ -13,7 +12,7 @@ use crate::{
         Schedule,
         local::{CURRENT_SCHEDULER, queue::LocalTaskQueue},
     },
-    task::Task,
+    task::{JoinHandle, OwnedTask, Task, TaskId, new_owned_task},
 };
 
 /// The scheduler for a single-threaded (current-thread) runtime.
@@ -26,6 +25,7 @@ use crate::{
 pub(crate) struct Scheduler {
     pub(crate) tasks: LocalTaskQueue<ScheduleHandle>,
     remote: RemoteTaskQueue,
+    owned: RefCell<HashMap<TaskId, OwnedTask<ScheduleHandle>>>,
 }
 
 impl Default for Scheduler {
@@ -33,6 +33,7 @@ impl Default for Scheduler {
         Self {
             tasks: LocalTaskQueue::default(),
             remote: RemoteTaskQueue::default(),
+            owned: RefCell::new(HashMap::new()),
         }
     }
 }
@@ -67,11 +68,55 @@ impl Scheduler {
         self.remote.drain_into(&self.tasks);
     }
 
+    pub(crate) fn spawn<F>(&self, future: F) -> JoinHandle<F::Output>
+    where
+        F: Future + 'static,
+        F::Output: 'static,
+    {
+        let (task, join, owned) = new_owned_task(future, self.handle());
+        let replaced = self.owned.borrow_mut().insert(owned.id(), owned);
+        debug_assert!(replaced.is_none());
+        self.tasks.push_back(task);
+        join
+    }
+
+    pub(crate) fn run_task(&self, task: Task<ScheduleHandle>) {
+        let id = task.run();
+        let finished = self.owned.borrow().get(&id).is_some_and(OwnedTask::is_finished);
+        if finished {
+            let owned = self.owned.borrow_mut().remove(&id);
+            drop(owned);
+        }
+    }
+
     /// Drop queued tasks while the driver remains alive so their detached
     /// operation state can be handed back to the backend during shutdown.
     pub(crate) fn shutdown(&mut self) {
-        // Close the remote queue first. Dropping local tasks may drop wakers
-        // that otherwise try to enqueue more tasks during teardown.
+        if self.owned.get_mut().is_empty() {
+            self.remote.shutdown();
+            self.tasks.clear();
+            return;
+        }
+
+        // Request cancellation while the remote queue remains open. Idle tasks
+        // are notified into that queue because shutdown runs outside the scoped
+        // scheduler context.
+        for task in self.owned.get_mut().values() {
+            task.abort();
+        }
+
+        // Every unfinished task is now either already notified or was notified
+        // by abort. Drive those notifications on the owner thread until each
+        // future has been consumed and its scheduler-owned reference released.
+        while !self.owned.get_mut().is_empty() {
+            self.remote.drain_into(&self.tasks);
+            let task = self
+                .tasks
+                .pop_front()
+                .expect("cancelled task missing scheduler notification");
+            self.run_task(task);
+        }
+
         self.remote.shutdown();
         self.tasks.clear();
     }
@@ -85,7 +130,7 @@ pub(crate) struct ScheduleHandle {
 
 impl Schedule for ScheduleHandle {
     fn schedule(&self, task: Task<Self>) {
-        if thread::current().id() == self.owner && CURRENT_SCHEDULER.is_set() {
+        if self.is_current() {
             CURRENT_SCHEDULER.with(|scheduler| scheduler.tasks.push_back(task));
         } else {
             self.remote.push_back(task);
@@ -94,6 +139,14 @@ impl Schedule for ScheduleHandle {
 
     fn yield_now(&self, task: Task<Self>) {
         self.schedule(task);
+    }
+}
+
+impl ScheduleHandle {
+    fn is_current(&self) -> bool {
+        thread::current().id() == self.owner
+            && CURRENT_SCHEDULER.is_set()
+            && CURRENT_SCHEDULER.with(|scheduler| self.remote.is_same_queue(&scheduler.remote))
     }
 }
 
@@ -116,29 +169,19 @@ struct RemoteTaskQueue {
 }
 
 struct RemoteQueueInner {
-    queue: Mutex<VecDeque<Task<ScheduleHandle>>>,
-    /// Once set, further pushes drop the task instead of enqueueing. Prevents
-    /// resurrecting the Arc cycle after the scheduler has shut down.
-    closed: AtomicBool,
+    state: Mutex<RemoteQueueState>,
 }
 
-impl Drop for RemoteQueueInner {
-    fn drop(&mut self) {
-        // Last Arc clone is going away — drop any remaining tasks so we never
-        // leave an Arc cycle if shutdown was skipped.
-        self.closed.store(true, Ordering::Relaxed);
-        if let Ok(queue) = self.queue.get_mut() {
-            queue.clear();
-        }
-    }
+enum RemoteQueueState {
+    Open(VecDeque<Task<ScheduleHandle>>),
+    Closed,
 }
 
 impl Default for RemoteTaskQueue {
     fn default() -> Self {
         Self {
             inner: Arc::new(RemoteQueueInner {
-                queue: Mutex::new(VecDeque::new()),
-                closed: AtomicBool::new(false),
+                state: Mutex::new(RemoteQueueState::Open(VecDeque::new())),
             }),
             wakeup: None,
         }
@@ -146,26 +189,44 @@ impl Default for RemoteTaskQueue {
 }
 
 impl RemoteTaskQueue {
+    fn is_same_queue(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     fn push_back(&self, task: Task<ScheduleHandle>) {
-        {
-            let mut remote = self.inner.queue.lock().expect("remote task queue poisoned");
-            if self.inner.closed.load(Ordering::Acquire) {
-                // Scheduler is gone (or going). Drop the task handle rather than
-                // re-enqueue and recreate an Arc cycle.
-                drop(task);
-                return;
+        let rejected = {
+            let mut state = self.inner.state.lock().expect("remote task queue poisoned");
+            match &mut *state {
+                RemoteQueueState::Open(queue) => {
+                    queue.push_back(task);
+                    None
+                }
+                RemoteQueueState::Closed => Some(task),
             }
-            remote.push_back(task);
+        };
+
+        if let Some(task) = rejected {
+            // A task destructor may wake another task. Run it after releasing
+            // the queue lock so scheduling remains reentrant during shutdown.
+            drop(task);
+            return;
         }
+
         if let Some(w) = &self.wakeup {
             w.wake();
         }
     }
 
     fn drain_into(&self, local: &LocalTaskQueue<ScheduleHandle>) {
-        let mut remote = self.inner.queue.lock().expect("remote task queue poisoned");
+        let queued = {
+            let mut state = self.inner.state.lock().expect("remote task queue poisoned");
+            match &mut *state {
+                RemoteQueueState::Open(queue) => std::mem::take(queue),
+                RemoteQueueState::Closed => VecDeque::new(),
+            }
+        };
 
-        while let Some(task) = remote.pop_front() {
+        for task in queued {
             local.push_back(task);
         }
     }
@@ -176,8 +237,78 @@ impl RemoteTaskQueue {
     /// `Arc → Task → ScheduleHandle → Arc` cycle before the scheduler's
     /// `Arc` clone is released.
     fn shutdown(&self) {
-        self.inner.closed.store(true, Ordering::Release);
-        let mut remote = self.inner.queue.lock().expect("remote task queue poisoned");
-        remote.clear();
+        let queued = {
+            let mut state = self.inner.state.lock().expect("remote task queue poisoned");
+            match std::mem::replace(&mut *state, RemoteQueueState::Closed) {
+                RemoteQueueState::Open(queue) => queue,
+                RemoteQueueState::Closed => VecDeque::new(),
+            }
+        };
+
+        // Dropping a task can execute arbitrary future destructors. Keep that
+        // work outside the mutex so a destructor may safely wake another task.
+        drop(queued);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        sync::{Arc, mpsc},
+        thread,
+    };
+
+    use crate::task::new_task;
+
+    use super::{RemoteQueueInner, RemoteTaskQueue, ScheduleHandle};
+
+    struct LockQueueOnDrop {
+        inner: Arc<RemoteQueueInner>,
+        lock_reentered: mpsc::Sender<()>,
+    }
+
+    impl std::future::Future for LockQueueOnDrop {
+        type Output = ();
+
+        fn poll(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for LockQueueOnDrop {
+        fn drop(&mut self) {
+            let guard = self
+                .inner
+                .state
+                .try_lock()
+                .expect("task destructor should run after unlocking the queue");
+            drop(guard);
+            self.lock_reentered.send(()).expect("report queue reentry");
+        }
+    }
+
+    #[test]
+    fn shutdown_drops_queued_tasks_after_unlocking() {
+        let remote = RemoteTaskQueue::default();
+        let scheduler = ScheduleHandle {
+            owner: thread::current().id(),
+            remote: remote.clone(),
+        };
+        let (lock_reentered_tx, lock_reentered_rx) = mpsc::channel();
+        let (task, join) = new_task(
+            LockQueueOnDrop {
+                inner: Arc::clone(&remote.inner),
+                lock_reentered: lock_reentered_tx,
+            },
+            scheduler,
+        );
+        drop(join);
+        remote.push_back(task);
+
+        remote.shutdown();
+
+        lock_reentered_rx
+            .recv()
+            .expect("task destructor should reenter the queue lock");
     }
 }

@@ -36,6 +36,7 @@ use std::{
     fmt,
     future::Future,
     io,
+    num::NonZeroUsize,
     panic::{self, AssertUnwindSafe},
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
@@ -86,7 +87,7 @@ pub struct BlockingPoolHandle {
 struct PoolInner {
     shared: Mutex<Shared>,
     condvar: Condvar,
-    thread_cap: usize,
+    thread_cap: NonZeroUsize,
     keep_alive: Duration,
 }
 
@@ -98,17 +99,18 @@ struct Shared {
     num_idle: usize,
     shutdown: bool,
     shutdown_complete: bool,
-    /// Workers reserved under the mutex but whose `JoinHandle` has not yet
-    /// been recorded. Shutdown waits for this to reach zero before taking the
-    /// worker list.
-    num_starting_workers: usize,
     worker_threads: Vec<thread::JoinHandle<()>>,
     next_thread_id: usize,
 }
 
 impl BlockingPool {
     /// Create a pool with the given thread cap and idle keep-alive.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `thread_cap` is zero.
     pub fn new(thread_cap: usize, keep_alive: Duration) -> Self {
+        let thread_cap = NonZeroUsize::new(thread_cap).expect("blocking pool thread cap must be nonzero");
         Self {
             inner: Arc::new(PoolInner {
                 shared: Mutex::new(Shared {
@@ -118,7 +120,6 @@ impl BlockingPool {
                     num_idle: 0,
                     shutdown: false,
                     shutdown_complete: false,
-                    num_starting_workers: 0,
                     worker_threads: Vec::new(),
                     next_thread_id: 0,
                 }),
@@ -225,6 +226,14 @@ impl fmt::Debug for BlockingPoolHandle {
 
 impl PoolInner {
     fn dispatch(self: &Arc<Self>, job: Job) -> io::Result<()> {
+        self.dispatch_with(job, |id| self.spawn_worker(id))
+    }
+
+    fn dispatch_with(
+        self: &Arc<Self>,
+        job: Job,
+        spawn_worker: impl FnOnce(usize) -> io::Result<thread::JoinHandle<()>>,
+    ) -> io::Result<()> {
         let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
 
         if shared.shutdown {
@@ -242,38 +251,26 @@ impl PoolInner {
             return Ok(());
         }
 
-        if shared.num_threads < self.thread_cap {
+        if shared.num_threads < self.thread_cap.get() {
             let id = shared.next_thread_id;
             shared.next_thread_id = shared.next_thread_id.wrapping_add(1);
-            // Reserve the slot under the lock so concurrent dispatches do not
-            // overshoot `thread_cap`.
-            shared.num_threads += 1;
-            shared.num_starting_workers += 1;
-            let other_live = shared.num_threads - 1;
-            drop(shared);
-
-            match self.spawn_worker(id) {
+            // Keep admission and worker creation under one mutex acquisition.
+            // A new worker blocks on this mutex until its count and join handle
+            // have been recorded, while concurrent dispatchers cannot enqueue
+            // work that depends on an unconfirmed worker.
+            match spawn_worker(id) {
                 Ok(handle) => {
-                    let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                    shared.num_starting_workers = shared.num_starting_workers.saturating_sub(1);
+                    shared.num_threads += 1;
                     shared.worker_threads.push(handle);
-                    self.condvar.notify_all();
                     Ok(())
                 }
                 Err(err) => {
-                    let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                    shared.num_starting_workers = shared.num_starting_workers.saturating_sub(1);
-                    shared.num_threads = shared.num_threads.saturating_sub(1);
-                    self.condvar.notify_all();
-                    if shared.shutdown {
-                        // Shutdown is draining the queue while worker startup
-                        // was in progress; the job will be run or dropped there.
-                        return Ok(());
-                    }
-                    if other_live > 0 {
+                    if shared.num_threads > 0 {
                         // Existing workers will eventually drain the queue.
                         Ok(())
                     } else {
+                        // No other dispatcher could mutate the queue while the
+                        // spawn was attempted, so the last job is ours.
                         let _ = shared.queue.pop_back();
                         Err(err)
                     }
@@ -392,13 +389,6 @@ impl PoolInner {
             }
         }
 
-        // A dispatcher may have reserved a worker slot and released the mutex
-        // to call `thread::spawn`. Wait until it records the JoinHandle before
-        // taking the worker list.
-        while shared.num_starting_workers > 0 {
-            shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner());
-        }
-
         let workers = std::mem::take(&mut shared.worker_threads);
 
         // Wait for every worker to exit, bounded by `timeout`. Workers notify
@@ -508,6 +498,37 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::mpsc;
     use std::time::Instant;
+
+    #[test]
+    #[should_panic(expected = "blocking pool thread cap must be nonzero")]
+    fn zero_thread_cap_is_rejected() {
+        let _pool = BlockingPool::new(0, Duration::from_secs(1));
+    }
+
+    #[test]
+    fn failed_first_worker_does_not_leave_queued_work() {
+        let pool = BlockingPool::new(1, Duration::from_secs(1));
+        let result = pool.inner.dispatch_with(
+            Job {
+                work: Box::new(|| panic!("failed worker must not run this job")),
+                mandatory: false,
+            },
+            |_| Err(io::Error::other("injected worker spawn failure")),
+        );
+
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        {
+            let shared = pool.inner.shared.lock().unwrap_or_else(|error| error.into_inner());
+            assert!(shared.queue.is_empty());
+            assert_eq!(shared.num_threads, 0);
+        }
+
+        let (done_tx, done_rx) = mpsc::channel();
+        pool.dispatch(move || done_tx.send(()).expect("report recovered dispatch"));
+        done_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("a later dispatch should start a worker");
+    }
 
     #[test]
     fn dispatch_runs_job() {

@@ -549,11 +549,6 @@ impl IocpBackend {
         }
     }
 
-    pub(crate) fn submit(&mut self) -> Result<()> {
-        // IOCP operations are submitted by the individual overlapped syscalls.
-        Ok(())
-    }
-
     pub(crate) fn wait(&mut self) -> Result<usize> {
         let num_entries = self.port.get_many(&mut self.entries, None)?;
         Ok(num_entries)

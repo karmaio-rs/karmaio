@@ -4,6 +4,7 @@ use std::{
     io,
     pin::pin,
     task::{Context, Waker},
+    time::Duration,
 };
 
 use std::rc::Rc;
@@ -11,7 +12,7 @@ use std::rc::Rc;
 use crate::{
     builder::{RuntimeBuilder, RuntimeConfig},
     driver::{Driver, Handle},
-    runtime::blocking::{BlockingPool, run_blocking},
+    runtime::blocking::{spawn_blocking_task, BlockingPool},
     runtime::local::scheduler::Scheduler,
     task::{join::JoinHandle, new_task},
     time::Timer,
@@ -232,8 +233,42 @@ impl Runtime {
         F: FnOnce() -> R + Send + 'static,
         R: Send + 'static,
     {
-        let future = run_blocking(self.driver.blocking_pool(), self.driver.wakeup(), f);
-        self.spawn(future)
+        spawn_blocking_task(self.driver.blocking_pool(), self.driver.wakeup(), f)
+    }
+
+    /// Shut down the runtime, waiting at most `duration` for the blocking pool
+    /// to finish draining before dropping it.
+    ///
+    /// This is a convenience for dropping a runtime from a context where
+    /// blocking on in-flight blocking work would be undesirable (for example
+    /// inside an async context). After the timeout elapses, blocking workers
+    /// still executing are detached and finish on their own.
+    ///
+    /// ```no_run
+    /// use std::time::Duration;
+    /// use karmaio::runtime::Runtime;
+    ///
+    /// let mut rt = Runtime::new().unwrap();
+    /// rt.block_on(async {
+    ///     // work
+    /// });
+    /// rt.shutdown_timeout(Duration::from_millis(100));
+    /// ```
+    pub fn shutdown_timeout(self, duration: Duration) {
+        self._blocking.shutdown_with_timeout(duration);
+        // Dropping `self` runs the normal teardown; the pool already shut down
+        // so its shutdown step returns immediately.
+    }
+
+    /// Shut down the runtime without waiting for any blocking work to stop.
+    ///
+    /// Equivalent to [`Runtime::shutdown_timeout`] with a zero duration.
+    ///
+    /// Blocking jobs that are mid-execution are detached and may still be
+    /// running when this returns, so resources they were about to release may
+    /// leak if they never finish.
+    pub fn shutdown_background(self) {
+        self.shutdown_timeout(Duration::ZERO);
     }
 }
 
@@ -257,13 +292,7 @@ where
 
     CURRENT_DRIVER.with(|handle| {
         let driver = handle.upgrade().expect("spawn_blocking: driver has been dropped");
-        let future = run_blocking(driver.blocking_pool(), driver.wakeup(), f);
-
-        CURRENT_SCHEDULER.with(|scheduler| {
-            let (task, join_handle) = new_task(future, scheduler.handle());
-            scheduler.tasks.push_back(task);
-            join_handle
-        })
+        spawn_blocking_task(driver.blocking_pool(), driver.wakeup(), f)
     })
 }
 
@@ -418,7 +447,6 @@ mod tests {
         let (release_tx, release_rx) = mpsc::channel();
         let (completed_tx, completed_rx) = mpsc::channel();
         let (drop_started_tx, drop_started_rx) = mpsc::channel();
-
         let task = runtime.spawn_blocking(move || {
             started_tx.send(()).expect("report blocking work start");
             release_rx.recv().expect("release blocking work");
@@ -444,6 +472,57 @@ mod tests {
         completed_rx
             .try_recv()
             .expect("runtime drop should join the running blocking job");
+    }
+
+    #[test]
+    fn shutdown_timeout_detaches_running_blocking_work() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let _task = runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("report blocking work start");
+            release_rx.recv().ok();
+        });
+
+        runtime.block_on(async {
+            crate::time::sleep(std::time::Duration::from_millis(1)).await;
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking work should start before teardown");
+
+        // A zero timeout must not wait for the stuck blocking job.
+        let start = std::time::Instant::now();
+        runtime.shutdown_timeout(std::time::Duration::from_millis(0));
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+
+        drop(release_tx);
+    }
+
+    #[test]
+    fn shutdown_background_is_fast() {
+        let mut runtime = Runtime::new().expect("runtime should start");
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let _task = runtime.spawn_blocking(move || {
+            started_tx.send(()).expect("report blocking work start");
+            release_rx.recv().ok();
+        });
+
+        runtime.block_on(async {
+            crate::time::sleep(std::time::Duration::from_millis(1)).await;
+        });
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("blocking work should start before teardown");
+
+        let start = std::time::Instant::now();
+        runtime.shutdown_background();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+
+        drop(release_tx);
     }
 
     #[test]

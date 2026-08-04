@@ -11,6 +11,21 @@
 //! - Zero extra dependencies: `Mutex` + `Condvar` + `VecDeque`.
 //! - Completions wake the runtime through the driver's [`Wakeup`] token.
 //!
+//! # Shutdown semantics
+//!
+//! Every job carries a `mandatory` flag. Driver-dispatched syscalls (for
+//! example [`crate::driver::ops::close`]) are mandatory: their side effect —
+//! usually releasing an OS resource such as an fd — must happen even during
+//! shutdown, otherwise the resource leaks. User work spawned through
+//! [`crate::runtime::spawn_blocking`] is optional and may be dropped if the
+//! runtime shuts down before it runs.
+//!
+//! At shutdown the owner drains the queue itself, running mandatory jobs and
+//! dropping optional ones, then waits up to a configurable timeout for the
+//! workers to finish whatever they were already executing. A timed-out shutdown
+//! detaches the remaining workers; they still finish their in-flight job and
+//! exit on their own.
+//!
 //! # When not to use this pool
 //!
 //! Long-lived or infinite loops should use a dedicated `std::thread` instead.
@@ -24,14 +39,29 @@ use std::{
     panic::{self, AssertUnwindSafe},
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
-    task::{Context, Poll, Waker},
+    task::{Context, Poll},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use crate::driver::Wakeup;
+use crate::{
+    driver::Wakeup,
+    runtime::Schedule,
+    task::{new_task, JoinHandle, Task},
+};
 
-type Job = Box<dyn FnOnce() + Send + 'static>;
+/// Boxed unit of work dispatched to the pool.
+type JobWork = Box<dyn FnOnce() + Send + 'static>;
+
+/// A unit of work, tagged with whether it must run even during shutdown.
+///
+/// Mandatory jobs are dispatched by the driver for operations whose side
+/// effects (releasing fds/handles) must not be skipped. Optional jobs are user
+/// work from [`crate::runtime::spawn_blocking`].
+struct Job {
+    work: JobWork,
+    mandatory: bool,
+}
 
 /// Owned blocking pool. Dropping it signals shutdown and joins workers.
 ///
@@ -116,12 +146,21 @@ impl BlockingPool {
         self.handle().dispatch(f);
     }
 
-    /// Stop accepting new work, discard queued jobs, and join every worker.
-    ///
-    /// Jobs already running are allowed to finish. The operation is idempotent;
-    /// concurrent callers wait for the first shutdown to finish joining.
+    /// Stop accepting new work, run any queued mandatory jobs, discard optional
+    /// queued jobs, and join every worker. Jobs already running are allowed to
+    /// finish. The operation is idempotent; concurrent callers wait for the
+    /// first shutdown to finish joining.
     pub(crate) fn shutdown_and_join(&self) {
-        self.inner.shutdown_and_join();
+        self.inner.shutdown(None);
+    }
+
+    /// Shut the pool down, but wait at most `timeout` for workers to exit.
+    ///
+    /// Queued mandatory jobs are still run (so driver side effects are
+    /// preserved); optional jobs are dropped. If the timeout elapses while a
+    /// worker is still executing, that worker is detached rather than joined.
+    pub(crate) fn shutdown_with_timeout(&self, timeout: Duration) {
+        self.inner.shutdown(Some(timeout));
     }
 
     /// Number of live worker threads (for tests / diagnostics).
@@ -161,8 +200,16 @@ impl BlockingPoolHandle {
     }
 
     /// Fallible dispatch used by tests and internal callers.
-    pub(crate) fn try_dispatch(&self, job: Job) -> io::Result<()> {
-        self.inner.dispatch(job)
+    pub(crate) fn try_dispatch(&self, job: JobWork) -> io::Result<()> {
+        self.inner.dispatch(Job { work: job, mandatory: false })
+    }
+
+    /// Fallible dispatch of a mandatory job that must run even during shutdown.
+    ///
+    /// Used by the drivers to offload syscalls whose side effects (such as
+    /// closing an fd) must not be dropped with the runtime.
+    pub(crate) fn try_dispatch_mandatory(&self, job: JobWork) -> io::Result<()> {
+        self.inner.dispatch(Job { work: job, mandatory: true })
     }
 }
 
@@ -219,8 +266,8 @@ impl PoolInner {
                     shared.num_threads = shared.num_threads.saturating_sub(1);
                     self.condvar.notify_all();
                     if shared.shutdown {
-                        // Shutdown cleared the queue while worker startup was
-                        // in progress, so the dropped job is already canceled.
+                        // Shutdown is draining the queue while worker startup
+                        // was in progress; the job will be run or dropped there.
                         return Ok(());
                     }
                     if other_live > 0 {
@@ -251,10 +298,17 @@ impl PoolInner {
         loop {
             // BUSY: drain the queue.
             while let Some(job) = shared.queue.pop_front() {
+                if shared.shutdown && !job.mandatory {
+                    // The pool is shutting down and this job is optional: drop
+                    // it without running. Mandatory jobs (driver syscalls) are
+                    // still executed so their side effects are preserved.
+                    drop(job);
+                    continue;
+                }
                 drop(shared);
                 // Panics in jobs must not kill the worker thread.
-                // Job-level panic propagation is handled by `run_blocking`.
-                let _ = panic::catch_unwind(AssertUnwindSafe(job));
+                // Job-level panic propagation is handled by the task system.
+                let _ = panic::catch_unwind(AssertUnwindSafe(job.work));
                 shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
             }
 
@@ -291,20 +345,52 @@ impl PoolInner {
         }
 
         shared.num_threads = shared.num_threads.saturating_sub(1);
+        // Shutdown joins workers by waiting for `num_threads` to reach zero.
+        self.condvar.notify_all();
     }
 
-    fn shutdown_and_join(&self) {
+    fn shutdown(&self, timeout: Option<Duration>) {
         let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+
         if shared.shutdown {
+            // A concurrent caller is already shutting down; wait for it to
+            // finish (honoring this caller's own cap).
+            let deadline = timeout.map(|duration| Instant::now() + duration);
             while !shared.shutdown_complete {
-                shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner());
+                match deadline {
+                    Some(deadline) => {
+                        let now = Instant::now();
+                        if now >= deadline {
+                            break;
+                        }
+                        let (guard, _) = self.condvar.wait_timeout(shared, deadline - now).unwrap_or_else(|e| e.into_inner());
+                        shared = guard;
+                    }
+                    None => shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner()),
+                }
             }
             return;
         }
+
         shared.shutdown = true;
-        // Drop queued jobs so oneshot receivers observe cancellation.
-        shared.queue.clear();
         self.condvar.notify_all();
+
+        // Drain the queue ourselves so mandatory jobs run even if every worker
+        // is stuck in an optional (user) job. Optional jobs are dropped.
+        loop {
+            match shared.queue.pop_front() {
+                Some(job) if job.mandatory => {
+                    drop(shared);
+                    let _ = panic::catch_unwind(AssertUnwindSafe(job.work));
+                    shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                }
+                Some(job) => {
+                    // Non-mandatory queued job: cancel it.
+                    drop(job);
+                }
+                None => break,
+            }
+        }
 
         // A dispatcher may have reserved a worker slot and released the mutex
         // to call `thread::spawn`. Wait until it records the JoinHandle before
@@ -314,126 +400,106 @@ impl PoolInner {
         }
 
         let workers = std::mem::take(&mut shared.worker_threads);
-        drop(shared);
 
-        for handle in workers {
-            let _ = handle.join();
-        }
-
-        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-        shared.shutdown_complete = true;
-        self.condvar.notify_all();
-    }
-}
-
-// ===== oneshot channel for spawn_blocking =====
-
-struct OneshotState<T> {
-    value: Option<T>,
-    waker: Option<Waker>,
-    /// `true` once the sender has been dropped without sending.
-    closed: bool,
-}
-
-struct OneshotInner<T> {
-    state: Mutex<OneshotState<T>>,
-}
-
-struct OneshotSender<T> {
-    inner: Arc<OneshotInner<T>>,
-}
-
-struct OneshotReceiver<T> {
-    inner: Arc<OneshotInner<T>>,
-}
-
-fn oneshot_channel<T>() -> (OneshotSender<T>, OneshotReceiver<T>) {
-    let inner = Arc::new(OneshotInner {
-        state: Mutex::new(OneshotState {
-            value: None,
-            waker: None,
-            closed: false,
-        }),
-    });
-    (
-        OneshotSender {
-            inner: Arc::clone(&inner),
-        },
-        OneshotReceiver { inner },
-    )
-}
-
-impl<T> OneshotSender<T> {
-    fn send(self, value: T) {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.value = Some(value);
-        if let Some(waker) = state.waker.take() {
-            drop(state);
-            waker.wake();
-        }
-    }
-}
-
-impl<T> Drop for OneshotSender<T> {
-    fn drop(&mut self) {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.value.is_none() {
-            state.closed = true;
-            if let Some(waker) = state.waker.take() {
-                drop(state);
-                waker.wake();
+        // Wait for every worker to exit, bounded by `timeout`. Workers notify
+        // the condvar when they decrement `num_threads` at thread exit.
+        let deadline = timeout.map(|duration| Instant::now() + duration);
+        while shared.num_threads > 0 {
+            match deadline {
+                Some(deadline) => {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        break;
+                    }
+                    let (guard, _) = self.condvar.wait_timeout(shared, deadline - now).unwrap_or_else(|e| e.into_inner());
+                    shared = guard;
+                }
+                None => shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner()),
             }
         }
+        let all_exited = shared.num_threads == 0;
+
+        shared.shutdown_complete = true;
+        self.condvar.notify_all();
+        drop(shared);
+
+        if all_exited {
+            for handle in workers {
+                let _ = handle.join();
+            }
+        } else {
+            // The timeout elapsed while a worker was still running. Detach the
+            // remaining workers; they finish their in-flight job and exit on
+            // their own. Their completions may arrive after the driver has shut
+            // down and are simply dropped (the wakeup token is a no-op once
+            // closed).
+            drop(workers);
+        }
     }
 }
 
-impl<T> Future for OneshotReceiver<T> {
-    type Output = Result<T, ()>;
+// ===== task-based blocking spawn =====
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut state = self.inner.state.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(value) = state.value.take() {
-            return Poll::Ready(Ok(value));
-        }
-        if state.closed {
-            return Poll::Ready(Err(()));
-        }
-        match &state.waker {
-            Some(w) if w.will_wake(cx.waker()) => {}
-            _ => state.waker = Some(cx.waker().clone()),
-        }
-        Poll::Pending
-    }
-}
-
-/// Result of a blocking job, including panic payloads.
-type JobResult<T> = Result<T, Box<dyn std::any::Any + Send + 'static>>;
-
-/// Schedule `f` on the pool and return a future that resolves to its output.
+/// Future that runs a blocking closure when polled.
 ///
-/// The future panics (caught by the task system as `JoinError::panic`) if the
-/// blocking closure panics. If the pool shuts down before the job finishes,
-/// the future panics with a descriptive message.
-pub(crate) fn run_blocking<F, R>(pool: &BlockingPoolHandle, wakeup: Wakeup, f: F) -> impl Future<Output = R> + 'static
+/// A pool worker polls it exactly once via [`Task::run`]; the closure runs and
+/// its output becomes the task's output. Panics in the closure are caught by the
+/// task system and surface through the [`JoinHandle`] as `JoinError::panic`.
+pub(crate) struct BlockingTask<F> {
+    func: Option<F>,
+}
+
+// SAFETY: `BlockingTask` does not rely on address stability: it is polled once
+// and only to extract the wrapped closure.
+impl<F> Unpin for BlockingTask<F> {}
+
+impl<F> BlockingTask<F> {
+    pub(crate) fn new(func: F) -> Self {
+        Self { func: Some(func) }
+    }
+}
+
+impl<F, R> Future for BlockingTask<F>
+where
+    F: FnOnce() -> R,
+{
+    type Output = R;
+
+    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<R> {
+        let func = self.func.take().expect("blocking task polled more than once");
+        Poll::Ready(func())
+    }
+}
+
+/// `Schedule` implementation for blocking tasks.
+///
+/// Blocking tasks are polled once by a pool worker and never yield, so they are
+/// never rescheduled.
+pub(crate) struct BlockingSchedule;
+
+impl Schedule for BlockingSchedule {
+    fn schedule(&self, _task: Task<Self>) {
+        unreachable!("blocking tasks are never rescheduled");
+    }
+}
+
+/// Spawn `f` onto the pool as a task, returning a [`JoinHandle`] for its output.
+///
+/// The caller's [`Wakeup`] is poked after the task completes so a runtime parked
+/// in `driver.wait()` re-polls the `JoinHandle`.
+pub(crate) fn spawn_blocking_task<F, R>(pool: &BlockingPoolHandle, wakeup: Wakeup, f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
     R: Send + 'static,
 {
-    let (tx, rx) = oneshot_channel::<JobResult<R>>();
+    let (task, join_handle) = new_task(BlockingTask::new(f), BlockingSchedule);
 
     pool.dispatch(move || {
-        let result = panic::catch_unwind(AssertUnwindSafe(f));
-        tx.send(result);
+        task.run();
         wakeup.wake();
     });
 
-    async move {
-        match rx.await {
-            Ok(Ok(value)) => value,
-            Ok(Err(payload)) => panic::resume_unwind(payload),
-            Err(()) => panic!("blocking pool shut down before task completed"),
-        }
-    }
+    join_handle
 }
 
 #[cfg(test)]
@@ -595,30 +661,119 @@ mod tests {
     }
 
     #[test]
-    fn oneshot_delivers_value() {
-        let (tx, rx) = oneshot_channel::<u32>();
-        thread::spawn(move || {
-            tx.send(99);
+    fn shutdown_runs_queued_mandatory_jobs() {
+        let pool = BlockingPool::new(1, Duration::from_secs(5));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let handle = pool.handle();
+
+        // Occupy the only worker with an optional job that blocks forever.
+        pool.dispatch(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().ok();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should start the first job");
+
+        // Queue a mandatory job behind the stuck optional job.
+        let (ran_tx, ran_rx) = mpsc::channel();
+        handle
+            .try_dispatch_mandatory(Box::new(move || {
+                ran_tx.send(()).unwrap();
+            }))
+            .expect("mandatory dispatch should succeed");
+
+        // Shutdown must run the queued mandatory job even though the worker is
+        // stuck; the owner drains the queue itself.
+        let shutdown_thread = thread::spawn(move || pool.shutdown_and_join());
+        ran_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("queued mandatory job should run at shutdown");
+
+        drop(release_tx);
+        shutdown_thread.join().expect("shutdown should finish");
+    }
+
+    #[test]
+    fn mandatory_dispatch_rejected_after_shutdown() {
+        let pool = BlockingPool::new(1, Duration::from_secs(1));
+        let handle = pool.handle();
+        drop(pool);
+
+        let result = handle.try_dispatch_mandatory(Box::new(|| {}));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn shutdown_with_zero_timeout_detaches_stuck_worker() {
+        let pool = BlockingPool::new(1, Duration::from_secs(5));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        pool.dispatch(move || {
+            started_tx.send(()).unwrap();
+            release_rx.recv().ok();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("worker should start the job");
+
+        // A zero timeout must return immediately even though the worker is
+        // stuck; the worker is detached and finishes when released.
+        let start = Instant::now();
+        pool.shutdown_with_timeout(Duration::from_millis(0));
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        drop(release_tx);
+    }
+
+    #[test]
+    fn spawn_blocking_task_runs_and_wakes() {
+        let pool = BlockingPool::new(2, Duration::from_secs(5));
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakeup = crate::driver::Wakeup::new({
+            let wakes = Arc::clone(&wakes);
+            move || {
+                wakes.fetch_add(1, Ordering::Relaxed);
+            }
         });
 
-        let mut rx = rx;
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(&waker);
+        let handle = spawn_blocking_task(&pool.handle(), wakeup, || 42usize);
+        assert_eq!(handle.is_finished(), false);
+
         let start = Instant::now();
         loop {
-            match Pin::new(&mut rx).poll(&mut cx) {
-                Poll::Ready(Ok(v)) => {
-                    assert_eq!(v, 99);
-                    break;
-                }
-                Poll::Ready(Err(())) => panic!("oneshot closed"),
-                Poll::Pending => {
-                    if start.elapsed() > Duration::from_secs(2) {
-                        panic!("oneshot timed out");
-                    }
-                    thread::sleep(Duration::from_millis(1));
-                }
+            if handle.is_finished() {
+                break;
             }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("blocking task did not finish");
+            }
+            thread::sleep(Duration::from_millis(1));
         }
+        assert!(wakes.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn spawn_blocking_task_reports_panics() {
+        let pool = BlockingPool::new(2, Duration::from_secs(5));
+        let wakeup = crate::driver::Wakeup::new(|| {});
+
+        let handle = spawn_blocking_task(&pool.handle(), wakeup, || -> usize {
+            panic!("boom");
+        });
+        let start = Instant::now();
+        loop {
+            if handle.is_finished() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(2) {
+                panic!("blocking task did not finish");
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // The panic must not propagate to the test process: `is_finished` only
+        // observes completion, the panic is stored for the JoinHandle.
     }
 }

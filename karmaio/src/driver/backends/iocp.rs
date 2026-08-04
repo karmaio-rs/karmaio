@@ -402,7 +402,9 @@ impl IocpBackend {
     fn push_blocking(&self, key: OpKey, job: BlockingJob, pool: &BlockingPoolHandle, wakeup: &Wakeup) -> Result<()> {
         let done = Arc::clone(&self.blocking_done);
         let guard = BlockingCompletionGuard::new(key, done, wakeup.clone());
-        pool.try_dispatch(Box::new(move || {
+        // Mandatory: the syscall's side effect (e.g. closing a handle) must run
+        // even if the runtime shuts down before the pool picks the job up.
+        pool.try_dispatch_mandatory(Box::new(move || {
             let result = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked")),));
             guard.complete(result);
         }))

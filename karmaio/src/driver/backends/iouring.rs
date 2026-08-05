@@ -345,7 +345,7 @@ impl IoUringBackend {
         let mut rearm_wakeup = false;
         let mut deferred = Vec::new();
 
-        for completion in completion_queue {
+        for completion in &mut completion_queue {
             let Some(key) = CompletionKey::decode(completion.user_data()) else {
                 // A malformed or stale control value cannot name an operation.
                 continue;

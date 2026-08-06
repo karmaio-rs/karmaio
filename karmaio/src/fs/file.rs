@@ -1,5 +1,10 @@
 use std::path::Path;
 
+#[cfg(unix)]
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle};
+
 use crate::{
     buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
     driver::{helpers::attached_handle::AttachedHandle, ops::Op},
@@ -24,6 +29,7 @@ use crate::{
 /// Explicit `close().await` is recommended when you need non-blocking close or to
 /// observe close errors. Closing a file does not guarantee writes have persisted
 /// to disk; use [`sync_all`] for that.
+#[derive(Debug, Clone)]
 pub struct File {
     /// Open file; associated with the driver and shared so in-flight ops can
     /// pin the resource until complete.
@@ -31,6 +37,11 @@ pub struct File {
 }
 
 impl File {
+    /// Creates a new set of options for opening a file.
+    pub fn options() -> OpenOptions {
+        OpenOptions::new()
+    }
+
     /// Opens a file in write-only mode.
     ///
     /// This function will create a file if it does not exist, and will truncate it if it does.
@@ -127,7 +138,47 @@ impl File {
 
     /// Changes the permissions on the underlying file.
     pub async fn set_permissions(&self, perm: Permissions) -> std::io::Result<()> {
-        Op::set_permissions(&self.handle, perm)?.await
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // io_uring has no chmod operation. Duplicate the descriptor so the
+            // blocking worker owns a Send handle to the same file.
+            let file = self.handle.try_clone()?;
+            let perm = std::fs::Permissions::from_mode(perm.mode());
+            crate::fs::asyncify(move || file.set_permissions(perm)).await
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            Op::set_permissions(&self.handle, perm)?.await
+        }
+    }
+
+    /// Creates another `File` that refers to the same underlying OS file.
+    ///
+    /// Unlike [`Clone`], this duplicates the OS handle. Both handles still
+    /// share the operating system's file description and cursor state.
+    pub async fn try_clone(&self) -> std::io::Result<Self> {
+        Self::from_std(self.handle.try_clone()?)
+    }
+
+    /// Converts this file into a standard-library file after outstanding
+    /// operations and shared Karmaio handles have been released.
+    pub async fn into_std(self) -> std::fs::File {
+        self.handle
+            .into_inner()
+            .take()
+            .await
+            .expect("file resource was already taken")
+    }
+
+    /// Attempts to convert this file into a standard-library file immediately.
+    ///
+    /// The original `File` is returned if another clone or operation currently
+    /// holds the resource.
+    pub fn try_into_std(self) -> Result<std::fs::File, Self> {
+        self.handle.try_unwrap().map_err(|handle| Self { handle })
     }
 }
 
@@ -173,5 +224,50 @@ impl AsyncWriteAt for File {
         Op::writev(&self.handle, bufs, pos)
             .expect("Failed to submit writev operation (no runtime or driver error)")
             .await
+    }
+}
+
+impl AsyncWriteAt for &File {
+    async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B> {
+        Op::write_at(&self.handle, buf, pos)
+            .expect("Failed to submit write operation (no runtime or driver error)")
+            .await
+    }
+
+    #[cfg(not(windows))]
+    async fn write_vectored_at<B: BoundedIoBuf>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
+        Op::writev(&self.handle, bufs, pos)
+            .expect("Failed to submit writev operation (no runtime or driver error)")
+            .await
+    }
+}
+
+#[cfg(unix)]
+impl AsRawFd for File {
+    fn as_raw_fd(&self) -> RawFd {
+        self.handle.as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl AsFd for File {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.handle.as_fd()
+    }
+}
+
+#[cfg(windows)]
+impl AsRawHandle for File {
+    fn as_raw_handle(&self) -> RawHandle {
+        self.handle.as_raw_handle()
+    }
+}
+
+#[cfg(windows)]
+impl AsHandle for File {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        // SAFETY: the borrowed handle cannot outlive `self`, which owns the
+        // underlying file handle for the duration of this borrow.
+        unsafe { BorrowedHandle::borrow_raw(self.as_raw_handle()) }
     }
 }

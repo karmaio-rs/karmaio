@@ -3,6 +3,7 @@ use std::path::Path;
 
 use crate::driver::ops::Op;
 
+#[derive(Debug)]
 pub struct DirBuilder {
     #[cfg(unix)]
     mode: u32,
@@ -79,6 +80,10 @@ impl DirBuilder {
     }
 
     async fn create_recursive(&self, path: &Path) -> std::io::Result<()> {
+        if path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
         let mut missing: Vec<&Path> = Vec::new();
         let mut current = path;
 
@@ -122,6 +127,12 @@ impl DirBuilder {
                 Err(e) => return Err(e),
             }
         }
+    }
+}
+
+impl Default for DirBuilder {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

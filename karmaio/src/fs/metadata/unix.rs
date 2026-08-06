@@ -1,7 +1,7 @@
 use std::{
     io,
     os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt},
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 #[derive(Clone)]
@@ -135,6 +135,27 @@ pub(crate) struct FileType {
 }
 
 impl FileType {
+    pub(crate) fn from_std(file_type: std::fs::FileType) -> Self {
+        let mode = if file_type.is_symlink() {
+            libc::S_IFLNK
+        } else if file_type.is_dir() {
+            libc::S_IFDIR
+        } else if file_type.is_file() {
+            libc::S_IFREG
+        } else if file_type.is_block_device() {
+            libc::S_IFBLK
+        } else if file_type.is_char_device() {
+            libc::S_IFCHR
+        } else if file_type.is_fifo() {
+            libc::S_IFIFO
+        } else if file_type.is_socket() {
+            libc::S_IFSOCK
+        } else {
+            0
+        };
+        Self::from_mode(mode as libc::mode_t)
+    }
+
     fn from_mode(mode: libc::mode_t) -> Self {
         Self { mode }
     }
@@ -218,5 +239,5 @@ fn stat_ctime_nsec(stat: &rustix::fs::Stat) -> i64 {
 }
 
 fn timespec(secs: libc::time_t, nsecs: libc::c_long) -> io::Result<SystemTime> {
-    Ok(SystemTime::UNIX_EPOCH + Duration::new(secs as u64, nsecs as u32))
+    super::system_time_from_unix(secs, nsecs as u32)
 }

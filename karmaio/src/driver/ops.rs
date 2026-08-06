@@ -28,13 +28,15 @@ pub(crate) mod create_dir;
 pub(crate) mod hardlink;
 #[cfg(feature = "fs")]
 pub(crate) mod open;
+#[cfg(all(feature = "fs", unix))]
+pub(crate) mod path_stat;
 #[cfg(feature = "fs")]
 pub(crate) mod read_at;
 #[cfg(feature = "fs")]
 pub(crate) mod readv;
 #[cfg(feature = "fs")]
 pub(crate) mod rename;
-#[cfg(feature = "fs")]
+#[cfg(all(feature = "fs", not(target_os = "linux")))]
 pub(crate) mod set_permissions;
 #[cfg(feature = "fs")]
 pub(crate) mod stat;

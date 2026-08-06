@@ -162,19 +162,6 @@ impl OpenOptions {
     }
 }
 
-/// Opens an existing file or directory for read-only attribute access.
-pub(crate) async fn open_path(path: impl AsRef<Path>) -> std::io::Result<File> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
-        opts.custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
-    }
-    opts.open(path).await
-}
-
 #[cfg(unix)]
 impl OpenOptions {
     pub(crate) fn access_mode(&self) -> std::io::Result<libc::c_int> {

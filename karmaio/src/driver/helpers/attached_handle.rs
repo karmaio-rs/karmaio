@@ -129,6 +129,11 @@ impl<T> AttachedHandle<T> {
     pub(crate) fn into_inner(self) -> SharedIoHandle<T> {
         self.source
     }
+
+    /// Tries to consume this handle and return its resource without closing it.
+    pub(crate) fn try_unwrap(self) -> Result<T, Self> {
+        self.source.try_unwrap().map_err(|source| Self { source })
+    }
 }
 
 impl<T> Clone for AttachedHandle<T> {

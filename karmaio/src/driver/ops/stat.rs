@@ -36,7 +36,7 @@ pub(crate) struct Stat {
     /// Filled by the blocking-pool job via shared storage.
     stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<rustix::fs::Stat>>>>,
     #[cfg(windows)]
-    result: Option<Metadata>,
+    metadata_shared: std::sync::Arc<std::sync::Mutex<Option<Metadata>>>,
 }
 
 impl Op<Stat> {
@@ -62,7 +62,7 @@ impl Op<Stat> {
         #[cfg(windows)]
         let data = Stat {
             handle: handle.clone(),
-            result: None,
+            metadata_shared: std::sync::Arc::new(std::sync::Mutex::new(None)),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -144,17 +144,27 @@ unsafe impl IocpOperation for Stat {
     fn submit(&mut self) -> IocpSubmission {
         use windows_sys::Win32::Foundation::HANDLE;
 
-        match Metadata::from_handle(self.handle.raw_handle() as HANDLE) {
-            Ok(metadata) => {
-                self.result = Some(metadata);
-                IocpSubmission::Ready(Completion::new(Ok(0) ))
+        let handle = self.handle.raw_handle() as isize;
+        let metadata_slot = std::sync::Arc::clone(&self.metadata_shared);
+
+        windows_syscall_blocking!({
+            match Metadata::from_handle(handle as HANDLE) {
+                Ok(metadata) => {
+                    *metadata_slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(metadata);
+                    Ok(0_u32)
+                }
+                Err(error) => Err(error),
             }
-            Err(err) => IocpSubmission::Ready(Completion::new(Err(err) )),
-        }
+        })
     }
 
     fn complete(self, completion: Completion) -> Self::Output {
         completion.result?;
-        Ok(self.result.expect("metadata missing after successful submit"))
+        Ok(self
+            .metadata_shared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("metadata missing after successful completion"))
     }
 }

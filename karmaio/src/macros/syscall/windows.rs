@@ -5,7 +5,6 @@
 /// - `BOOL` — non-zero indicates success (e.g. `CreateDirectoryW`, `CloseHandle`)
 /// - `BOOLEAN` — `true` indicates success (e.g. `CreateSymbolicLinkW`)
 /// - `SOCKET` — zero indicates success (e.g. `closesocket`)
-/// - `HANDLE` — anything other than `INVALID_HANDLE_VALUE` is success (e.g. `CreateFileW`)
 macro_rules! windows_syscall {
     (BOOL, $e:expr) => {{
         #[allow(unused_unsafe)]
@@ -34,15 +33,6 @@ macro_rules! windows_syscall {
             }))
         } else {
             Ok(0u32)
-        }
-    }};
-    (HANDLE, $e:expr) => {{
-        #[allow(unused_unsafe)]
-        let res = unsafe { $e };
-        if res == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
-            Err(std::io::Error::last_os_error())
-        } else {
-            Ok(res as u32)
         }
     }};
 }

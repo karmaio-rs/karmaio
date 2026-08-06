@@ -1,5 +1,6 @@
 use std::{
     io,
+    os::windows::fs::{FileTypeExt, MetadataExt},
     time::{Duration, SystemTime},
 };
 
@@ -19,6 +20,7 @@ pub(crate) struct Metadata {
     volume_serial_number: Option<u32>,
     number_of_links: Option<u32>,
     file_index: Option<u64>,
+    change_time: Option<u64>,
 }
 
 impl Metadata {
@@ -54,7 +56,29 @@ impl Metadata {
                 volume_serial_number: Some(info.dwVolumeSerialNumber),
                 number_of_links: Some(info.nNumberOfLinks),
                 file_index: Some(info.nFileIndexLow as u64 | ((info.nFileIndexHigh as u64) << 32)),
+                change_time: None,
             })
+        }
+    }
+
+    pub(crate) fn from_std(metadata: std::fs::Metadata) -> Self {
+        let file_type = metadata.file_type();
+        let mut attributes = metadata.file_attributes();
+        if file_type.is_symlink_dir() {
+            attributes |= FILE_ATTRIBUTE_DIRECTORY;
+        }
+
+        Self {
+            attributes,
+            creation_time: u64_to_filetime(metadata.creation_time()),
+            last_access_time: u64_to_filetime(metadata.last_access_time()),
+            last_write_time: u64_to_filetime(metadata.last_write_time()),
+            file_size: metadata.file_size(),
+            reparse_tag: if file_type.is_symlink() { 0x2000_0000 } else { 0 },
+            volume_serial_number: None,
+            number_of_links: None,
+            file_index: None,
+            change_time: None,
         }
     }
 
@@ -123,7 +147,7 @@ impl Metadata {
     }
 
     pub(crate) fn change_time(&self) -> Option<u64> {
-        None
+        self.change_time
     }
 }
 
@@ -134,6 +158,13 @@ pub(crate) struct FileType {
 }
 
 impl FileType {
+    pub(crate) fn from_std(file_type: std::fs::FileType) -> Self {
+        Self {
+            is_directory: file_type.is_dir() || file_type.is_symlink_dir(),
+            is_symlink: file_type.is_symlink(),
+        }
+    }
+
     fn new(attributes: u32, reparse_tag: u32) -> Self {
         let is_directory = attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
         let is_symlink = {
@@ -194,6 +225,13 @@ impl Permissions {
 
 fn filetime_to_u64(ft: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (ft.dwLowDateTime as u64) | ((ft.dwHighDateTime as u64) << 32)
+}
+
+fn u64_to_filetime(value: u64) -> windows_sys::Win32::Foundation::FILETIME {
+    windows_sys::Win32::Foundation::FILETIME {
+        dwLowDateTime: value as u32,
+        dwHighDateTime: (value >> 32) as u32,
+    }
 }
 
 fn filetime_to_system_time(ft: &windows_sys::Win32::Foundation::FILETIME) -> io::Result<SystemTime> {

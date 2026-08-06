@@ -14,7 +14,11 @@ use windows as sys;
 
 use std::{io, path::Path, time::SystemTime};
 
-use super::open_options;
+#[cfg(unix)]
+use std::time::Duration;
+
+#[cfg(unix)]
+use crate::driver::ops::Op;
 
 /// Metadata information about a file.
 ///
@@ -43,6 +47,11 @@ impl Metadata {
     #[cfg(windows)]
     pub(crate) fn from_handle(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Self> {
         sys::Metadata::from_handle(handle).map(Self)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn from_std(metadata: std::fs::Metadata) -> Self {
+        Self(sys::Metadata::from_std(metadata))
     }
 
     /// Returns the file type for this metadata.
@@ -214,6 +223,10 @@ impl std::os::unix::fs::MetadataExt for Metadata {
 pub struct FileType(sys::FileType);
 
 impl FileType {
+    pub(crate) fn from_std(file_type: std::fs::FileType) -> Self {
+        Self(sys::FileType::from_std(file_type))
+    }
+
     /// Tests whether this file type represents a directory.
     pub fn is_dir(&self) -> bool {
         self.0.is_dir()
@@ -291,7 +304,49 @@ impl Permissions {
 ///
 /// This is an async version of [`std::fs::metadata`].
 pub async fn metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
-    open_options::open_path(path).await?.metadata().await
+    metadata_impl(path.as_ref(), true).await
+}
+
+/// Returns the metadata for a path without following a symbolic link at the end
+/// of the path.
+///
+/// This is an async version of [`std::fs::symlink_metadata`].
+pub async fn symlink_metadata(path: impl AsRef<Path>) -> io::Result<Metadata> {
+    metadata_impl(path.as_ref(), false).await
+}
+
+pub(crate) async fn metadata_impl(path: &Path, follow_symlinks: bool) -> io::Result<Metadata> {
+    #[cfg(unix)]
+    {
+        Op::path_stat(path, follow_symlinks)?.await
+    }
+
+    #[cfg(windows)]
+    {
+        let path = path.to_owned();
+        super::asyncify(move || {
+            let metadata = if follow_symlinks {
+                std::fs::metadata(path)
+            } else {
+                std::fs::symlink_metadata(path)
+            }?;
+            Ok(Metadata::from_std(metadata))
+        })
+        .await
+    }
+}
+
+#[cfg(unix)]
+fn system_time_from_unix(secs: i64, nanos: u32) -> io::Result<SystemTime> {
+    let time = if secs >= 0 {
+        SystemTime::UNIX_EPOCH.checked_add(Duration::new(secs as u64, nanos))
+    } else if nanos == 0 {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+    } else {
+        SystemTime::UNIX_EPOCH.checked_sub(Duration::new(secs.unsigned_abs() - 1, 1_000_000_000 - nanos))
+    };
+
+    time.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "filesystem timestamp is out of range"))
 }
 
 #[cfg(unix)]
@@ -306,5 +361,20 @@ impl std::os::unix::fs::PermissionsExt for Permissions {
 
     fn from_mode(mode: u32) -> Self {
         Self(sys::Permissions::from_mode(mode))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::time::{Duration, SystemTime};
+
+    use super::system_time_from_unix;
+
+    #[test]
+    fn converts_pre_epoch_timestamp_with_subsecond_precision() {
+        assert_eq!(
+            system_time_from_unix(-1, 500_000_000).unwrap(),
+            SystemTime::UNIX_EPOCH - Duration::from_millis(500)
+        );
     }
 }

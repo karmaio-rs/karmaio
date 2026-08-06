@@ -2,6 +2,8 @@ use std::path::Path;
 
 #[cfg(windows)]
 use std::os::windows::io::RawHandle;
+#[cfg(windows)]
+use std::sync::{Arc, Mutex};
 
 #[cfg(windows)]
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
@@ -53,7 +55,7 @@ pub(crate) struct Open {
     pub(crate) path: OsPath,
     options: OpenOptions,
     #[cfg(windows)]
-    handle: Option<RawHandle>,
+    handle: Arc<Mutex<Option<isize>>>,
 }
 
 impl Op<Open> {
@@ -77,7 +79,7 @@ impl Op<Open> {
             path,
             options,
             #[cfg(windows)]
-            handle: None,
+            handle: Arc::new(Mutex::new(None)),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -164,45 +166,50 @@ impl KqueueOperation for Open {
 unsafe impl IocpOperation for Open {
     type Output = std::io::Result<File>;
     fn submit(&mut self) -> IocpSubmission {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
         use windows_sys::Win32::Storage::FileSystem::CreateFileW;
 
-        let access_mode = match self.options.access_mode() {
-            Ok(m) => m,
-            Err(e) => {
-                return IocpSubmission::Ready(Completion::new(Err(e) ));
-            }
-        };
-        let creation_mode = match self.options.creation_mode() {
-            Ok(m) => m,
-            Err(e) => {
-                return IocpSubmission::Ready(Completion::new(Err(e) ));
-            }
-        };
+        let access_mode = self.options.access_mode().expect("invalid open options combination");
+        let creation_mode = self.options.creation_mode().expect("invalid open options combination");
+        let path = self.path.clone();
+        let share_mode = self.options.share_mode;
+        let flags_and_attributes = self.options.get_flags_and_attributes();
+        let handle_slot = Arc::clone(&self.handle);
 
-        match windows_syscall!(HANDLE, {
-            CreateFileW(
-                self.path.as_ptr(),
-                access_mode,
-                self.options.share_mode,
-                std::ptr::null_mut(),
-                creation_mode,
-                self.options.get_flags_and_attributes(),
-                std::ptr::null_mut(),
-            )
-        }) {
-            Ok(handle) => {
-                self.handle = Some(handle as _);
-                IocpSubmission::Ready(Completion::new(Ok(0) ))
+        windows_syscall_blocking!({
+            // Safety: `path` is an owned, NUL-terminated UTF-16 buffer that
+            // remains alive for the call; the optional pointer arguments are null.
+            let handle = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    access_mode,
+                    share_mode,
+                    std::ptr::null_mut(),
+                    creation_mode,
+                    flags_and_attributes,
+                    std::ptr::null_mut(),
+                )
+            };
+
+            if handle == INVALID_HANDLE_VALUE {
+                Err(std::io::Error::last_os_error())
+            } else {
+                *handle_slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(handle as isize);
+                Ok(0_u32)
             }
-            Err(err) => IocpSubmission::Ready(Completion::new(Err(err) )),
-        }
+        })
     }
 
-    fn complete(mut self, cqe: Completion) -> Self::Output {
-        let _ = cqe.result?;
-        let handle = self.handle.take().expect("Open handle not set");
+    fn complete(self, cqe: Completion) -> Self::Output {
+        cqe.result?;
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+            .expect("open handle missing after successful completion");
         // Safety: open produced an open Win32 file handle; ownership transfers here.
-        let file = unsafe { std::fs::File::from_raw_handle(handle) };
+        let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
         Ok(File {
             handle: AttachedHandle::new(file)?,
         })
@@ -212,7 +219,14 @@ unsafe impl IocpOperation for Open {
 #[cfg(windows)]
 impl Drop for Open {
     fn drop(&mut self) {
-        if let Some(handle) = self.handle.take() {
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+        {
+            // Safety: the result slot owns this successfully opened handle and
+            // `take` ensures it is closed at most once.
             unsafe {
                 windows_sys::Win32::Foundation::CloseHandle(handle as _);
             }

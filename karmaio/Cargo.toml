@@ -78,6 +78,10 @@ required-features = ["macros"]
 name = "framed_tcp"
 required-features = ["macros", "net"]
 
+[[test]]
+name = "fs"
+required-features = ["fs"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]

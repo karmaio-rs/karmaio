@@ -5,8 +5,6 @@ use std::os::unix::fs::PermissionsExt;
 
 #[cfg(windows)]
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
-#[cfg(target_os = "linux")]
-use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
 #[cfg(any(
     target_os = "macos",
     target_os = "freebsd",
@@ -28,8 +26,6 @@ use crate::{
 pub(crate) struct SetPermissions {
     handle: SharedIoHandle<std::fs::File>,
     perm: Permissions,
-    #[cfg(target_os = "linux")]
-    result: Option<io::Result<()>>,
 }
 
 impl Op<SetPermissions> {
@@ -40,8 +36,6 @@ impl Op<SetPermissions> {
         let data = SetPermissions {
             handle: handle.clone(),
             perm,
-            #[cfg(target_os = "linux")]
-            result: None,
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -72,38 +66,6 @@ impl KqueueOperation for SetPermissions {
 
     fn complete(self, cqe: Completion) -> Self::Output {
         cqe.result.map(|_| ())
-    }
-}
-
-#[cfg(target_os = "linux")]
-unsafe impl UringOperation for SetPermissions {
-    type Output = io::Result<()>;
-    fn submit(&mut self) -> UringSubmission {
-        use io_uring::opcode;
-
-        // No direct fchmod opcode in io_uring (as of current version). Perform
-        // the operation synchronously here (like kqueue path) and deliver the
-        // result via a NOP submission so the uring backend can track it.
-        loop {
-            match rustix::fs::fchmod(&self.handle, rustix::fs::Mode::from_raw_mode(self.perm.mode() as _))
-                .map_err(std::io::Error::from)
-            {
-                Ok(()) => {
-                    self.result = Some(Ok(()));
-                    return opcode::Nop::new().build();
-                }
-                Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
-                Err(err) => {
-                    self.result = Some(Err(err));
-                    return opcode::Nop::new().build();
-                }
-            }
-        }
-    }
-
-    fn complete(self, _cqe: Completion) -> Self::Output {
-        self.result
-            .unwrap_or_else(|| Err(io::Error::new(io::ErrorKind::Other, "set_permissions result missing")))
     }
 }
 

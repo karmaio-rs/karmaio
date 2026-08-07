@@ -7,7 +7,10 @@ use std::{
     task::Poll,
 };
 
-use karmaio::{Runtime, fs};
+use karmaio::{
+    Runtime, fs,
+    io::{AsyncReadAtExt, AsyncReadExt, AsyncWriteAtExt, AsyncWriteExt},
+};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -142,6 +145,139 @@ fn recursive_directory_operations() -> io::Result<()> {
     })
 }
 
+#[test]
+fn positional_extensions_and_file_cursor() -> io::Result<()> {
+    use std::io::Cursor;
+
+    let root = TestDir::new()?;
+    let path = root.path().join("positioned.txt");
+    let mut runtime = Runtime::new()?;
+
+    runtime.block_on(async {
+        let mut file = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await?;
+
+        let (result, _) = file.write_all_at(b"world".to_vec(), 6).await;
+        result?;
+        let (result, _) = file.write_all_at(b"hello ".to_vec(), 0).await;
+        result?;
+
+        let (result, bytes) = file.read_exact_at(Box::new([0; 5]), 6).await;
+        result?;
+        assert_eq!(&*bytes, b"world");
+
+        let (result, bytes) = file.read_to_end_at(Vec::new(), 0).await;
+        assert_eq!(result?, 11);
+        assert_eq!(bytes, b"hello world");
+
+        let mut cursor = Cursor::new(file);
+        cursor.set_position(6);
+        let (result, bytes) = cursor.read_exact(Box::new([0; 5])).await;
+        assert_eq!(result?, 5);
+        assert_eq!(&*bytes, b"world");
+
+        cursor.set_position(0);
+        let (result, _) = cursor.write_all(b"HELLO".to_vec()).await;
+        assert_eq!(result?, 5);
+        cursor.into_inner().close().await?;
+
+        assert_eq!(fs::read(&path).await?, b"HELLO world");
+
+        let source = b"012345".to_vec();
+        let (result, bytes) = source.read_to_end_at(vec![b'x'], 2).await;
+        assert_eq!(result?, 4);
+        assert_eq!(bytes, b"x2345");
+
+        let (result, string) = source.read_to_string_at("value=".into(), 2).await;
+        assert_eq!(result?, 4);
+        assert_eq!(string, "value=2345");
+
+        let buffers = vec![Vec::with_capacity(2), Vec::with_capacity(3)];
+        let (result, buffers) = source.read_vectored_exact_at(buffers, 1).await;
+        result?;
+        assert_eq!(buffers, [b"12".to_vec(), b"345".to_vec()]);
+
+        let mut destination = Vec::new();
+        let buffers = vec![b"abc".to_vec(), b"def".to_vec()];
+        let (result, returned) = destination.write_vectored_all_at(buffers, 2).await;
+        result?;
+        assert_eq!(returned, [b"abc".to_vec(), b"def".to_vec()]);
+        assert_eq!(destination, b"\0\0abcdef");
+
+        let invalid_utf8 = vec![0xff];
+        let (result, string) = invalid_utf8.read_to_string_at("valid".into(), 0).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(string, "valid");
+
+        let short_source = b"ab".to_vec();
+        let buffers = vec![Vec::with_capacity(2), Vec::with_capacity(1)];
+        let (result, returned) = short_source.read_vectored_exact_at(buffers, 0).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(returned.len(), 2);
+
+        let mut short_destination = [0u8; 2];
+        let buffers = vec![b"abc".to_vec(), b"def".to_vec()];
+        let (result, returned) = short_destination.write_vectored_all_at(buffers, 0).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
+        assert_eq!(returned.len(), 2);
+        Ok(())
+    })
+}
+
+#[test]
+fn file_interoperability_and_shared_writes() -> io::Result<()> {
+    let root = TestDir::new()?;
+    let path = root.path().join("interop.txt");
+    let mut runtime = Runtime::new()?;
+
+    runtime.block_on(async {
+        let file = fs::File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)
+            .await?;
+        assert!(format!("{file:?}").contains("File"));
+
+        let mut shared = &file;
+        let (result, _) = shared.write_all_at(b"shared".to_vec(), 0).await;
+        result?;
+
+        #[cfg(unix)]
+        {
+            use std::os::fd::{AsFd, AsRawFd};
+            assert_eq!(file.as_fd().as_raw_fd(), file.as_raw_fd());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::{AsHandle, AsRawHandle};
+            assert_eq!(file.as_handle().as_raw_handle(), file.as_raw_handle());
+        }
+
+        let shared_clone = file.clone();
+        let file = match file.try_into_std() {
+            Ok(_) => panic!("shared file should not unwrap"),
+            Err(file) => file,
+        };
+        drop(shared_clone);
+
+        let duplicate = file.try_clone().await?;
+        let std_file = file.try_into_std().expect("unique file should unwrap");
+        let file = fs::File::from_std(std_file)?;
+        assert_eq!(file.metadata().await?.len(), 6);
+        drop(file.into_std().await);
+        drop(duplicate.into_std().await);
+        Ok(())
+    })
+}
+
 #[cfg(unix)]
 #[test]
 fn symlink_and_permissions_operations() -> io::Result<()> {
@@ -197,54 +333,5 @@ fn path_permissions_operation() -> io::Result<()> {
         let mut permissions = fs::metadata(&target).await?.permissions();
         permissions.set_readonly(false);
         fs::set_permissions(&target, permissions).await
-    })
-}
-
-#[test]
-fn file_interoperability_and_shared_writes() -> io::Result<()> {
-    let root = TestDir::new()?;
-    let path = root.path().join("interop.txt");
-    let mut runtime = Runtime::new()?;
-
-    runtime.block_on(async {
-        let file = fs::File::options()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&path)
-            .await?;
-        assert!(format!("{file:?}").contains("File"));
-
-        let mut shared = &file;
-        let (result, _) = shared.write_all_at(b"shared".to_vec(), 0).await;
-        result?;
-
-        #[cfg(unix)]
-        {
-            use std::os::fd::{AsFd, AsRawFd};
-            assert_eq!(file.as_fd().as_raw_fd(), file.as_raw_fd());
-        }
-
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::{AsHandle, AsRawHandle};
-            assert_eq!(file.as_handle().as_raw_handle(), file.as_raw_handle());
-        }
-
-        let shared_clone = file.clone();
-        let file = match file.try_into_std() {
-            Ok(_) => panic!("shared file should not unwrap"),
-            Err(file) => file,
-        };
-        drop(shared_clone);
-
-        let duplicate = file.try_clone().await?;
-        let std_file = file.try_into_std().expect("unique file should unwrap");
-        let file = fs::File::from_std(std_file)?;
-        assert_eq!(file.metadata().await?.len(), 6);
-        drop(file.into_std().await);
-        drop(duplicate.into_std().await);
-        Ok(())
     })
 }

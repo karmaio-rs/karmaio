@@ -198,14 +198,14 @@ impl From<AttachedHandle<std::fs::File>> for File {
 }
 
 impl AsyncReadAt for File {
-    async fn read_at<B: BoundedIoBufMut>(&mut self, buf: B, pos: u64) -> BufResult<usize, B> {
+    async fn read_at<B: BoundedIoBufMut>(&self, buf: B, pos: u64) -> BufResult<usize, B> {
         Op::read_at(&self.handle, buf, pos)
             .expect("Failed to submit read operation (no runtime or driver error)")
             .await
     }
 
     #[cfg(not(windows))]
-    async fn read_vectored_at<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
+    async fn read_vectored_at<B: BoundedIoBufMut>(&self, bufs: Vec<B>, pos: u64) -> BufResult<usize, Vec<B>> {
         Op::readv(&self.handle, bufs, pos)
             .expect("Failed to submit readv operation (no runtime or driver error)")
             .await

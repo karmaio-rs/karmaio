@@ -1,5 +1,5 @@
 use std::{
-    io::{Cursor, Result, Write},
+    io::{Cursor, Result},
     slice,
 };
 
@@ -31,7 +31,8 @@ pub trait AsyncWrite {
     async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
         let mut total = 0usize;
         let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
-        for buf in bufs {
+        let mut remaining = bufs.into_iter();
+        while let Some(buf) = remaining.next() {
             let init = buf.bytes_init();
             let (res, buf) = self.write(buf).await;
             match res {
@@ -39,11 +40,13 @@ pub trait AsyncWrite {
                     total += n;
                     returned.push(buf);
                     if n < init {
+                        returned.extend(remaining);
                         break;
                     }
                 }
                 Err(e) => {
                     returned.push(buf);
+                    returned.extend(remaining);
                     return (Err(e), returned);
                 }
             }
@@ -82,7 +85,8 @@ pub trait AsyncWriteAt {
         let mut total = 0usize;
         let mut offset = pos;
         let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
-        for buf in bufs {
+        let mut remaining = bufs.into_iter();
+        while let Some(buf) = remaining.next() {
             let init = buf.bytes_init();
             let (res, buf) = self.write_at(buf, offset).await;
             match res {
@@ -91,11 +95,13 @@ pub trait AsyncWriteAt {
                     offset += n as u64;
                     returned.push(buf);
                     if n < init {
+                        returned.extend(remaining);
                         break;
                     }
                 }
                 Err(e) => {
                     returned.push(buf);
+                    returned.extend(remaining);
                     return (Err(e), returned);
                 }
             }
@@ -105,6 +111,22 @@ pub trait AsyncWriteAt {
 }
 
 impl<T: ?Sized + AsyncWriteAt> AsyncWriteAt for &mut T {
+    #[inline]
+    fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> impl Future<Output = BufResult<usize, B>> {
+        (**self).write_at(buf, pos)
+    }
+
+    #[inline]
+    fn write_vectored_at<B: BoundedIoBuf>(
+        &mut self,
+        bufs: Vec<B>,
+        pos: u64,
+    ) -> impl Future<Output = BufResult<usize, Vec<B>>> {
+        (**self).write_vectored_at(bufs, pos)
+    }
+}
+
+impl<T: ?Sized + AsyncWriteAt> AsyncWriteAt for Box<T> {
     #[inline]
     fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> impl Future<Output = BufResult<usize, B>> {
         (**self).write_at(buf, pos)
@@ -202,43 +224,87 @@ impl AsyncWrite for Vec<u8> {
     }
 }
 
-impl<W> AsyncWrite for Cursor<W>
-where
-    Cursor<W>: Write + Unpin,
-{
-    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
-        let bytes_to_write = buf.bytes_init();
+impl AsyncWriteAt for [u8] {
+    async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B> {
+        let pos = usize::try_from(pos).unwrap_or(usize::MAX).min(self.len());
+        let bytes_to_write = buf.bytes_init().min(self.len() - pos);
 
+        if bytes_to_write > 0 {
+            unsafe {
+                self[pos..]
+                    .as_mut_ptr()
+                    .copy_from_nonoverlapping(buf.stable_read_ptr(), bytes_to_write);
+            }
+        }
+
+        (Ok(bytes_to_write), buf)
+    }
+}
+
+impl<const N: usize> AsyncWriteAt for [u8; N] {
+    #[inline]
+    async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B> {
+        self.as_mut_slice().write_at(buf, pos).await
+    }
+}
+
+impl AsyncWriteAt for Vec<u8> {
+    async fn write_at<B: BoundedIoBuf>(&mut self, buf: B, pos: u64) -> BufResult<usize, B> {
+        let pos = match usize::try_from(pos) {
+            Ok(pos) => pos,
+            Err(_) => {
+                return (
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "file offset exceeds usize",
+                    )),
+                    buf,
+                );
+            }
+        };
+        let bytes_to_write = buf.bytes_init();
         if bytes_to_write == 0 {
             return (Ok(0), buf);
         }
-
-        let res = unsafe {
-            let slice = slice::from_raw_parts(buf.stable_read_ptr(), bytes_to_write);
-            Write::write(self, slice)
-        };
-        match res {
-            Ok(n) => (Ok(n), buf),
-            Err(e) => (Err(e), buf),
+        if pos.checked_add(bytes_to_write).is_none() {
+            return (
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "file offset overflow",
+                )),
+                buf,
+            );
         }
+
+        let bytes = unsafe { slice::from_raw_parts(buf.stable_read_ptr(), bytes_to_write) };
+        if pos > self.len() {
+            self.resize(pos, 0);
+        }
+        let overwrite = bytes_to_write.min(self.len() - pos);
+        self[pos..pos + overwrite].copy_from_slice(&bytes[..overwrite]);
+        self.extend_from_slice(&bytes[overwrite..]);
+
+        (Ok(bytes_to_write), buf)
+    }
+}
+
+impl<W: AsyncWriteAt> AsyncWrite for Cursor<W> {
+    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        let pos = self.position();
+        let (result, buf) = self.get_mut().write_at(buf, pos).await;
+        if let Ok(written) = result {
+            self.set_position(pos + written as u64);
+        }
+        (result, buf)
     }
 
     async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let mut total = 0usize;
-        for b in bufs.iter() {
-            let n = b.bytes_init();
-            if n > 0 {
-                let res = unsafe {
-                    let slice = slice::from_raw_parts(b.stable_read_ptr(), n);
-                    Write::write(self, slice)
-                };
-                match res {
-                    Ok(w) => total += w,
-                    Err(e) => return (Err(e), bufs),
-                }
-            }
+        let pos = self.position();
+        let (result, bufs) = self.get_mut().write_vectored_at(bufs, pos).await;
+        if let Ok(written) = result {
+            self.set_position(pos + written as u64);
         }
-        (Ok(total), bufs)
+        (result, bufs)
     }
 
     async fn flush(&mut self) -> Result<()> {

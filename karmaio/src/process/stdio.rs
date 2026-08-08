@@ -21,7 +21,7 @@ use std::os::windows::io::{FromRawHandle, IntoRawHandle, OwnedHandle};
 use rustix::fs::{OFlags, fcntl_getfl, fcntl_setfl};
 
 use crate::{
-    buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBuf, IoBufMut},
     driver::{helpers::attached_handle::AttachedHandle, ops::Op},
     io::{AsyncRead, AsyncWrite},
 };
@@ -117,83 +117,29 @@ impl ChildStderr {
 }
 
 impl AsyncRead for ChildStdout {
-    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         match self.handle.as_ref() {
             Some(handle) => Op::read(handle, buf).unwrap().await,
-            None => (Ok(0), buf),
+            None => BufResult(Ok(0), buf),
         }
-    }
-
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let mut total = 0usize;
-        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
-        for buf in bufs {
-            match self.read(buf).await {
-                (Ok(n), buf) => {
-                    total += n;
-                    returned.push(buf);
-                }
-                (Err(e), buf) => {
-                    returned.push(buf);
-                    return (Err(e), returned);
-                }
-            }
-        }
-        (Ok(total), returned)
     }
 }
 
 impl AsyncRead for ChildStderr {
-    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         match self.handle.as_ref() {
             Some(handle) => Op::read(handle, buf).unwrap().await,
-            None => (Ok(0), buf),
+            None => BufResult(Ok(0), buf),
         }
-    }
-
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let mut total = 0usize;
-        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
-        for buf in bufs {
-            match self.read(buf).await {
-                (Ok(n), buf) => {
-                    total += n;
-                    returned.push(buf);
-                }
-                (Err(e), buf) => {
-                    returned.push(buf);
-                    return (Err(e), returned);
-                }
-            }
-        }
-        (Ok(total), returned)
     }
 }
 
 impl AsyncWrite for ChildStdin {
-    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         match self.handle.as_ref() {
             Some(handle) => Op::write(handle, buf).unwrap().await,
-            None => (Ok(0), buf),
+            None => BufResult(Ok(0), buf),
         }
-    }
-
-    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let mut total = 0usize;
-        let mut returned: Vec<B> = Vec::with_capacity(bufs.len());
-        for buf in bufs {
-            match self.write(buf).await {
-                (Ok(n), buf) => {
-                    total += n;
-                    returned.push(buf);
-                }
-                (Err(e), buf) => {
-                    returned.push(buf);
-                    return (Err(e), returned);
-                }
-            }
-        }
-        (Ok(total), returned)
     }
 
     async fn flush(&mut self) -> io::Result<()> {

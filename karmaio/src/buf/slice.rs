@@ -1,189 +1,376 @@
 use std::{
-    cmp,
-    ops::{self, Bound},
-    ptr,
+    mem::MaybeUninit,
+    ops::{Bound, Deref, DerefMut, RangeBounds},
 };
 
-use crate::buf::{BoundedIoBuf, BoundedIoBufMut, IoBuf, IoBufMut};
+use crate::buf::{IntoInner, IoBuf, IoBufExt, IoBufMut, IoBufMutExt, IoVectoredBuf, IoVectoredBufMut, SetLen};
 
-// An owned view into a contiguous sequence of bytes.
-//
-// This is similar to Rust slices (`&buf[..]`) but owns the underlying buffer.
-// This type is useful for performing io-uring read and write operations using a subset of a buffer.
-//
-// `Slice<T>` always wraps the original base `IoBuf` (never `Slice<Slice<…>>`).
-// Chaining `.slice().slice().slice()` stays flat → perfect monomorphisation.
+/// An owned view into a completion buffer.
+///
+/// Slices are created through [`IoBufExt::slice`]. An open-ended slice follows
+/// changes to the underlying buffer's initialized length and capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Slice<T> {
     buf: T,
     start: usize,
-    end: usize,
+    end: Option<usize>,
 }
 
 impl<T> Slice<T> {
-    pub(crate) fn new(buf: T, start: usize, end: usize) -> Slice<T> {
-        Slice { buf, start, end }
+    /// Constructs a slice whose beginning has already been validated.
+    ///
+    /// # Safety
+    ///
+    /// `start` must not exceed the underlying buffer's initialized length.
+    pub(crate) unsafe fn new_unchecked(buf: T, start: usize, end: Option<usize>) -> Self {
+        Self { buf, start, end }
     }
 
-    // Offset in the underlying buffer at which this slice starts.
+    /// Returns the offset at which this view starts.
     #[inline]
     pub fn start(&self) -> usize {
         self.start
     }
 
-    // Ofset in the underlying buffer at which this slice ends.
+    /// Returns the configured exclusive end, or `None` for an open-ended view.
     #[inline]
-    pub fn end(&self) -> usize {
+    pub fn end(&self) -> Option<usize> {
         self.end
     }
 
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.end - self.start
-    }
-
-    // Gets a reference to the underlying buffer.
+    /// Returns a reference to the underlying buffer.
     #[inline]
     pub fn get_ref(&self) -> &T {
         &self.buf
     }
 
-    // Gets a mutable reference to the underlying buffer.
-    //
-    // This method escapes the slice's view.
+    /// Returns a mutable reference to the underlying buffer.
     #[inline]
     pub fn get_mut(&mut self) -> &mut T {
         &mut self.buf
     }
 
-    // Unwraps this `Slice`, returning the underlying buffer.
+    /// Unwraps the view and returns the underlying buffer.
     #[inline]
     pub fn into_inner(self) -> T {
         self.buf
     }
 }
 
-impl<T: IoBuf> ops::Deref for Slice<T> {
+impl<T: IoBuf> Slice<T> {
+    /// Creates a fixed-end internal view after validating its initialized start.
+    pub(crate) fn new(buf: T, start: usize, end: usize) -> Self {
+        assert!(start <= buf.buf_len(), "slice starts beyond initialized bytes");
+        assert!(start <= end, "slice end precedes its start");
+        // Safety: start was checked against the initialized length.
+        unsafe { Self::new_unchecked(buf, start, Some(end)) }
+    }
+
+    fn initialized_end(&self) -> usize {
+        self.end.unwrap_or_else(|| self.buf.buf_len()).min(self.buf.buf_len())
+    }
+
+    /// Changes the starting of the view.
+    pub fn set_start(&mut self, start: usize) {
+        assert!(start <= self.buf.buf_len(), "slice starts beyond initialized bytes");
+        self.start = start;
+    }
+
+    /// Creates another view relative to this view without nesting adapters.
+    ///
+    /// An unbounded end retains this view's configured end. A bounded end is
+    /// clipped to it, matching the behavior of flattening a nested view.
+    pub fn slice(self, range: impl RangeBounds<usize>) -> Self {
+        let relative_start = match range.start_bound() {
+            Bound::Included(&n) => n,
+            Bound::Excluded(&n) => n.checked_add(1).expect("out of range"),
+            Bound::Unbounded => 0,
+        };
+        let relative_end = match range.end_bound() {
+            Bound::Included(&n) => Some(n.checked_add(1).expect("out of range")),
+            Bound::Excluded(&n) => Some(n),
+            Bound::Unbounded => None,
+        };
+
+        assert!(
+            relative_start <= self.as_init().len(),
+            "slice starts beyond initialized bytes"
+        );
+        if let Some(relative_end) = relative_end {
+            assert!(relative_start <= relative_end, "slice end precedes its start");
+        }
+
+        let start = self.start.checked_add(relative_start).expect("slice offset overflow");
+        let end = match (relative_end, self.end) {
+            (Some(relative_end), Some(parent_end)) => Some(
+                self.start
+                    .checked_add(relative_end)
+                    .expect("slice offset overflow")
+                    .min(parent_end),
+            ),
+            (Some(relative_end), None) => Some(self.start.checked_add(relative_end).expect("slice offset overflow")),
+            (None, parent_end) => parent_end,
+        };
+
+        // Safety: the relative start was checked against this view's
+        // initialized bytes, which map directly into the underlying buffer.
+        unsafe { Self::new_unchecked(self.buf, start, end) }
+    }
+}
+
+impl<T: IoBufMut> Slice<T> {
+    fn capacity_end(&mut self) -> usize {
+        let capacity = self.buf.buf_capacity();
+        self.end.unwrap_or(capacity).min(capacity)
+    }
+}
+
+impl<T: IoBuf> Slice<Slice<T>> {
+    /// Flattens nested views without copying the underlying buffer.
+    pub fn flatten(self) -> Slice<T> {
+        let outer_start = self.buf.start;
+        let start = outer_start.checked_add(self.start).expect("slice offset overflow");
+        let end = match (self.end, self.buf.end) {
+            (Some(inner_end), Some(outer_end)) => Some(
+                outer_start
+                    .checked_add(inner_end)
+                    .expect("slice offset overflow")
+                    .min(outer_end),
+            ),
+            (Some(inner_end), None) => Some(outer_start.checked_add(inner_end).expect("slice offset overflow")),
+            (None, outer_end) => outer_end,
+        };
+
+        // Safety: construction of both slices established that their relative
+        // starts lie within their initialized views.
+        unsafe { Slice::new_unchecked(self.buf.buf, start, end) }
+    }
+}
+
+impl<T> IntoInner for Slice<T> {
+    type Inner = T;
+
+    #[inline]
+    fn into_inner(self) -> Self::Inner {
+        self.buf
+    }
+}
+
+impl<T: IoBuf> Deref for Slice<T> {
     type Target = [u8];
 
-    fn deref(&self) -> &[u8] {
-        // Safety: the `IoBuf` trait is marked as unsafe and is expected to be implemented correctly.
-        let buf_bytes = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
-        let end = cmp::min(self.end, buf_bytes.len());
-        &buf_bytes[self.start..end]
+    fn deref(&self) -> &Self::Target {
+        &self.buf.as_init()[self.start..self.initialized_end()]
     }
 }
 
-impl<T: IoBufMut> ops::DerefMut for Slice<T> {
-    fn deref_mut(&mut self) -> &mut [u8] {
-        // Safety: the `IoBufMut` trait is marked as unsafe and is expected to be implemented correct.
-        let buf_bytes = unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_init()) };
-        let end = cmp::min(self.end, buf_bytes.len());
-        &mut buf_bytes[self.start..end]
+impl<T: IoBufMut> DerefMut for Slice<T> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        let start = self.start;
+        let end = self.initialized_end();
+        &mut self.buf.as_mut_slice()[start..end]
     }
 }
 
-impl<T: IoBuf> BoundedIoBuf for Slice<T> {
-    type Buf = T;
-    type Bounds = ops::Range<usize>;
-
-    fn slice(self, range: impl ops::RangeBounds<usize>) -> Slice<T> {
-        let start = match range.start_bound() {
-            Bound::Included(&n) => self.start.checked_add(n).expect("out of range"),
-            Bound::Excluded(&n) => self
-                .start
-                .checked_add(n)
-                .and_then(|x| x.checked_add(1))
-                .expect("out of range"),
-            Bound::Unbounded => self.start,
-        };
-
-        assert!(start <= self.end);
-
-        let end = match range.end_bound() {
-            Bound::Included(&n) => self
-                .start
-                .checked_add(n)
-                .and_then(|x| x.checked_add(1))
-                .expect("out of range"),
-            Bound::Excluded(&n) => self.start.checked_add(n).expect("out of range"),
-            Bound::Unbounded => self.end,
-        };
-
-        assert!(end <= self.end);
-        assert!(start <= self.buf.bytes_init());
-
-        Slice::new(self.buf, start, end)
-    }
-
+impl<T: IoBuf> IoBuf for Slice<T> {
     #[inline]
-    fn slice_full(self) -> Slice<T> {
+    fn as_init(&self) -> &[u8] {
         self
     }
+}
 
-    #[inline]
-    fn get_buf(&self) -> &T {
-        &self.buf
+impl<T: IoBufMut> IoBufMut for Slice<T> {
+    fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+        let start = self.start;
+        let end = self.capacity_end();
+        &mut self.buf.as_uninit()[start..end]
     }
 
-    #[inline]
-    fn bounds(&self) -> Self::Bounds {
-        self.start..self.end
-    }
-
-    fn from_buf_bounds(buf: T, bounds: Self::Bounds) -> Self {
-        assert!(bounds.start <= buf.bytes_init());
-        assert!(bounds.end <= buf.bytes_total());
-        Slice::new(buf, bounds.start, bounds.end)
-    }
-
-    fn stable_read_ptr(&self) -> *const u8 {
-        // Safety: `start` is within the underlying buffer capacity. Callers that
-        // read via this pointer must only access initialized bytes
-        // (`bytes_init` of the view).
-        unsafe { self.buf.stable_read_ptr().add(self.start) }
-    }
-
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        ops::Deref::deref(self).len()
-    }
-
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        self.end - self.start
+    fn reserve(&mut self, additional: usize) -> std::io::Result<()> {
+        if self.end.is_some() {
+            let initialized = <Self as IoBuf>::as_init(self).len();
+            let capacity = self.as_uninit().len();
+            return if additional <= capacity.saturating_sub(initialized) {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "fixed slice cannot reserve additional capacity",
+                ))
+            };
+        }
+        self.buf.reserve(additional)
     }
 }
 
-impl<T: IoBufMut> BoundedIoBufMut for Slice<T> {
-    type BufMut = T;
+impl<T: SetLen> SetLen for Slice<T> {
+    unsafe fn set_len(&mut self, len: usize) {
+        let absolute = self.start.checked_add(len).expect("buffer length overflow");
+        // Safety: the caller initialized the slice prefix, which maps directly
+        // to start..start+len in the underlying buffer.
+        unsafe { self.buf.set_len(absolute) }
+    }
+}
 
-    fn put_slice(&mut self, src: &[u8]) {
-        assert!(self.bytes_total() >= src.len());
+/// An owned cursor into a vectored buffer collection.
+pub struct VectoredSlice<T> {
+    buf: T,
+    start: usize,
+    index: usize,
+    offset: usize,
+}
 
-        // Safety:
-        // - dst pointer validity is ensured by stable_write_ptr.
-        // - The length is checked to not exceed the view's total capacity
-        // - src (immutable) and dst (mutable) cannot point to overlapping memory.
-        // - After copying the amount of bytes given by the slice, it's safe to mark them as initialized in the buffer.
-        unsafe {
-            ptr::copy_nonoverlapping(src.as_ptr(), self.stable_write_ptr(), src.len());
-            self.set_init(src.len());
+impl<T> VectoredSlice<T> {
+    /// Constructs a capacity-based view from already computed offsets.
+    pub(crate) fn from_capacity_mut(buf: T, start: usize, index: usize, offset: usize) -> Self {
+        Self {
+            buf,
+            start,
+            index,
+            offset,
         }
     }
 
-    fn stable_write_ptr(&mut self) -> *mut u8 {
-        // Point at the slice start even when it lies at/after the initialized
-        // watermark so completion reads can fill the uninitialized tail
-        // (`start == bytes_init()`, `end == bytes_total()`).
-        //
-        // Safety: `start` is within the underlying buffer's capacity
-        // (`bytes_total`); the pointer may reference uninitialized memory.
-        unsafe { self.buf.stable_write_ptr().add(self.start) }
+    pub(crate) fn from_initialized(buf: T, start: usize) -> Self
+    where
+        T: IoVectoredBuf,
+    {
+        assert!(
+            start <= buf.total_len(),
+            "vectored slice starts beyond initialized bytes"
+        );
+        let mut remaining = start;
+        let mut index = 0;
+        for slice in buf.iter_slice() {
+            if remaining < slice.len() {
+                break;
+            }
+            remaining -= slice.len();
+            index += 1;
+        }
+        Self {
+            buf,
+            start,
+            index,
+            offset: remaining,
+        }
     }
 
+    /// Returns the skipped byte count in the underlying collection.
     #[inline]
-    unsafe fn set_init(&mut self, pos: usize) {
-        // `pos` is relative to this view's start. Absolute init becomes start + pos.
-        self.buf.set_init(self.start + pos);
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// Returns the underlying buffer collection.
+    #[inline]
+    pub fn into_inner(self) -> T {
+        self.buf
+    }
+}
+
+impl<T> IntoInner for VectoredSlice<T> {
+    type Inner = T;
+
+    #[inline]
+    fn into_inner(self) -> Self::Inner {
+        self.buf
+    }
+}
+
+impl<T: IoVectoredBuf> IoVectoredBuf for VectoredSlice<T> {
+    fn iter_slice(&self) -> impl Iterator<Item = &[u8]> {
+        let index = self.index;
+        let offset = self.offset;
+        self.buf
+            .iter_slice()
+            .enumerate()
+            .skip(index)
+            .map(move |(current, buf)| {
+                if current == index {
+                    &buf[offset.min(buf.len())..]
+                } else {
+                    buf
+                }
+            })
+    }
+}
+
+impl<T: IoVectoredBufMut> IoVectoredBufMut for VectoredSlice<T> {
+    fn iter_uninit_slice(&mut self) -> impl Iterator<Item = &mut [MaybeUninit<u8>]> {
+        let index = self.index;
+        let offset = self.offset;
+        self.buf
+            .iter_uninit_slice()
+            .enumerate()
+            .skip(index)
+            .map(move |(current, buf)| {
+                if current == index {
+                    let offset = offset.min(buf.len());
+                    &mut buf[offset..]
+                } else {
+                    buf
+                }
+            })
+    }
+}
+
+impl<T: IoVectoredBufMut> SetLen for VectoredSlice<T> {
+    unsafe fn set_len(&mut self, len: usize) {
+        let total = self.start.checked_add(len).expect("vectored buffer length overflow");
+        // Safety: the caller initialized `len` bytes after the view's starting
+        // position, so the underlying initialized prefix ends at start + len.
+        unsafe { self.buf.set_len(total) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn open_ended_slice_follows_vec_capacity() {
+        let mut buf = Vec::with_capacity(8);
+        buf.extend_from_slice(b"abc");
+        let mut slice = IoBufExt::slice(buf, 3..);
+
+        assert_eq!(slice.as_init(), b"");
+        assert_eq!(slice.buf_capacity(), 5);
+
+        slice.put_slice(b"de");
+        assert_eq!(slice.as_init(), b"de");
+        assert_eq!(slice.into_inner(), b"abcde");
+    }
+
+    #[test]
+    fn nested_slices_flatten_offsets() {
+        let nested = IoBufExt::slice(IoBufExt::slice(Vec::from(b"abcdef"), 1..5), 2..);
+        let flat = nested.flatten();
+
+        assert_eq!(flat.start(), 3);
+        assert_eq!(flat.as_init(), b"de");
+        assert_eq!(flat.into_inner(), b"abcdef");
+    }
+
+    #[test]
+    fn chained_slices_stay_flat() {
+        fn assert_flat(_: &Slice<Vec<u8>>) {}
+
+        let slice = IoBufExt::slice(Vec::from(b"abcdefgh"), 1..7).slice(2..6).slice(1..);
+
+        assert_flat(&slice);
+        assert_eq!(slice.start(), 4);
+        assert_eq!(slice.as_init(), b"efg");
+        assert_eq!(slice.into_inner(), b"abcdefgh");
+    }
+
+    #[test]
+    fn vectored_slice_skips_initialized_bytes_without_copying() {
+        let bufs = [Vec::from(b"abc"), Vec::from(b"def")];
+        let view = IoVectoredBuf::slice(bufs, 4);
+        let slices = view.iter_slice().collect::<Vec<_>>();
+
+        assert_eq!(slices, [b"ef".as_slice()]);
+        assert_eq!(view.into_inner(), [b"abc".to_vec(), b"def".to_vec()]);
     }
 }

@@ -43,7 +43,7 @@ where
 /// This is an async version of [`std::fs::read`].
 pub async fn read(path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
     let file = file::File::open(path).await?;
-    let (result, contents) = file.read_to_end_at(Vec::new(), 0).await;
+    let (result, contents) = file.read_to_end_at(Vec::new(), 0).await.into_parts();
     result?;
     Ok(contents)
 }
@@ -61,7 +61,7 @@ pub async fn write(path: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> std::i
 
     while offset < len {
         let slice = Slice::new(buf, offset, len);
-        let (res, slice) = file.write_at(slice, offset as u64).await;
+        let (res, slice) = file.write_at(slice, offset as u64).await.into_parts();
         buf = slice.into_inner();
         let n = res?;
         if n == 0 {

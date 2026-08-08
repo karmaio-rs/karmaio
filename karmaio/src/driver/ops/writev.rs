@@ -14,7 +14,7 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBuf, BufResult},
+    buf::{BufResult, IoVectoredBuf},
     driver::{
         helpers::io_handle::SharedIoHandle,
         ops::{Completion, Op},
@@ -22,63 +22,26 @@ use crate::{
     runtime::local::CURRENT_DRIVER,
 };
 
-pub(crate) struct Writev<B: BoundedIoBuf> {
-    // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
+pub(crate) struct Writev<V: IoVectoredBuf> {
     #[allow(unused)]
     io_handle: SharedIoHandle<std::fs::File>,
-
-    // Reference to the in-flight buffers.
-    pub(crate) bufs: Vec<B>,
-
-    // Internal pointers to the IOVEC strcuts
+    pub(crate) bufs: V,
     #[cfg(unix)]
     iovs: Vec<libc::iovec>,
-
-    // FILE_SEGMENT_ELEMENT array for Windows WriteFileGather (page-aligned required).
-    // TODO: ensure upper layers provide page-aligned buffers before using this path
     #[cfg(windows)]
     segments: Vec<windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT>,
-
-    // Write offset
     offset: u64,
 }
 
-impl<B: BoundedIoBuf> Op<Writev<B>> {
-    pub(crate) fn writev(
-        io_handle: &SharedIoHandle<std::fs::File>,
-        bufs: Vec<B>,
-        offset: u64,
-    ) -> io::Result<Op<Writev<B>>> {
-        #[cfg(unix)]
-        let iovs: Vec<libc::iovec> = bufs
-            .iter()
-            .map(|buf| libc::iovec {
-                iov_base: buf.stable_read_ptr() as *mut libc::c_void,
-                iov_len: buf.bytes_init(),
-            })
-            .collect();
-
-        #[cfg(windows)]
-        let segments = {
-            let mut segs: Vec<windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT> = bufs
-                .iter()
-                .map(|buf| windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT {
-                    Buffer: buf.stable_read_ptr() as *mut core::ffi::c_void,
-                })
-                .collect();
-            segs.push(windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT {
-                Buffer: std::ptr::null_mut(),
-            });
-            segs
-        };
-
+impl<V: IoVectoredBuf> Op<Writev<V>> {
+    pub(crate) fn writev(io_handle: &SharedIoHandle<std::fs::File>, bufs: V, offset: u64) -> io::Result<Op<Writev<V>>> {
         let data = Writev {
             io_handle: io_handle.clone(),
             bufs,
             #[cfg(unix)]
-            iovs,
+            iovs: Vec::new(),
             #[cfg(windows)]
-            segments,
+            segments: Vec::new(),
             offset,
         };
 
@@ -86,12 +49,47 @@ impl<B: BoundedIoBuf> Op<Writev<B>> {
     }
 }
 
+impl<V: IoVectoredBuf> Writev<V> {
+    #[cfg(unix)]
+    fn rebuild_iovs(&mut self) {
+        self.iovs = self
+            .bufs
+            .iter_slice()
+            .map(|buf| libc::iovec {
+                iov_base: buf.as_ptr() as *mut libc::c_void,
+                iov_len: buf.len(),
+            })
+            .collect();
+    }
+
+    #[cfg(windows)]
+    fn rebuild_segments(&mut self) {
+        self.segments = self
+            .bufs
+            .iter_slice()
+            .map(|buf| windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT {
+                Buffer: buf.as_ptr() as *mut core::ffi::c_void,
+            })
+            .collect();
+        self.segments
+            .push(windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT {
+                Buffer: std::ptr::null_mut(),
+            });
+    }
+
+    fn finish(self, completion: Completion) -> BufResult<usize, V> {
+        BufResult(completion.result.map(|n| n as usize), self.bufs)
+    }
+}
+
 #[cfg(target_os = "linux")]
-unsafe impl<B: BoundedIoBuf> UringOperation for Writev<B> {
-    type Output = BufResult<usize, Vec<B>>;
+unsafe impl<V: IoVectoredBuf> UringOperation for Writev<V> {
+    type Output = BufResult<usize, V>;
+
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
+        self.rebuild_iovs();
         opcode::Writev::new(
             types::Fd(self.io_handle.raw_fd()),
             self.iovs.as_ptr(),
@@ -101,14 +99,8 @@ unsafe impl<B: BoundedIoBuf> UringOperation for Writev<B> {
         .build()
     }
 
-    fn complete(self, completion_entry: Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-
-        // Recover the buffer
-        let bufs = self.bufs;
-
-        (res, bufs)
+    fn complete(self, completion: Completion) -> Self::Output {
+        self.finish(completion)
     }
 }
 
@@ -119,18 +111,18 @@ unsafe impl<B: BoundedIoBuf> UringOperation for Writev<B> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<B: BoundedIoBuf> KqueueOperation for Writev<B> {
-    type Output = BufResult<usize, Vec<B>>;
+impl<V: IoVectoredBuf> KqueueOperation for Writev<V> {
+    type Output = BufResult<usize, V>;
+
     fn attempt(&mut self) -> KqueueAttempt {
-        // Same rationale as WriteAt: kqueue is useless for regular files and
-        // pwritev may block. Keep iovecs/buffers alive in the Op while the pool runs.
+        self.rebuild_iovs();
         let fd = self.io_handle.raw_fd();
         let iovs = self.iovs.as_ptr() as usize;
         let iovcnt = self.iovs.len();
         let offset = self.offset;
         kqueue_syscall_blocking!({
-            // Safety: the operation retains the owning file and all buffers
-            // until this blocking job completes.
+            // Safety: the stable operation carrier retains the descriptor
+            // array, buffers, and file until the blocking job completes.
             let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
             let iovs = unsafe { std::slice::from_raw_parts(iovs as *const libc::iovec, iovcnt) };
             let bufs = iovs
@@ -146,26 +138,21 @@ impl<B: BoundedIoBuf> KqueueOperation for Writev<B> {
         })
     }
 
-    fn complete(self, completion_entry: Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-
-        // Recover the buffer
-        let bufs = self.bufs;
-
-        (res, bufs)
+    fn complete(self, completion: Completion) -> Self::Output {
+        self.finish(completion)
     }
 }
 
 #[cfg(windows)]
-unsafe impl<B: BoundedIoBuf> IocpOperation for Writev<B> {
-    type Output = BufResult<usize, Vec<B>>;
+unsafe impl<V: IoVectoredBuf> IocpOperation for Writev<V> {
+    type Output = BufResult<usize, V>;
 
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFileGather;
 
-        let total_bytes: u32 = self.bufs.iter().map(|b| b.bytes_init() as u32).sum();
+        let total_bytes = self.bufs.total_len() as u32;
+        self.rebuild_segments();
         let handle = self.io_handle.raw_handle();
         let mut interest = Interest::new(handle as _);
 
@@ -186,13 +173,7 @@ unsafe impl<B: BoundedIoBuf> IocpOperation for Writev<B> {
         })
     }
 
-    fn complete(self, completion_entry: Completion) -> Self::Output {
-        // Convert the operation result to `usize`
-        let res = completion_entry.result.map(|v| v as usize);
-
-        // Recover the buffer
-        let bufs = self.bufs;
-
-        (res, bufs)
+    fn complete(self, completion: Completion) -> Self::Output {
+        self.finish(completion)
     }
 }

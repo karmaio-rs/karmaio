@@ -227,7 +227,7 @@ where
         }
         self.framer.enclose(&mut buf);
 
-        let (res, mut buf) = self.io.write_all(buf).await;
+        let (res, mut buf) = self.io.write_all(buf).await.into_parts();
         buf.clear();
         self.write = Some(buf);
         res.map(|_| ()).map_err(Into::into)
@@ -252,7 +252,7 @@ where
 {
     async fn fill(&mut self) -> std::io::Result<usize> {
         let (pending_start, fill) = self.read.prepare_fill();
-        let (res, fill) = self.io.read(fill).await;
+        let (res, fill) = self.io.read(fill).await.into_parts();
         self.read.finish_fill(fill, pending_start);
         res
     }
@@ -286,10 +286,10 @@ where
 
         let frame_len = frame.len();
         let slice = self.read.take_inner();
-        let begin = slice.start();
+        let start = slice.start();
         let buf = slice.into_inner();
 
-        let abs_prefix = begin + frame.prefix();
+        let abs_prefix = start + frame.prefix();
         let abs_payload_end = abs_prefix + frame.payload();
         let payload = Slice::new(buf, abs_prefix, abs_payload_end);
         let decoded = if at_eof {
@@ -299,7 +299,7 @@ where
         };
         let buf = payload.into_inner();
 
-        let frame_end = begin + frame_len;
+        let frame_end = start + frame_len;
         self.read.restore_from_parts(buf, frame_end);
 
         decoded

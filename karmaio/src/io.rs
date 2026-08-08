@@ -1,3 +1,8 @@
+//! Completion-based asynchronous I/O traits and utilities.
+//!
+//! Operations take ownership of their buffers and return them on completion,
+//! allowing platform drivers to retain stable memory across asynchronous I/O.
+
 mod framed;
 mod read;
 mod sink;

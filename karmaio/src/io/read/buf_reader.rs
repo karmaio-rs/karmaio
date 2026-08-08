@@ -1,24 +1,16 @@
 use crate::{
-    buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     io::{AsyncBufRead, AsyncRead, AsyncWrite},
 };
 
-// The `BufReader` struct adds buffering to any reader.
-//
-// It can be excessively inefficient to work directly with a [`AsyncRead`]
-// instance. A `BufReader` performs large, infrequent reads on the underlying
-// [`AsyncRead`] and maintains an in-memory buffer of the results.
-//
-// `BufReader` can improve the speed of programs that make *small* and
-// *repeated* read calls to the same file or network socket. It does not
-// help when reading very large amounts at once, or reading just one or a few
-// times. It also provides no advantage when reading from a source that is
-// already in memory, like a `Vec<u8>`.
-//
-// When the `BufReader` is dropped, the contents of its buffer will be
-// discarded. Creating multiple instances of a `BufReader` on the same
-// stream can cause data loss.
-//
+/// Adds buffering to an [`AsyncRead`] implementation.
+///
+/// `BufReader` performs large, infrequent reads and serves smaller reads from
+/// an in-memory buffer. It is most useful for repeated small reads from files
+/// and network streams, and offers little benefit for large or in-memory reads.
+///
+/// Dropping a `BufReader` discards buffered contents. Creating multiple
+/// readers over the same stream can therefore cause data loss.
 pub struct BufReader<R> {
     reader: R,
     buf: Box<[u8]>,
@@ -87,13 +79,13 @@ impl<R: AsyncRead> BufReader<R> {
 }
 
 impl<R: AsyncRead> AsyncRead for BufReader<R> {
-    async fn read<B: BoundedIoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         // If we don't have any buffered data and we're doing a massive read
         // (larger than our internal buffer), bypass our internal buffer
         // entirely.
         let owned_buf = self.buf.as_ref();
 
-        if self.pos == self.cap && buf.bytes_total() >= owned_buf.len() {
+        if self.pos == self.cap && buf.as_uninit().len() >= owned_buf.len() {
             self.discard_buffer();
             return self.reader.read(buf).await;
         }
@@ -101,23 +93,26 @@ impl<R: AsyncRead> AsyncRead for BufReader<R> {
         let rem = match self.fill_buf().await {
             Ok(slice) => slice,
             Err(e) => {
-                return (Err(e), buf);
+                return BufResult(Err(e), buf);
             }
         };
 
-        let amt = rem.len().min(buf.bytes_total());
+        let amt = rem.len().min(buf.as_uninit().len());
 
         unsafe {
-            buf.stable_write_ptr().copy_from_nonoverlapping(rem.as_ptr(), amt);
-            buf.set_init(amt);
+            buf.as_uninit()
+                .as_mut_ptr()
+                .cast::<u8>()
+                .copy_from_nonoverlapping(rem.as_ptr(), amt);
+            buf.set_len(amt);
         }
 
         self.consume(amt);
 
-        (Ok(amt), buf)
+        BufResult(Ok(amt), buf)
     }
 
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
         // For vectored reads, bypass the internal buffer to keep the implementation simple and correct.
         // The buffer is a performance hint for small reads; scattering a large vectored request goes direct.
         self.discard_buffer();
@@ -130,7 +125,7 @@ impl<R: AsyncRead> AsyncBufRead for BufReader<R> {
         if self.pos == self.cap {
             let buf = std::mem::take(&mut self.buf);
 
-            let (res, buf) = self.reader.read(buf).await;
+            let (res, buf) = self.reader.read(buf).await.into_parts();
 
             self.buf = buf;
 
@@ -159,12 +154,12 @@ impl<R: AsyncRead> AsyncBufRead for BufReader<R> {
 
 impl<R: AsyncRead + AsyncWrite> AsyncWrite for BufReader<R> {
     #[inline]
-    async fn write<T: BoundedIoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
         self.reader.write(buf).await
     }
 
     #[inline]
-    async fn write_vectored<T: BoundedIoBuf>(&mut self, bufs: Vec<T>) -> BufResult<usize, Vec<T>> {
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, bufs: V) -> BufResult<usize, V> {
         self.reader.write_vectored(bufs).await
     }
 

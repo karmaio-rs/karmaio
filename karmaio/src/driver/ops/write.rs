@@ -23,7 +23,7 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBuf, BufResult},
+    buf::{BufResult, IoBuf},
     driver::{
         helpers::io_handle::SharedIoHandle,
         ops::{Completion, Op},
@@ -44,7 +44,7 @@ pub(crate) struct Write<T, B> {
 impl<T, B> Op<Write<T, B>>
 where
     T: AsFd + AsRawFd + 'static,
-    B: BoundedIoBuf + 'static,
+    B: IoBuf + 'static,
 {
     pub(crate) fn write(io_handle: &SharedIoHandle<T>, buf: B) -> io::Result<Op<Write<T, B>>> {
         let data = Write {
@@ -59,7 +59,7 @@ where
 impl<T, B> Op<Write<T, B>>
 where
     T: AsRawHandle + 'static,
-    B: BoundedIoBuf + 'static,
+    B: IoBuf + 'static,
 {
     pub(crate) fn write(io_handle: &SharedIoHandle<T>, buf: B) -> io::Result<Op<Write<T, B>>> {
         let data = Write {
@@ -71,20 +71,20 @@ where
 }
 
 #[cfg(target_os = "linux")]
-unsafe impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> UringOperation for Write<T, B> {
+unsafe impl<T: AsRawFd + 'static, B: IoBuf + 'static> UringOperation for Write<T, B> {
     type Output = BufResult<usize, B>;
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
-        let ptr = self.buf.stable_read_ptr();
-        let len = self.buf.bytes_init();
+        let ptr = self.buf.as_init().as_ptr();
+        let len = self.buf.as_init().len();
         opcode::Write::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
 
     fn complete(self, completion: Completion) -> Self::Output {
         match completion.result {
-            Ok(res) => (Ok(res as usize), self.buf),
-            Err(err) => (Err(err), self.buf),
+            Ok(res) => BufResult(Ok(res as usize), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
@@ -96,7 +96,7 @@ unsafe impl<T: AsRawFd + 'static, B: BoundedIoBuf + 'static> UringOperation for 
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<T: AsFd + AsRawFd + 'static, B: BoundedIoBuf + 'static> KqueueOperation for Write<T, B> {
+impl<T: AsFd + AsRawFd + 'static, B: IoBuf + 'static> KqueueOperation for Write<T, B> {
     type Output = BufResult<usize, B>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(
@@ -105,7 +105,7 @@ impl<T: AsFd + AsRawFd + 'static, B: BoundedIoBuf + 'static> KqueueOperation for
             {
                 // Safety: the operation owns this buffer for the duration of the
                 // syscall, and the slice covers exactly its initialized bytes.
-                let buf = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
+                let buf = unsafe { std::slice::from_raw_parts(self.buf.as_init().as_ptr(), self.buf.as_init().len()) };
                 rustix::io::write(&self.io_handle, buf)
                     .map(|n| n as u32)
                     .map_err(std::io::Error::from)
@@ -115,22 +115,22 @@ impl<T: AsFd + AsRawFd + 'static, B: BoundedIoBuf + 'static> KqueueOperation for
 
     fn complete(self, completion: Completion) -> Self::Output {
         match completion.result {
-            Ok(res) => (Ok(res as usize), self.buf),
-            Err(err) => (Err(err), self.buf),
+            Ok(res) => BufResult(Ok(res as usize), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }
 
 #[cfg(windows)]
-unsafe impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> IocpOperation for Write<T, B> {
+unsafe impl<T: AsRawHandle + 'static, B: IoBuf + 'static> IocpOperation for Write<T, B> {
     type Output = BufResult<usize, B>;
 
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::WriteFile;
 
-        let ptr = self.buf.stable_read_ptr() as *const u8;
-        let len = self.buf.bytes_init() as u32;
+        let ptr = self.buf.as_init().as_ptr() as *const u8;
+        let len = self.buf.as_init().len() as u32;
         let handle = self.io_handle.raw_handle();
 
         let mut interest = Interest::new(handle as _);
@@ -141,8 +141,8 @@ unsafe impl<T: AsRawHandle + 'static, B: BoundedIoBuf + 'static> IocpOperation f
 
     fn complete(self, completion: Completion) -> Self::Output {
         match completion.result {
-            Ok(res) => (Ok(res as usize), self.buf),
-            Err(err) => (Err(err), self.buf),
+            Ok(res) => BufResult(Ok(res as usize), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }

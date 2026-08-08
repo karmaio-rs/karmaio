@@ -35,7 +35,7 @@ async fn main() -> std::io::Result<()> {
             let mut buf = vec![0; 4096];
 
             loop {
-                let (result, returned_buf) = socket.read(buf).await;
+                let (result, returned_buf) = socket.read(buf).await.into_parts();
                 buf = returned_buf;
 
                 match result {
@@ -44,7 +44,7 @@ async fn main() -> std::io::Result<()> {
                         return;
                     }
                     Ok(_n) => {
-                        let (write_result, returned_buf) = socket.write_all(buf).await;
+                        let (write_result, returned_buf) = socket.write_all(buf).await.into_parts();
                         buf = returned_buf;
                         if let Err(e) = write_result {
                             eprintln!("failed to write to {peer}: {e}");

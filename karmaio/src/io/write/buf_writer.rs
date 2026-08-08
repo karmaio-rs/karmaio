@@ -1,23 +1,15 @@
 use crate::{
-    buf::{BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     io::{AsyncBufRead, AsyncRead, AsyncWrite, AsyncWriteExt},
 };
 
-// Wraps a writer and buffers its output.
-//
-// It can be excessively inefficient to work directly with something that implements [`AsyncWrite`].
-// A `BufWriter` keeps an in-memory buffer of data
-// and writes it to an underlying writer in large, infrequent batches.
-//
-// `BufWriter` can improve the speed of programs that make *small* and
-// *repeated* write calls to the same file or network socket.
-// It does not help when writing very large amounts at once, or writing just one or a few times.
-// It also provides no advantage when writing to a destination that is in memory, like a `Vec<u8>`.
-//
-// When the `BufWriter` is dropped, the contents of its buffer will be discarded.
-// Creating multiple instances of a `BufWriter` on the same stream can cause data loss.
-// If you need to write out the contents of its buffer,
-// you must manually call flush before the writer is dropped.
+/// Buffers output before writing it to an [`AsyncWrite`] implementation.
+///
+/// `BufWriter` combines repeated small writes into larger, less frequent
+/// writes. It offers little benefit for large writes or in-memory destinations.
+///
+/// Dropping a `BufWriter` discards buffered output. Call
+/// [`AsyncWrite::flush`] before dropping it when that data must be preserved.
 pub struct BufWriter<W> {
     writer: W,
     buf: Box<[u8]>,
@@ -83,7 +75,7 @@ impl<W: AsyncWrite> BufWriter<W> {
             // there is some data left inside internal buf
             let buf = std::mem::take(&mut self.buf);
 
-            let (ret, buf) = self.writer.write_all(buf).await;
+            let (ret, buf) = self.writer.write_all(buf).await.into_parts();
 
             // move it back and return
             self.buf = buf;
@@ -96,10 +88,10 @@ impl<W: AsyncWrite> BufWriter<W> {
 }
 
 impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
-    async fn write<B: crate::buf::BoundedIoBuf>(&mut self, buf: B) -> crate::buf::BufResult<usize, B> {
+    async fn write<B: crate::buf::IoBuf>(&mut self, buf: B) -> crate::buf::BufResult<usize, B> {
         let writer_buf = self.buf.as_ref();
         let writer_buf_written = writer_buf.len();
-        let bytes_to_write = buf.bytes_init();
+        let bytes_to_write = buf.as_init().len();
 
         // Buf can not be copied directly into OwnedBuf,
         // we must flush OwnedBuf first.
@@ -107,7 +99,7 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
             match self.flush_buf().await {
                 Ok(_) => (),
                 Err(e) => {
-                    return (Err(e), buf);
+                    return BufResult(Err(e), buf);
                 }
             }
         }
@@ -125,23 +117,20 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
                 writer_buf
                     .as_mut_ptr()
                     .add(self.written)
-                    .copy_from_nonoverlapping(buf.stable_read_ptr(), bytes_to_write);
+                    .copy_from_nonoverlapping(buf.as_init().as_ptr(), bytes_to_write);
             }
             self.written += bytes_to_write;
-            return (Ok(bytes_to_write), buf);
+            return BufResult(Ok(bytes_to_write), buf);
         }
     }
 
-    async fn write_vectored<B: crate::buf::BoundedIoBuf>(
-        &mut self,
-        bufs: Vec<B>,
-    ) -> crate::buf::BufResult<usize, Vec<B>> {
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, bufs: V) -> crate::buf::BufResult<usize, V> {
         // To keep buffering logic simple for the gather case, flush any pending data first,
         // then delegate the entire vectored write to the underlying writer.
         if let Err(e) = self.flush_buf().await {
             // On flush error we have to return the bufs; since we don't know which, return them as-is (empty write effectively failed before).
             // A better approach would track, but for now surface the error with the original vec.
-            return (Err(e), bufs);
+            return BufResult(Err(e), bufs);
         }
         self.writer.write_vectored(bufs).await
     }
@@ -158,11 +147,11 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
 }
 
 impl<W: AsyncRead + AsyncWrite> AsyncRead for BufWriter<W> {
-    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         self.writer.read(buf).await
     }
 
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
         self.writer.read_vectored(bufs).await
     }
 }

@@ -1,7 +1,7 @@
 use std::ops::Deref;
 
 use crate::{
-    buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     io::{AsyncRead, AsyncWrite},
 };
 
@@ -20,11 +20,11 @@ impl<'a, T> AsyncRead for ReadHalf<'a, T>
 where
     &'a T: AsyncRead,
 {
-    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         self.0.read(buf).await
     }
 
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
         self.0.read_vectored(bufs).await
     }
 }
@@ -45,11 +45,11 @@ impl<'a, T> AsyncWrite for WriteHalf<'a, T>
 where
     &'a T: AsyncWrite,
 {
-    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         self.0.write(buf).await
     }
 
-    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, bufs: V) -> BufResult<usize, V> {
         self.0.write_vectored(bufs).await
     }
 

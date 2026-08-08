@@ -1,5 +1,5 @@
 use crate::{
-    buf::{BoundedIoBuf, BufResult, IoBufMut, Slice},
+    buf::{BufResult, IntoInner, IoBufMut, IoBufMutExt, Slice},
     io::AsyncRead,
 };
 
@@ -8,21 +8,21 @@ macro_rules! reader_trait_impl {
     // One line per type: Type => be_method_name, le_method_name
     ($($t:ty => $be:ident, $le:ident),* $(,)?) => {
         $(
-            // Big Endian
+            /// Reads a value encoded in big-endian byte order.
             async fn $be(&mut self) -> std::io::Result<$t> {
                 let buf = Box::new([0; std::mem::size_of::<$t>()]);
 
-                let (res, buf) = self.read_exact(buf).await;
+                let (res, buf) = self.read_exact(buf).await.into_parts();
                 res?;
 
                 Ok(<$t>::from_be_bytes(*buf))
             }
 
-            // Little Endian
+            /// Reads a value encoded in little-endian byte order.
             async fn $le(&mut self) -> std::io::Result<$t> {
                 let buf = Box::new([0; std::mem::size_of::<$t>()]);
 
-                let (res, buf) = self.read_exact(buf).await;
+                let (res, buf) = self.read_exact(buf).await.into_parts();
                 res?;
 
                 Ok(<$t>::from_le_bytes(*buf))
@@ -31,18 +31,18 @@ macro_rules! reader_trait_impl {
     };
 }
 
-// Implemented as an extension trait, adding utility methods to all [`AsyncRead`] types.
-// Callers will tend to import this trait instead of [`AsyncRead`].
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+/// Convenience methods for all [`AsyncRead`] implementations.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait AsyncReadExt: AsyncRead {
-    // Read until buf capacity is fulfilled
+    /// Reads until the buffer's capacity is filled.
     async fn read_exact<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B>;
 
-    // Reads into the uninitialized tail of `buf` (appends to initialized data).
-    //
-    // Equivalent to reading into `buf.slice(bytes_init()..bytes_total())` and
-    // restoring the full buffer. Useful when growing a framing buffer.
+    /// Reads into the uninitialized tail of `buf`.
+    ///
+    /// This is equivalent to reading into a slice spanning the initialized
+    /// length through capacity and then restoring the full buffer.
     async fn append<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B>;
 
     reader_trait_impl! {
@@ -63,17 +63,17 @@ pub trait AsyncReadExt: AsyncRead {
 
 impl<T: AsyncRead + ?Sized> AsyncReadExt for T {
     async fn read_exact<B: IoBufMut + 'static>(&mut self, mut buf: B) -> BufResult<usize, B> {
-        let buf_capacity = buf.bytes_total();
+        let buf_capacity = buf.as_uninit().len();
         let mut bytes_read = 0;
 
         while bytes_read < buf_capacity {
             let buf_slice = Slice::new(buf, bytes_read, buf_capacity);
-            let (result, buf_slice) = self.read(buf_slice).await;
+            let (result, buf_slice) = self.read(buf_slice).await.into_parts();
             buf = buf_slice.into_inner();
 
             match result {
                 Ok(0) => {
-                    return (
+                    return BufResult(
                         Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "failed to fill whole buffer",
@@ -83,24 +83,55 @@ impl<T: AsyncRead + ?Sized> AsyncReadExt for T {
                 }
                 Ok(n) => {
                     bytes_read += n;
-                    buf.set_init(bytes_read);
+                    // Safety: successful reads initialized every byte in the
+                    // accumulated prefix and the loop never exceeds capacity.
+                    unsafe { buf.set_len(bytes_read) };
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), buf),
+                Err(e) => return BufResult(Err(e), buf),
             }
         }
 
-        (Ok(bytes_read), buf)
+        BufResult(Ok(bytes_read), buf)
     }
 
-    async fn append<B: IoBufMut + 'static>(&mut self, buf: B) -> BufResult<usize, B> {
-        let init = buf.bytes_init();
-        let total = buf.bytes_total();
+    async fn append<B: IoBufMut + 'static>(&mut self, mut buf: B) -> BufResult<usize, B> {
+        let init = buf.as_init().len();
+        let total = buf.as_uninit().len();
         if init >= total {
-            return (Ok(0), buf);
+            return BufResult(Ok(0), buf);
         }
-        let slice = buf.slice(init..total);
-        let (res, slice) = self.read(slice).await;
-        (res, slice.into_inner())
+        let uninit = buf.uninit();
+        let (res, uninit) = self.read(uninit).await.into_parts();
+        BufResult(res, uninit.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{future::Future, task::Poll};
+
+    use super::*;
+
+    fn run_ready<F: Future>(future: F) -> F::Output {
+        let mut future = std::pin::pin!(future);
+        let waker = std::task::Waker::noop();
+        let mut context = std::task::Context::from_waker(waker);
+        match future.as_mut().poll(&mut context) {
+            Poll::Ready(output) => output,
+            Poll::Pending => panic!("test future unexpectedly yielded"),
+        }
+    }
+
+    #[test]
+    fn append_reads_into_the_spare_tail() {
+        let mut reader = b"de".as_slice();
+        let mut buffer = Vec::with_capacity(5);
+        buffer.extend_from_slice(b"abc");
+
+        let (result, buffer) = run_ready(reader.append(buffer)).into_parts();
+
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(buffer, b"abcde");
     }
 }

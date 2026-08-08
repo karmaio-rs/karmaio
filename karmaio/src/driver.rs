@@ -79,7 +79,7 @@ impl Driver {
         if let Some(completion) = completion
             && let Some(data) = op.take_data()
         {
-            drop(Operation::complete(data, completion));
+            drop(Operation::complete(*data, completion));
         }
     }
 
@@ -89,7 +89,7 @@ impl Driver {
             Poll::Pending => Poll::Pending,
             Poll::Ready(completion) => {
                 let data = op.take_data().expect("op data missing at completion");
-                Poll::Ready(Operation::complete(data, completion))
+                Poll::Ready(Operation::complete(*data, completion))
             }
         }
     }
@@ -107,7 +107,7 @@ impl Driver {
             Poll::Pending => Poll::Pending,
             Poll::Ready(completion) => {
                 let data = op.take_data().expect("op data missing at completion");
-                Poll::Ready(Operation::complete(data, completion))
+                Poll::Ready(Operation::complete(*data, completion))
             }
         }
     }

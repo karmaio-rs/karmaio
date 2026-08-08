@@ -8,7 +8,7 @@ const DEFAULT_RESERVE: usize = 8 * 1024;
 /// +------------------ capacity ------------------+
 /// | consumed |   pending frames   |  uninit     |
 /// +----------+--------------------+-------------+
-///            ^ Slice begin        ^ bytes_init
+///            ^ Slice start        ^ bytes_init
 /// ```
 ///
 /// The stored [`Slice`] view starts at the first unconsumed byte and ends at the
@@ -26,8 +26,8 @@ impl ReadBuffer<Vec<u8>> {
 }
 
 impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
-    pub(super) fn new_with(buf: B) -> Self {
-        let end = buf.bytes_total().max(buf.bytes_init());
+    pub(super) fn new_with(mut buf: B) -> Self {
+        let end = buf.as_uninit().len().max(buf.as_init().len());
         Self(Some(Slice::new(buf, 0, end)))
     }
 
@@ -53,42 +53,42 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
         self.0 = Some(buf);
     }
 
-    // Restore a buffer with an absolute pending cursor `[start, end)`.
-    pub(super) fn restore_from_parts(&mut self, buf: B, start: usize) {
-        let init = buf.bytes_init();
-        let end = buf.bytes_total().max(init);
+    /// Restores a buffer with an absolute pending cursor `[start, end)`.
+    pub(super) fn restore_from_parts(&mut self, mut buf: B, start: usize) {
+        let init = buf.as_init().len();
+        let end = buf.as_uninit().len().max(init);
         let start = start.min(init);
         self.restore_inner(Slice::new(buf, start, end));
     }
 
-    // Ensure spare capacity for reading more bytes into the uninit tail.
+    /// Ensures spare capacity for reading more bytes into the uninitialized tail.
     pub(super) fn reserve(&mut self, additional: usize) {
         let slice = self.take_inner();
         let start = slice.start();
         let mut buf = slice.into_inner();
-        let init = buf.bytes_init();
-        let spare = buf.bytes_total().saturating_sub(init);
+        let init = buf.as_init().len();
+        let spare = buf.as_uninit().len().saturating_sub(init);
         if spare < additional {
-            buf.reserve(additional - spare);
+            buf.reserve(additional - spare)
+                .expect("failed to reserve framed read buffer");
         }
-        let init = buf.bytes_init();
-        let end = buf.bytes_total().max(init);
+        let init = buf.as_init().len();
+        let end = buf.as_uninit().len().max(init);
         let start = start.min(init);
         self.restore_inner(Slice::new(buf, start, end));
     }
 
-    // Compact consumed prefix if it is large, then return an owned slice over
-    // the uninitialized region for a completion-based read.
-    //
-    // Returns `(pending_start, fill_slice)`. After the read completes, call
-    // [`finish_fill`] with the same `pending_start` and the number of bytes read.
+    /// Compacts a large consumed prefix and returns an owned fill slice.
+    ///
+    /// Returns `(pending_start, fill_slice)`. After the read completes, call
+    /// [`Self::finish_fill`] with the same `pending_start` and the number read.
     pub(super) fn prepare_fill(&mut self) -> (usize, Slice<B>) {
         self.reserve(DEFAULT_RESERVE);
 
         let slice = self.take_inner();
         let mut pending_start = slice.start();
         let mut buf = slice.into_inner();
-        let init = buf.bytes_init();
+        let init = buf.as_init().len();
 
         // Compact when half the initialized region has been consumed.
         if pending_start > 0 && pending_start >= init / 2 {
@@ -102,27 +102,28 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
             pending_start = 0;
         }
 
-        let init = buf.bytes_init();
-        if init >= buf.bytes_total() {
-            buf.reserve(DEFAULT_RESERVE);
+        let init = buf.as_init().len();
+        if init >= buf.as_uninit().len() {
+            buf.reserve(DEFAULT_RESERVE)
+                .expect("failed to reserve framed read buffer");
         }
-        let init = buf.bytes_init();
-        let end = buf.bytes_total().max(init);
+        let init = buf.as_init().len();
+        let end = buf.as_uninit().len().max(init);
         // Fill window is the uninitialized tail [init, capacity).
         let fill = Slice::new(buf, init, end);
         (pending_start, fill)
     }
 
-    // Restore the read cursor after a fill.
+    /// Restores the read cursor after a fill.
     pub(super) fn finish_fill(&mut self, fill: Slice<B>, pending_start: usize) {
-        let buf = fill.into_inner();
-        let init = buf.bytes_init();
-        let end = buf.bytes_total().max(init);
+        let mut buf = fill.into_inner();
+        let init = buf.as_init().len();
+        let end = buf.as_uninit().len().max(init);
         let start = pending_start.min(init);
         self.restore_inner(Slice::new(buf, start, end));
     }
 
-    // Returns a reference to the underlying buffer (escapes the cursor view).
+    /// Returns the underlying buffer, escaping the cursor view.
     #[allow(dead_code)]
     pub(super) fn get_ref(&self) -> &B {
         self.pending().get_ref()

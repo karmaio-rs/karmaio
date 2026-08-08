@@ -226,7 +226,7 @@ async fn read_to_end<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Vec<u8>
     loop {
         // A fresh buffer each iteration: the read op advances the buffer's init
         // cursor, so reusing it would skip already-read bytes.
-        let (res, buf) = reader.read([0u8; 8192]).await;
+        let (res, buf) = reader.read([0u8; 8192]).await.into_parts();
         let n = res?;
         if n == 0 {
             break;

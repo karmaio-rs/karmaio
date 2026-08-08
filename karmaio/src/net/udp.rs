@@ -6,7 +6,7 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use socket2::SockAddr;
 
 use crate::{
-    buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
 };
 
@@ -77,14 +77,14 @@ impl UdpSocket {
     /// Sends data on the connected socket
     ///
     /// On success, returns the number of bytes written.
-    pub async fn send<B: BoundedIoBuf>(&self, buf: B) -> BufResult<usize, B> {
+    pub async fn send<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
         self.inner.send(buf).await
     }
 
     /// Sends data on the socket to the given address.
     ///
     /// On success, returns the number of bytes written.
-    pub async fn send_to<B: BoundedIoBuf>(&self, buf: B, socket_addr: SocketAddr) -> BufResult<usize, B> {
+    pub async fn send_to<B: IoBuf>(&self, buf: B, socket_addr: SocketAddr) -> BufResult<usize, B> {
         self.inner.send_to(buf, socket_addr).await
     }
 
@@ -97,33 +97,33 @@ impl UdpSocket {
     /// * The original `msg_contol` `Option<C>`
     ///
     /// Consider using [`Self::sendmsg_zc`] for a zero-copy alternative.
-    pub async fn sendmsg<B: BoundedIoBuf, C: BoundedIoBuf>(
+    pub async fn sendmsg<V: IoVectoredBuf, C: IoBuf>(
         &self,
-        io_slices: Vec<B>,
+        io_slices: V,
         socket_addr: Option<SocketAddr>,
         msg_control: Option<C>,
-    ) -> BufResult<(usize, Option<C>), Vec<B>> {
+    ) -> BufResult<(usize, Option<C>), V> {
         self.inner.sendmsg(io_slices, socket_addr, msg_control).await
     }
 
     /// Reads a packet of data from the socket into the buffer.
     ///
     /// Returns the original buffer and quantity of data read.
-    pub async fn recv<B: BoundedIoBufMut>(&self, buf: B) -> BufResult<usize, B> {
+    pub async fn recv<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         self.inner.recv(buf).await
     }
 
     /// Receives a single datagram message on the socket.
     ///
     /// On success, returns the number of bytes read and the origin.
-    pub async fn recv_from<B: BoundedIoBufMut>(&self, buf: B) -> BufResult<(usize, SocketAddr), B> {
+    pub async fn recv_from<B: IoBufMut>(&self, buf: B) -> BufResult<(usize, SocketAddr), B> {
         self.inner.recv_from(buf).await
     }
 
     /// Receives a single datagram message on the socket, into multiple buffers
     ///
     /// On success, returns the number of bytes read and the origin.
-    pub async fn recvmsg<B: BoundedIoBufMut>(&self, buf: Vec<B>) -> BufResult<(usize, SocketAddr), Vec<B>> {
+    pub async fn recvmsg<V: IoVectoredBufMut>(&self, buf: V) -> BufResult<(usize, SocketAddr), V> {
         self.inner.recvmsg(buf).await
     }
 

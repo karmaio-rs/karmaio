@@ -412,7 +412,7 @@ impl IocpBackend {
 }
 
 impl IocpBackend {
-    pub(crate) fn submit_op<T: IocpOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+    pub(crate) fn submit_op<T: IocpOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
         if self.shutting_down {
             return Err(Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -420,13 +420,17 @@ impl IocpBackend {
             ));
         }
 
+        // Stabilize the operation before `submit` derives buffer or OVERLAPPED
+        // pointers. Moving the returned future only moves this box.
+        let mut data = Box::new(data);
+
         let key = self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
             blocking_job: None,
         })?;
 
-        match IocpOperation::submit(&mut data) {
+        match IocpOperation::submit(&mut *data) {
             IocpSubmission::Ready(completion) => {
                 // The operation finished before it needed IOCP. Store the
                 // completion so the first poll resolves the future.
@@ -478,9 +482,9 @@ impl IocpBackend {
                 // the completion packet arrives so we can cleanup accept/open.
                 let mut data = op.take_data().expect("op data missing on detach");
                 if let Some(interest) = slot.interest.as_ref() {
-                    IocpOperation::cancel(&mut data, interest);
+                    IocpOperation::cancel(&mut *data, interest);
                 }
-                slot.state = State::Ignored(Box::new(data));
+                slot.state = State::Ignored(data);
                 None
             }
             State::Completed(_) => {

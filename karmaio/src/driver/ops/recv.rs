@@ -12,12 +12,12 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBufMut},
     driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
-pub(crate) struct Recv<B: BoundedIoBufMut> {
+pub(crate) struct Recv<B: IoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
     io_handle: SharedIoHandle<socket2::Socket>,
@@ -30,21 +30,13 @@ pub(crate) struct Recv<B: BoundedIoBufMut> {
     wsa_buf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
 }
 
-impl<B: BoundedIoBufMut> Op<Recv<B>> {
-    // `mut buf` is required on Windows (`stable_write_ptr`); unused on other targets.
-    #[allow(unused_mut)]
-    pub(crate) fn recv(io_handle: &SharedIoHandle<socket2::Socket>, mut buf: B) -> std::io::Result<Op<Recv<B>>> {
-        #[cfg(windows)]
-        let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
-            len: buf.bytes_total() as u32,
-            buf: buf.stable_write_ptr() as *mut u8,
-        };
-
+impl<B: IoBufMut> Op<Recv<B>> {
+    pub(crate) fn recv(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> std::io::Result<Op<Recv<B>>> {
         let data = Recv {
             io_handle: io_handle.clone(),
             buf,
             #[cfg(windows)]
-            wsa_buf: Box::new(wsa_buf),
+            wsa_buf: Box::new(unsafe { std::mem::zeroed() }),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -52,14 +44,14 @@ impl<B: BoundedIoBufMut> Op<Recv<B>> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe impl<B: BoundedIoBufMut> UringOperation for Recv<B> {
+unsafe impl<B: IoBufMut> UringOperation for Recv<B> {
     type Output = BufResult<usize, B>;
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         // Get raw buffer info
-        let ptr = self.buf.stable_write_ptr();
-        let len = self.buf.bytes_total();
+        let ptr = self.buf.as_uninit().as_mut_ptr().cast::<u8>();
+        let len = self.buf.as_uninit().len();
 
         opcode::Recv::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
@@ -76,7 +68,7 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for Recv<B> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<B: BoundedIoBufMut> KqueueOperation for Recv<B> {
+impl<B: IoBufMut> KqueueOperation for Recv<B> {
     type Output = BufResult<usize, B>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(
@@ -85,8 +77,12 @@ impl<B: BoundedIoBufMut> KqueueOperation for Recv<B> {
             {
                 // Safety: the operation owns this buffer for the duration of the
                 // syscall, and the slice covers exactly its writable capacity.
-                let buf =
-                    unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_total()) };
+                let buf = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.buf.as_uninit().as_mut_ptr().cast::<u8>(),
+                        self.buf.as_uninit().len(),
+                    )
+                };
                 rustix::net::recv(&self.io_handle, buf, rustix::net::RecvFlags::empty())
                     .map(|(_, n)| n as u32)
                     .map_err(std::io::Error::from)
@@ -100,7 +96,7 @@ impl<B: BoundedIoBufMut> KqueueOperation for Recv<B> {
 }
 
 #[cfg(windows)]
-unsafe impl<B: BoundedIoBufMut> IocpOperation for Recv<B> {
+unsafe impl<B: IoBufMut> IocpOperation for Recv<B> {
     type Output = BufResult<usize, B>;
 
     fn submit(&mut self) -> IocpSubmission {
@@ -112,6 +108,8 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for Recv<B> {
         let mut interest = Interest::new(socket as _);
         let mut flags = 0u32;
         let mut bytes_recv = 0u32;
+        self.wsa_buf.len = self.buf.as_uninit().len() as u32;
+        self.wsa_buf.buf = self.buf.as_uninit().as_mut_ptr().cast::<u8>();
 
         windows_syscall_submit_overlapped!(interest, socket, {
             WSARecv(
@@ -131,18 +129,18 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for Recv<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> Recv<B> {
+impl<B: IoBufMut> Recv<B> {
     fn finish(mut self, completion: super::Completion) -> BufResult<usize, B> {
-        let capacity = self.buf.bytes_total();
+        let capacity = self.buf.as_uninit().len();
         match completion.bytes_transferred(capacity) {
             Ok(n) => {
                 // Safety: the platform wrote at most `capacity` bytes into the buffer.
                 unsafe {
-                    self.buf.set_init(n);
+                    self.buf.set_len(n);
                 }
-                (Ok(n), self.buf)
+                BufResult(Ok(n), self.buf)
             }
-            Err(err) => (Err(err), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }

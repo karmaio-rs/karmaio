@@ -22,12 +22,12 @@ async fn main() -> std::io::Result<()> {
     socket.connect(server_addr).await?;
     println!("connected to: {server_addr}");
 
-    let (result, _) = socket.send(b"Hello UDP!".to_vec()).await;
+    let (result, _) = socket.send(b"Hello UDP!".to_vec()).await.into_parts();
     result?;
     println!("sent message");
 
     let buf = vec![0; 1024];
-    let (result, buf) = socket.recv(buf).await;
+    let (result, buf) = socket.recv(buf).await.into_parts();
     let n = result?;
     println!("received {n} bytes: {}", String::from_utf8_lossy(&buf[..n]));
 

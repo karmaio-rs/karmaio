@@ -19,7 +19,7 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBuf, BufResult},
+    buf::{BufResult, IoBuf},
     driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
@@ -28,7 +28,7 @@ use crate::{
 //
 // On Linux, iouring does not support sendto yet, so have to simulate it with sendmsg
 // On Windows and macOS, the standard sendto syscalls are used
-pub(crate) struct SendTo<B: BoundedIoBuf> {
+pub(crate) struct SendTo<B: IoBuf> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
     io_handle: SharedIoHandle<socket2::Socket>,
@@ -54,7 +54,7 @@ pub(crate) struct SendTo<B: BoundedIoBuf> {
     wsa_buf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
 }
 
-impl<B: BoundedIoBuf> Op<SendTo<B>> {
+impl<B: IoBuf> Op<SendTo<B>> {
     pub(crate) fn send_to(
         io_handle: &SharedIoHandle<socket2::Socket>,
         buf: B,
@@ -62,38 +62,16 @@ impl<B: BoundedIoBuf> Op<SendTo<B>> {
     ) -> std::io::Result<Op<SendTo<B>>> {
         let socket_addr = Box::new(SockAddr::from(socket_addr));
 
-        #[cfg(target_os = "linux")]
-        let (io_slices, msghdr) = {
-            let mut io_slices = vec![IoSlice::new(unsafe {
-                std::slice::from_raw_parts(buf.stable_read_ptr(), buf.bytes_init())
-            })];
-
-            let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-            msghdr.msg_iov = io_slices.as_mut_ptr().cast();
-            msghdr.msg_iovlen = io_slices.len() as _;
-
-            msghdr.msg_name = socket_addr.as_ptr() as *mut libc::c_void;
-            msghdr.msg_namelen = socket_addr.len();
-
-            (io_slices, msghdr)
-        };
-
-        #[cfg(windows)]
-        let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
-            len: buf.bytes_init() as u32,
-            buf: buf.stable_read_ptr() as *mut u8,
-        };
-
         let data = SendTo {
             io_handle: io_handle.clone(),
             buf,
             socket_addr,
             #[cfg(target_os = "linux")]
-            io_slices,
+            io_slices: Vec::new(),
             #[cfg(target_os = "linux")]
-            msghdr,
+            msghdr: Box::new(unsafe { std::mem::zeroed() }),
             #[cfg(windows)]
-            wsa_buf: Box::new(wsa_buf),
+            wsa_buf: Box::new(unsafe { std::mem::zeroed() }),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -101,10 +79,20 @@ impl<B: BoundedIoBuf> Op<SendTo<B>> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe impl<B: BoundedIoBuf> UringOperation for SendTo<B> {
+unsafe impl<B: IoBuf> UringOperation for SendTo<B> {
     type Output = BufResult<usize, B>;
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
+
+        let buf = self.buf.as_init();
+        self.io_slices.clear();
+        self.io_slices.push(IoSlice::new(unsafe {
+            std::slice::from_raw_parts(buf.as_ptr(), buf.len())
+        }));
+        self.msghdr.msg_iov = self.io_slices.as_mut_ptr().cast();
+        self.msghdr.msg_iovlen = self.io_slices.len() as _;
+        self.msghdr.msg_name = self.socket_addr.as_ptr() as *mut _;
+        self.msghdr.msg_namelen = self.socket_addr.len();
 
         opcode::SendMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_ref() as *const _).build()
     }
@@ -113,7 +101,7 @@ unsafe impl<B: BoundedIoBuf> UringOperation for SendTo<B> {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 
-        (res, buf)
+        BufResult(res, buf)
     }
 }
 
@@ -124,7 +112,7 @@ unsafe impl<B: BoundedIoBuf> UringOperation for SendTo<B> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<B: BoundedIoBuf> KqueueOperation for SendTo<B> {
+impl<B: IoBuf> KqueueOperation for SendTo<B> {
     type Output = BufResult<usize, B>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(
@@ -143,7 +131,7 @@ impl<B: BoundedIoBuf> KqueueOperation for SendTo<B> {
                 // Safety: the operation owns the buffer for the duration of
                 // the syscall, and the slice covers exactly its initialized
                 // bytes.
-                let buf = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
+                let buf = unsafe { std::slice::from_raw_parts(self.buf.as_init().as_ptr(), self.buf.as_init().len()) };
                 rustix::net::sendto(&self.io_handle, buf, rustix::net::SendFlags::empty(), &address)
                     .map(|n| n as u32)
                     .map_err(std::io::Error::from)
@@ -155,12 +143,12 @@ impl<B: BoundedIoBuf> KqueueOperation for SendTo<B> {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 
-        (res, buf)
+        BufResult(res, buf)
     }
 }
 
 #[cfg(windows)]
-unsafe impl<B: BoundedIoBuf> IocpOperation for SendTo<B> {
+unsafe impl<B: IoBuf> IocpOperation for SendTo<B> {
     type Output = BufResult<usize, B>;
 
     fn submit(&mut self) -> IocpSubmission {
@@ -171,6 +159,8 @@ unsafe impl<B: BoundedIoBuf> IocpOperation for SendTo<B> {
 
         let mut interest = Interest::new(socket as _);
         let mut bytes_sent = 0u32;
+        self.wsa_buf.len = self.buf.as_init().len() as u32;
+        self.wsa_buf.buf = self.buf.as_init().as_ptr() as *mut u8;
 
         let name = self.socket_addr.as_ptr() as *const _;
         let namelen = self.socket_addr.len() as i32;
@@ -194,6 +184,6 @@ unsafe impl<B: BoundedIoBuf> IocpOperation for SendTo<B> {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 
-        (res, buf)
+        BufResult(res, buf)
     }
 }

@@ -23,13 +23,13 @@ async fn main() -> std::io::Result<()> {
 
     let mut buf = vec![0u8; 1024];
     loop {
-        let (result, returned) = socket.recv_from(buf).await;
+        let (result, returned) = socket.recv_from(buf).await.into_parts();
         buf = returned;
         let (n, peer) = result?;
         println!("received {n} bytes from {peer}");
 
         let payload = buf[..n].to_vec();
-        let (send_result, _) = socket.send_to(payload, peer).await;
+        let (send_result, _) = socket.send_to(payload, peer).await.into_parts();
         send_result?;
     }
 }

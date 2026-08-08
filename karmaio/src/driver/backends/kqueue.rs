@@ -612,7 +612,9 @@ impl KqueueBackend {
             registration: None,
         })?;
 
-        Ok(Op::<T>::new(key, data, handle))
+        // Keep the operation at a stable address before it can be attempted.
+        // Readiness retries and blocking completion may outlive the future.
+        Ok(Op::<T>::new(key, Box::new(data), handle))
     }
 
     /// Detach or cancel an operation.
@@ -643,7 +645,7 @@ impl KqueueBackend {
                     // A blocking-pool job still owns the operation payload so
                     // late completion can clean up resources it produces.
                     let data = op.take_data().expect("op data missing on detach");
-                    self.ops.get_mut(key).expect("waiting op missing").state = State::Ignored(Box::new(data));
+                    self.ops.get_mut(key).expect("waiting op missing").state = State::Ignored(data);
                 }
                 None
             }

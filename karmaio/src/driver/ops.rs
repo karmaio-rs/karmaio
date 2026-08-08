@@ -305,17 +305,22 @@ mod blocking_completion_tests {
 
 /// A typed one-shot operation future shared by all backends.
 ///
-/// The future owns the logical operation payload. The selected backend owns
-/// only the lifecycle slot and any platform-specific submission state, and
-/// drives this future through the target-local `Operation` protocol.
+/// The future owns the logical operation payload in a stable heap allocation.
+/// The selected backend owns only the lifecycle slot and any platform-specific
+/// submission state, and drives this future through the target-local
+/// `Operation` protocol.
+///
+/// Keeping the payload boxed is required for operations whose native control
+/// data points into the operation itself, including buffers with inline
+/// storage. Moving the `Op` future only moves the box pointer.
 pub(crate) struct Op<T: Operation + 'static> {
     driver: Handle,
     key: OpKey,
-    data: Option<T>,
+    data: Option<Box<T>>,
 }
 
 impl<T: Operation + 'static> Op<T> {
-    pub(crate) fn new(key: OpKey, data: T, driver: Handle) -> Self {
+    pub(crate) fn new(key: OpKey, data: Box<T>, driver: Handle) -> Self {
         Self {
             driver,
             key,
@@ -327,22 +332,22 @@ impl<T: Operation + 'static> Op<T> {
         self.key
     }
 
-    pub(crate) fn take_data(&mut self) -> Option<T> {
+    pub(crate) fn take_data(&mut self) -> Option<Box<T>> {
         self.data.take()
     }
 
     #[allow(dead_code)]
     pub(crate) fn data_ref(&self) -> Option<&T> {
-        self.data.as_ref()
+        self.data.as_deref()
     }
 
     #[allow(dead_code)]
     pub(crate) fn data_mut(&mut self) -> Option<&mut T> {
-        self.data.as_mut()
+        self.data.as_deref_mut()
     }
 }
 
-impl<T: Operation + Unpin + 'static> Future for Op<T> {
+impl<T: Operation + 'static> Future for Op<T> {
     type Output = T::Output;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {

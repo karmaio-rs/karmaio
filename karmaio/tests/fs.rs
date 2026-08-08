@@ -8,13 +8,35 @@ use std::{
 };
 
 use karmaio::{
-    Runtime, fs,
+    Runtime,
+    buf::IoBuf,
+    fs,
     io::{AsyncReadAtExt, AsyncReadExt, AsyncWriteAtExt, AsyncWriteExt},
 };
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
 struct TestDir(PathBuf);
+
+struct SafeInlineBuf<const N: usize> {
+    bytes: [u8; N],
+    _pinned: std::marker::PhantomPinned,
+}
+
+impl<const N: usize> SafeInlineBuf<N> {
+    fn new(bytes: [u8; N]) -> Self {
+        Self {
+            bytes,
+            _pinned: std::marker::PhantomPinned,
+        }
+    }
+}
+
+impl<const N: usize> IoBuf for SafeInlineBuf<N> {
+    fn as_init(&self) -> &[u8] {
+        &self.bytes
+    }
+}
 
 impl TestDir {
     fn new() -> io::Result<Self> {
@@ -162,67 +184,86 @@ fn positional_extensions_and_file_cursor() -> io::Result<()> {
             .open(&path)
             .await?;
 
-        let (result, _) = file.write_all_at(b"world".to_vec(), 6).await;
+        let (result, _) = file.write_all_at(b"world".to_vec(), 6).await.into_parts();
         result?;
-        let (result, _) = file.write_all_at(b"hello ".to_vec(), 0).await;
+        let (result, _) = file.write_all_at(b"hello ".to_vec(), 0).await.into_parts();
         result?;
 
-        let (result, bytes) = file.read_exact_at(Box::new([0; 5]), 6).await;
+        // A downstream buffer implementation needs no unsafe pointer contract,
+        // and may contain inline storage without implementing Unpin.
+        let (result, custom) = file.write_all_at(SafeInlineBuf::new(*b"HELLO"), 0).await.into_parts();
         result?;
-        assert_eq!(&*bytes, b"world");
+        assert_eq!(custom.bytes, *b"HELLO");
 
-        let (result, bytes) = file.read_to_end_at(Vec::new(), 0).await;
+        // Inline mutable storage remains at a stable address while the native
+        // operation is pending.
+        let (result, bytes) = file.read_exact_at([0; 5], 6).await.into_parts();
+        result?;
+        assert_eq!(&bytes, b"world");
+
+        let (result, bytes) = file.read_to_end_at(Vec::new(), 0).await.into_parts();
         assert_eq!(result?, 11);
-        assert_eq!(bytes, b"hello world");
+        assert_eq!(bytes, b"HELLO world");
 
         let mut cursor = Cursor::new(file);
         cursor.set_position(6);
-        let (result, bytes) = cursor.read_exact(Box::new([0; 5])).await;
+        let (result, bytes) = cursor.read_exact(Box::new([0; 5])).await.into_parts();
         assert_eq!(result?, 5);
         assert_eq!(&*bytes, b"world");
 
         cursor.set_position(0);
-        let (result, _) = cursor.write_all(b"HELLO".to_vec()).await;
+        let (result, _) = cursor.write_all(b"HELLO".to_vec()).await.into_parts();
         assert_eq!(result?, 5);
         cursor.into_inner().close().await?;
 
         assert_eq!(fs::read(&path).await?, b"HELLO world");
 
         let source = b"012345".to_vec();
-        let (result, bytes) = source.read_to_end_at(vec![b'x'], 2).await;
+        let (result, bytes) = source.read_to_end_at(vec![b'x'], 2).await.into_parts();
         assert_eq!(result?, 4);
         assert_eq!(bytes, b"x2345");
 
-        let (result, string) = source.read_to_string_at("value=".into(), 2).await;
+        let (result, string) = source.read_to_string_at("value=".into(), 2).await.into_parts();
         assert_eq!(result?, 4);
         assert_eq!(string, "value=2345");
 
         let buffers = vec![Vec::with_capacity(2), Vec::with_capacity(3)];
-        let (result, buffers) = source.read_vectored_exact_at(buffers, 1).await;
+        let (result, buffers) = source.read_vectored_exact_at(buffers, 1).await.into_parts();
         result?;
         assert_eq!(buffers, [b"12".to_vec(), b"345".to_vec()]);
 
+        let buffers = [[0u8; 2], [0u8; 2]];
+        let (result, buffers) = source.read_vectored_exact_at(buffers, 1).await.into_parts();
+        result?;
+        assert_eq!(buffers, [*b"12", *b"34"]);
+
         let mut destination = Vec::new();
         let buffers = vec![b"abc".to_vec(), b"def".to_vec()];
-        let (result, returned) = destination.write_vectored_all_at(buffers, 2).await;
+        let (result, returned) = destination.write_vectored_all_at(buffers, 2).await.into_parts();
         result?;
         assert_eq!(returned, [b"abc".to_vec(), b"def".to_vec()]);
         assert_eq!(destination, b"\0\0abcdef");
 
+        let buffers = [*b"gh", *b"ij"];
+        let (result, returned) = destination.write_vectored_all_at(buffers, 0).await.into_parts();
+        result?;
+        assert_eq!(returned, [*b"gh", *b"ij"]);
+        assert_eq!(&destination[..4], b"ghij");
+
         let invalid_utf8 = vec![0xff];
-        let (result, string) = invalid_utf8.read_to_string_at("valid".into(), 0).await;
+        let (result, string) = invalid_utf8.read_to_string_at("valid".into(), 0).await.into_parts();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::InvalidData);
         assert_eq!(string, "valid");
 
         let short_source = b"ab".to_vec();
         let buffers = vec![Vec::with_capacity(2), Vec::with_capacity(1)];
-        let (result, returned) = short_source.read_vectored_exact_at(buffers, 0).await;
+        let (result, returned) = short_source.read_vectored_exact_at(buffers, 0).await.into_parts();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
         assert_eq!(returned.len(), 2);
 
         let mut short_destination = [0u8; 2];
         let buffers = vec![b"abc".to_vec(), b"def".to_vec()];
-        let (result, returned) = short_destination.write_vectored_all_at(buffers, 0).await;
+        let (result, returned) = short_destination.write_vectored_all_at(buffers, 0).await.into_parts();
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WriteZero);
         assert_eq!(returned.len(), 2);
         Ok(())
@@ -246,7 +287,7 @@ fn file_interoperability_and_shared_writes() -> io::Result<()> {
         assert!(format!("{file:?}").contains("File"));
 
         let mut shared = &file;
-        let (result, _) = shared.write_all_at(b"shared".to_vec(), 0).await;
+        let (result, _) = shared.write_all_at(b"shared".to_vec(), 0).await.into_parts();
         result?;
 
         #[cfg(unix)]

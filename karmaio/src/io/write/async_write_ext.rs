@@ -8,31 +8,31 @@ macro_rules! writer_trait_impl {
     // One line per type: Type => be_method_name, le_method_name
     ($($t:ty => $be:ident, $le:ident),* $(,)?) => {
         $(
-            // Big Endian
+            /// Writes a value encoded in big-endian byte order.
             async fn $be(&mut self) -> std::io::Result<usize> {
                 let buf = Box::new([0; std::mem::size_of::<$t>()]);
 
-                let (res, _) = self.write_all(buf).await;
+                let (res, _) = self.write_all(buf).await.into_parts();
                 res
             }
 
-            // Little Endian
+            /// Writes a value encoded in little-endian byte order.
             async fn $le(&mut self) -> std::io::Result<usize> {
                 let buf = Box::new([0; std::mem::size_of::<$t>()]);
 
-                let (res, _) = self.write_all(buf).await;
+                let (res, _) = self.write_all(buf).await.into_parts();
                 res
             }
         )*
     };
 }
 
-// Implemented as an extension trait, adding utility methods to all [`AsyncWrite`] types.
-// Callers will tend to import this trait instead of [`AsyncWrite`].
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+/// Convenience methods for all [`AsyncWrite`] implementations.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait AsyncWriteExt: AsyncWrite {
-    // Write the entire contents of the buf
+    /// Writes all initialized bytes in the buffer.
     async fn write_all<B: IoBuf + 'static>(&mut self, buf: B) -> BufResult<usize, B>;
 
     writer_trait_impl! {
@@ -53,17 +53,17 @@ pub trait AsyncWriteExt: AsyncWrite {
 
 impl<T: AsyncWrite + ?Sized> AsyncWriteExt for T {
     async fn write_all<B: IoBuf + 'static>(&mut self, mut buf: B) -> BufResult<usize, B> {
-        let bytes_to_write = buf.bytes_init();
+        let bytes_to_write = buf.as_init().len();
         let mut bytes_written = 0;
 
         while bytes_written < bytes_to_write {
             let buf_slice = Slice::new(buf, bytes_written, bytes_to_write);
-            let (result, buf_slice) = self.write(buf_slice).await;
+            let (result, buf_slice) = self.write(buf_slice).await.into_parts();
             buf = buf_slice.into_inner();
 
             match result {
                 Ok(0) => {
-                    return (
+                    return BufResult(
                         Err(std::io::Error::new(
                             std::io::ErrorKind::UnexpectedEof,
                             "failed to fill whole buffer",
@@ -73,10 +73,10 @@ impl<T: AsyncWrite + ?Sized> AsyncWriteExt for T {
                 }
                 Ok(n) => bytes_written += n,
                 Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), buf),
+                Err(e) => return BufResult(Err(e), buf),
             }
         }
 
-        (Ok(bytes_written), buf)
+        BufResult(Ok(bytes_written), buf)
     }
 }

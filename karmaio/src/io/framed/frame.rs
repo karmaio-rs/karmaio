@@ -1,15 +1,15 @@
 use std::io;
 
-use crate::buf::{BoundedIoBuf, IoBufMut, IoBufMutExt, Slice};
+use crate::buf::{IoBuf, IoBufExt, IoBufMut, IoBufMutExt, Slice};
 
 /// An extracted frame describing where the payload sits inside a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Frame {
-    // Offset where the frame payload begins.
+    /// Offset where the frame payload starts.
     prefix: usize,
-    // Length of the frame payload.
+    /// Length of the frame payload.
     payload: usize,
-    // Suffix length after the payload (e.g. delimiter).
+    /// Suffix length after the payload, such as a delimiter.
     suffix: usize,
 }
 
@@ -56,7 +56,7 @@ impl Frame {
 
     /// Slice the payload out of an owned buffer as an owned [`Slice`] view.
     #[inline]
-    pub fn slice<B: BoundedIoBuf>(&self, buf: B) -> Slice<B::Buf> {
+    pub fn slice<B: IoBuf>(&self, buf: B) -> Slice<B> {
         buf.slice(self.prefix..self.prefix + self.payload)
     }
 }
@@ -151,22 +151,25 @@ impl LengthDelimited {
 
 impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
     fn enclose(&mut self, buf: &mut B) {
-        let len = buf.bytes_init();
+        let len = IoBuf::as_init(buf).len();
         let lfl = self.length_field_len;
 
-        buf.reserve(lfl);
+        buf.reserve(lfl).expect("failed to reserve frame prefix");
         // Shift payload right to make room for the length prefix.
         buf.copy_within(0..len, lfl);
-        debug_assert!(buf.bytes_init() >= lfl + len);
+        // Safety: copy_within initialized the shifted payload and the prefix is
+        // written immediately below before the enlarged length is observed.
+        unsafe { buf.set_len(lfl + len) };
+        debug_assert!(IoBuf::as_init(buf).len() >= lfl + len);
 
         let mut len_bytes = [0u8; Self::MAX_LFL];
         let len_u64 = len as u64;
         if self.length_field_is_big_endian {
             len_bytes[Self::MAX_LFL - lfl..].copy_from_slice(&len_u64.to_be_bytes()[Self::MAX_LFL - lfl..]);
-            buf.as_mut_init()[..lfl].copy_from_slice(&len_bytes[Self::MAX_LFL - lfl..]);
+            buf.as_mut_slice()[..lfl].copy_from_slice(&len_bytes[Self::MAX_LFL - lfl..]);
         } else {
             len_bytes[..lfl].copy_from_slice(&len_u64.to_le_bytes()[..lfl]);
-            buf.as_mut_init()[..lfl].copy_from_slice(&len_bytes[..lfl]);
+            buf.as_mut_slice()[..lfl].copy_from_slice(&len_bytes[..lfl]);
         }
     }
 
@@ -281,7 +284,7 @@ pub struct AnyDelimited<'a> {
 }
 
 impl<'a> AnyDelimited<'a> {
-    // Creates a new delimiter framer with the given delimiter bytes.
+    /// Creates a new delimiter framer with the given delimiter bytes.
     #[inline]
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes }
@@ -336,19 +339,19 @@ impl Default for NoopFramer {
 }
 
 impl NoopFramer {
-    // Creates a new no-op framer with a 4 KiB max chunk size.
+    /// Creates a new no-op framer with a 4 KiB maximum chunk size.
     #[inline]
     pub fn new() -> Self {
         Self::default()
     }
 
-    // Returns the maximum chunk size.
+    /// Returns the maximum chunk size.
     #[inline]
     pub fn max_size(&self) -> usize {
         self.max_size
     }
 
-    // Sets the maximum chunk size.
+    /// Sets the maximum chunk size.
     #[inline]
     pub fn set_max_size(mut self, max_size: usize) -> Self {
         self.max_size = max_size;
@@ -372,7 +375,6 @@ impl<B: IoBufMut> Framer<B> for NoopFramer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::buf::BoundedIoBuf;
 
     #[test]
     fn length_delimited_enclose_extract() {

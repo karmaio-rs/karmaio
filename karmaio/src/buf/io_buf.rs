@@ -1,150 +1,81 @@
-// An `io_uring` compatible buffer.
-//
-// The `IoBuf` trait is implemented by buffer types that can be passed to
-// io_uring operations. Users will not need to use this trait directly.
-//
-// # Safety
-//
-// Buffers passed to `io-uring` operations must reference a stable memory region.
-// While the runtime holds ownership to a buffer, the pointer returned
-// by `stable_read_ptr` must remain valid even if the `IoBuf` value is moved.
-pub unsafe trait IoBuf: Unpin + 'static {
-    // Returns a raw pointer to the vector’s buffer.
-    //
-    // This method is to be used by the runtime and we do not expect users to call it directly.
-    //
-    // The implementation must ensure that, while the runtime owns the value,
-    // the pointer returned by `stable_read_ptr` **does not**  change.
-    fn stable_read_ptr(&self) -> *const u8;
+use std::{rc::Rc, sync::Arc};
 
-    // Number of initialized bytes.
-    //
-    // This method is to be used by the runtime and it is not
-    // expected for users to call it directly.
-    //
-    // For `Vec`, this is identical to `len()`.
-    fn bytes_init(&self) -> usize;
-
-    // Total size of the buffer, including uninitialized memory, if any.
-    //
-    // This method is to be used by the runtime and it is not
-    // expected for users to call it directly.
-    //
-    // For `Vec`, this is identical to `capacity()`.
-    fn bytes_total(&self) -> usize;
+/// An immutable buffer for completion-based I/O operations.
+///
+/// Operations take ownership of buffers and keep them in stable storage while
+/// the operating system may access them. Implementors only expose a normal
+/// borrowed slice and therefore do not need to uphold raw-pointer stability.
+pub trait IoBuf: 'static {
+    /// Returns the initialized bytes available to an output operation.
+    fn as_init(&self) -> &[u8];
 }
 
-unsafe impl IoBuf for Vec<u8> {
+impl<B: IoBuf + ?Sized> IoBuf for &'static B {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
-    }
-
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        self.capacity()
+    fn as_init(&self) -> &[u8] {
+        (**self).as_init()
     }
 }
 
-unsafe impl IoBuf for &'static [u8] {
+impl<B: IoBuf + ?Sized> IoBuf for &'static mut B {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
-    }
-
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        self.bytes_init()
+    fn as_init(&self) -> &[u8] {
+        (**self).as_init()
     }
 }
 
-unsafe impl IoBuf for Box<[u8]> {
+impl<B: IoBuf + ?Sized> IoBuf for Box<B> {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
-    }
-
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        self.bytes_init()
+    fn as_init(&self) -> &[u8] {
+        (**self).as_init()
     }
 }
 
-unsafe impl<const N: usize> IoBuf for [u8; N] {
+impl<B: IoBuf + ?Sized> IoBuf for Rc<B> {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
-    }
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        N
-    }
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        N
+    fn as_init(&self) -> &[u8] {
+        (**self).as_init()
     }
 }
 
-unsafe impl<const N: usize> IoBuf for Box<[u8; N]> {
+impl<B: IoBuf + ?Sized> IoBuf for Arc<B> {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
-    }
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        N
-    }
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        N
+    fn as_init(&self) -> &[u8] {
+        (**self).as_init()
     }
 }
 
-unsafe impl IoBuf for &'static str {
+impl IoBuf for [u8] {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
-    }
-
-    #[inline]
-    fn bytes_init(&self) -> usize {
-        self.len()
-    }
-
-    #[inline]
-    fn bytes_total(&self) -> usize {
-        self.bytes_init()
+    fn as_init(&self) -> &[u8] {
+        self
     }
 }
 
-unsafe impl IoBuf for String {
+impl<const N: usize> IoBuf for [u8; N] {
     #[inline]
-    fn stable_read_ptr(&self) -> *const u8 {
-        self.as_ptr()
+    fn as_init(&self) -> &[u8] {
+        self
     }
+}
 
+impl IoBuf for Vec<u8> {
     #[inline]
-    fn bytes_init(&self) -> usize {
-        self.len()
+    fn as_init(&self) -> &[u8] {
+        self
     }
+}
 
+impl IoBuf for str {
     #[inline]
-    fn bytes_total(&self) -> usize {
-        self.bytes_init()
+    fn as_init(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl IoBuf for String {
+    #[inline]
+    fn as_init(&self) -> &[u8] {
+        self.as_bytes()
     }
 }

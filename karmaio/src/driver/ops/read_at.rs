@@ -12,12 +12,12 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBufMut},
     driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
-pub(crate) struct ReadAt<B: BoundedIoBufMut> {
+pub(crate) struct ReadAt<B: IoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(dead_code)]
     io_handle: SharedIoHandle<std::fs::File>,
@@ -29,7 +29,7 @@ pub(crate) struct ReadAt<B: BoundedIoBufMut> {
     offset: u64,
 }
 
-impl<B: BoundedIoBufMut> Op<ReadAt<B>> {
+impl<B: IoBufMut> Op<ReadAt<B>> {
     pub(crate) fn read_at(
         io_handle: &SharedIoHandle<std::fs::File>,
         buf: B,
@@ -46,14 +46,14 @@ impl<B: BoundedIoBufMut> Op<ReadAt<B>> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe impl<B: BoundedIoBufMut> UringOperation for ReadAt<B> {
+unsafe impl<B: IoBufMut> UringOperation for ReadAt<B> {
     type Output = BufResult<usize, B>;
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
         // Get raw buffer info
-        let ptr = self.buf.stable_write_ptr();
-        let len = self.buf.bytes_total();
+        let ptr = self.buf.as_uninit().as_mut_ptr().cast::<u8>();
+        let len = self.buf.as_uninit().len();
         opcode::Read::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _)
             .offset(self.offset as _)
             .build()
@@ -71,7 +71,7 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for ReadAt<B> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<B: BoundedIoBufMut> KqueueOperation for ReadAt<B> {
+impl<B: IoBufMut> KqueueOperation for ReadAt<B> {
     type Output = BufResult<usize, B>;
     fn attempt(&mut self) -> KqueueAttempt {
         // Regular files always report ready under kqueue, and pread can block on
@@ -79,8 +79,8 @@ impl<B: BoundedIoBufMut> KqueueOperation for ReadAt<B> {
         // Buffer pointers remain valid: the Op (and its buffers) stay alive until
         // the pool job completes and `complete` runs.
         let fd = self.io_handle.raw_fd();
-        let ptr = self.buf.stable_write_ptr() as usize;
-        let len = self.buf.bytes_total();
+        let ptr = self.buf.as_uninit().as_mut_ptr().cast::<u8>() as usize;
+        let len = self.buf.as_uninit().len();
         let offset = self.offset;
         kqueue_syscall_blocking!({
             // Safety: the operation retains the owning file handle and buffer
@@ -99,15 +99,15 @@ impl<B: BoundedIoBufMut> KqueueOperation for ReadAt<B> {
 }
 
 #[cfg(windows)]
-unsafe impl<B: BoundedIoBufMut> IocpOperation for ReadAt<B> {
+unsafe impl<B: IoBufMut> IocpOperation for ReadAt<B> {
     type Output = BufResult<usize, B>;
 
     fn submit(&mut self) -> IocpSubmission {
         use crate::driver::backends::iocp::Interest;
         use windows_sys::Win32::Storage::FileSystem::ReadFile;
 
-        let ptr = self.buf.stable_write_ptr();
-        let len = self.buf.bytes_total() as u32;
+        let ptr = self.buf.as_uninit().as_mut_ptr().cast::<u8>();
+        let len = self.buf.as_uninit().len() as u32;
         let handle = self.io_handle.raw_handle();
 
         let mut interest = Interest::new(handle as _);
@@ -129,18 +129,18 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for ReadAt<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> ReadAt<B> {
+impl<B: IoBufMut> ReadAt<B> {
     fn finish(mut self, completion: super::Completion) -> BufResult<usize, B> {
-        let capacity = self.buf.bytes_total();
+        let capacity = self.buf.as_uninit().len();
         match completion.bytes_transferred(capacity) {
             Ok(n) => {
                 // Safety: the platform wrote at most `capacity` bytes into the buffer.
                 unsafe {
-                    self.buf.set_init(n);
+                    self.buf.set_len(n);
                 }
-                (Ok(n), self.buf)
+                BufResult(Ok(n), self.buf)
             }
-            Err(err) => (Err(err), self.buf),
+            Err(err) => BufResult(Err(err), self.buf),
         }
     }
 }

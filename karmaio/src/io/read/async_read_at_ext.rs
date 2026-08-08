@@ -1,7 +1,7 @@
 use std::io;
 
 use crate::{
-    buf::{BufResult, IoBufMut, Slice},
+    buf::{BufResult, IoBufMut, IoVectoredBufMut, Slice},
     io::AsyncReadAt,
 };
 
@@ -16,21 +16,21 @@ pub trait AsyncReadAtExt: AsyncReadAt {
     /// An [`io::ErrorKind::UnexpectedEof`] error is returned if the source ends
     /// before the buffer is full.
     async fn read_exact_at<B: IoBufMut + 'static>(&self, mut buf: B, pos: u64) -> BufResult<(), B> {
-        let capacity = buf.bytes_total();
+        let capacity = buf.as_uninit().len();
         let mut read = 0usize;
 
         while read < capacity {
             let offset = match checked_offset(pos, read) {
                 Ok(offset) => offset,
-                Err(error) => return (Err(error), buf),
+                Err(error) => return BufResult(Err(error), buf),
             };
             let slice = Slice::new(buf, read, capacity);
-            let (result, slice) = self.read_at(slice, offset).await;
+            let (result, slice) = self.read_at(slice, offset).await.into_parts();
             buf = slice.into_inner();
 
             match result {
                 Ok(0) => {
-                    return (
+                    return BufResult(
                         Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "failed to fill whole buffer",
@@ -40,11 +40,11 @@ pub trait AsyncReadAtExt: AsyncReadAt {
                 }
                 Ok(bytes) => read += bytes,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return (Err(error), buf),
+                Err(error) => return BufResult(Err(error), buf),
             }
         }
 
-        (Ok(()), buf)
+        BufResult(Ok(()), buf)
     }
 
     /// Reads all bytes from `pos` to EOF, appending them to `buf`.
@@ -62,17 +62,17 @@ pub trait AsyncReadAtExt: AsyncReadAt {
             let capacity = buf.capacity();
             let offset = match checked_offset(pos, read) {
                 Ok(offset) => offset,
-                Err(error) => return (Err(error), buf),
+                Err(error) => return BufResult(Err(error), buf),
             };
             let slice = Slice::new(buf, start, capacity);
-            let (result, slice) = self.read_at(slice, offset).await;
+            let (result, slice) = self.read_at(slice, offset).await.into_parts();
             buf = slice.into_inner();
 
             match result {
-                Ok(0) => return (Ok(read), buf),
+                Ok(0) => return BufResult(Ok(read), buf),
                 Ok(bytes) => read += bytes,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return (Err(error), buf),
+                Err(error) => return BufResult(Err(error), buf),
             }
         }
     }
@@ -80,7 +80,7 @@ pub trait AsyncReadAtExt: AsyncReadAt {
     /// Reads all UTF-8 bytes from `pos` to EOF, appending them to `buf`.
     async fn read_to_string_at(&self, buf: String, pos: u64) -> BufResult<usize, String> {
         let original_len = buf.len();
-        let (result, bytes) = self.read_to_end_at(buf.into_bytes(), pos).await;
+        let (result, bytes) = self.read_to_end_at(buf.into_bytes(), pos).await.into_parts();
         string_from_bytes(result, bytes, original_len)
     }
 
@@ -88,34 +88,32 @@ pub trait AsyncReadAtExt: AsyncReadAt {
     ///
     /// An [`io::ErrorKind::UnexpectedEof`] error is returned if the source ends
     /// before all buffers are full.
-    async fn read_vectored_exact_at<B: IoBufMut + 'static>(&self, mut bufs: Vec<B>, pos: u64) -> BufResult<(), Vec<B>> {
-        let length = match total_capacity(&bufs) {
+    async fn read_vectored_exact_at<V: IoVectoredBufMut>(&self, mut bufs: V, pos: u64) -> BufResult<(), V> {
+        let length_result = {
+            bufs.iter_uninit_slice().try_fold(0usize, |total, buf| {
+                total
+                    .checked_add(buf.len())
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer capacity overflow"))
+            })
+        };
+        let length = match length_result {
             Ok(length) => length,
-            Err(error) => return (Err(error), bufs),
+            Err(error) => return BufResult(Err(error), bufs),
         };
         let mut read = 0usize;
 
         while read < length {
             let offset = match checked_offset(pos, read) {
                 Ok(offset) => offset,
-                Err(error) => return (Err(error), bufs),
+                Err(error) => return BufResult(Err(error), bufs),
             };
-            let mut skipped = read;
-            let slices = bufs
-                .into_iter()
-                .map(|buf| {
-                    let capacity = buf.bytes_total();
-                    let start = skipped.min(capacity);
-                    skipped -= start;
-                    Slice::new(buf, start, capacity)
-                })
-                .collect();
-            let (result, slices) = self.read_vectored_at(slices, offset).await;
-            bufs = slices.into_iter().map(Slice::into_inner).collect();
+            let view = IoVectoredBufMut::slice_mut(bufs, read);
+            let (result, view) = self.read_vectored_at(view, offset).await.into_parts();
+            bufs = view.into_inner();
 
             match result {
                 Ok(0) => {
-                    return (
+                    return BufResult(
                         Err(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
                             "failed to fill all buffers",
@@ -125,11 +123,11 @@ pub trait AsyncReadAtExt: AsyncReadAt {
                 }
                 Ok(bytes) => read += bytes,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return (Err(error), bufs),
+                Err(error) => return BufResult(Err(error), bufs),
             }
         }
 
-        (Ok(()), bufs)
+        BufResult(Ok(()), bufs)
     }
 }
 
@@ -142,17 +140,9 @@ fn checked_offset(pos: u64, offset: usize) -> io::Result<u64> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file offset overflow"))
 }
 
-fn total_capacity<B: IoBufMut>(bufs: &[B]) -> io::Result<usize> {
-    bufs.iter().try_fold(0usize, |total, buf| {
-        total
-            .checked_add(buf.bytes_total())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "buffer capacity overflow"))
-    })
-}
-
 fn string_from_bytes(result: io::Result<usize>, bytes: Vec<u8>, original_len: usize) -> BufResult<usize, String> {
     match String::from_utf8(bytes) {
-        Ok(string) => (result, string),
+        Ok(string) => BufResult(result, string),
         Err(error) => {
             let mut bytes = error.into_bytes();
             bytes.truncate(original_len);
@@ -162,7 +152,7 @@ fn string_from_bytes(result: io::Result<usize>, bytes: Vec<u8>, original_len: us
             let error = result
                 .err()
                 .unwrap_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stream did not contain valid UTF-8"));
-            (Err(error), string)
+            BufResult(Err(error), string)
         }
     }
 }

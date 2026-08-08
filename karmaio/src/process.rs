@@ -101,13 +101,13 @@ mod tests {
             let mut stdin = child.take_stdin().expect("stdin piped");
             let mut stdout = child.take_stdout().expect("stdout piped");
 
-            let (res, _) = stdin.write(b"hello".to_vec()).await;
+            let (res, _) = stdin.write(b"hello".to_vec()).await.into_parts();
             res.expect("write to cat");
             // Close stdin so `cat` observes EOF and flushes its output.
             stdin.shutdown().await.expect("shutdown stdin");
 
             let buf = Box::new([0u8; 5]);
-            let (res, buf) = stdout.read_exact(buf).await;
+            let (res, buf) = stdout.read_exact(buf).await.into_parts();
             res.expect("read from cat");
             assert_eq!(&*buf, b"hello");
 

@@ -1,16 +1,17 @@
 use crate::io::AsyncRead;
 
-// Async reader with buffered content support.
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+/// An asynchronous reader with buffered-content access.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait AsyncBufRead: AsyncRead {
-    // Fill the internal buffer (or return what is already there) and give a view.
+    /// Fills the internal buffer, or returns its existing contents.
     async fn fill_buf(&mut self) -> std::io::Result<&'_ [u8]>;
 
-    // Advance the read position inside the internal buffer.
+    /// Advances the read position inside the internal buffer.
     fn consume(&mut self, amount: usize);
 
-    // Current contents of the internal buffer (sync view).
+    /// Returns the current contents of the internal buffer synchronously.
     fn buffer(&self) -> &[u8];
 }
 

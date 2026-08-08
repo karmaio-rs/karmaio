@@ -14,7 +14,7 @@ pub struct FramedWrite<W, C, F, B = Vec<u8>> {
     pub(super) io: W,
     pub(super) codec: C,
     pub(super) framer: F,
-    // `None` only while the buffer is owned by an in-flight `write_all`.
+    /// `None` only while an in-flight `write_all` owns the buffer.
     pub(super) write: Option<B>,
 }
 
@@ -142,7 +142,7 @@ where
         }
         self.framer.enclose(&mut buf);
 
-        let (res, mut buf) = self.io.write_all(buf).await;
+        let (res, mut buf) = self.io.write_all(buf).await.into_parts();
         buf.clear();
         self.write = Some(buf);
         res.map(|_| ()).map_err(Into::into)

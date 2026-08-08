@@ -12,12 +12,12 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBuf, BufResult},
+    buf::{BufResult, IoBuf},
     driver::{helpers::io_handle::SharedIoHandle, ops::Op},
     runtime::local::CURRENT_DRIVER,
 };
 
-pub(crate) struct Send<B: BoundedIoBuf> {
+pub(crate) struct Send<B: IoBuf> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
     io_handle: SharedIoHandle<socket2::Socket>,
@@ -30,19 +30,13 @@ pub(crate) struct Send<B: BoundedIoBuf> {
     wsa_buf: Box<windows_sys::Win32::Networking::WinSock::WSABUF>,
 }
 
-impl<B: BoundedIoBuf> Op<Send<B>> {
+impl<B: IoBuf> Op<Send<B>> {
     pub(crate) fn send(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> std::io::Result<Op<Send<B>>> {
-        #[cfg(windows)]
-        let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
-            len: buf.bytes_init() as u32,
-            buf: buf.stable_read_ptr() as *mut u8,
-        };
-
         let data = Send {
             io_handle: io_handle.clone(),
             buf,
             #[cfg(windows)]
-            wsa_buf: Box::new(wsa_buf),
+            wsa_buf: Box::new(unsafe { std::mem::zeroed() }),
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -50,13 +44,13 @@ impl<B: BoundedIoBuf> Op<Send<B>> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe impl<B: BoundedIoBuf> UringOperation for Send<B> {
+unsafe impl<B: IoBuf> UringOperation for Send<B> {
     type Output = BufResult<usize, B>;
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
 
-        let ptr = self.buf.stable_read_ptr();
-        let len = self.buf.bytes_init();
+        let ptr = self.buf.as_init().as_ptr();
+        let len = self.buf.as_init().len();
 
         opcode::Send::new(types::Fd(self.io_handle.raw_fd()), ptr, len as _).build()
     }
@@ -65,7 +59,7 @@ unsafe impl<B: BoundedIoBuf> UringOperation for Send<B> {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 
-        (res, buf)
+        BufResult(res, buf)
     }
 }
 
@@ -76,7 +70,7 @@ unsafe impl<B: BoundedIoBuf> UringOperation for Send<B> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<B: BoundedIoBuf> KqueueOperation for Send<B> {
+impl<B: IoBuf> KqueueOperation for Send<B> {
     type Output = BufResult<usize, B>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(
@@ -85,7 +79,7 @@ impl<B: BoundedIoBuf> KqueueOperation for Send<B> {
             {
                 // Safety: the operation owns this buffer for the duration of the
                 // syscall, and the slice covers exactly its initialized bytes.
-                let buf = unsafe { std::slice::from_raw_parts(self.buf.stable_read_ptr(), self.buf.bytes_init()) };
+                let buf = unsafe { std::slice::from_raw_parts(self.buf.as_init().as_ptr(), self.buf.as_init().len()) };
                 rustix::net::send(&self.io_handle, buf, rustix::net::SendFlags::empty())
                     .map(|n| n as u32)
                     .map_err(std::io::Error::from)
@@ -97,12 +91,12 @@ impl<B: BoundedIoBuf> KqueueOperation for Send<B> {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 
-        (res, buf)
+        BufResult(res, buf)
     }
 }
 
 #[cfg(windows)]
-unsafe impl<B: BoundedIoBuf> IocpOperation for Send<B> {
+unsafe impl<B: IoBuf> IocpOperation for Send<B> {
     type Output = BufResult<usize, B>;
 
     fn submit(&mut self) -> IocpSubmission {
@@ -113,6 +107,8 @@ unsafe impl<B: BoundedIoBuf> IocpOperation for Send<B> {
 
         let mut interest = Interest::new(socket as _);
         let mut bytes_sent = 0u32;
+        self.wsa_buf.len = self.buf.as_init().len() as u32;
+        self.wsa_buf.buf = self.buf.as_init().as_ptr() as *mut u8;
 
         windows_syscall_submit_overlapped!(interest, socket, {
             WSASend(
@@ -131,6 +127,6 @@ unsafe impl<B: BoundedIoBuf> IocpOperation for Send<B> {
         let res = completion_entry.result.map(|v| v as usize);
         let buf = self.buf;
 
-        (res, buf)
+        BufResult(res, buf)
     }
 }

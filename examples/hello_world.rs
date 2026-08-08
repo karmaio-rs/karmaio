@@ -21,7 +21,7 @@ async fn main() -> std::io::Result<()> {
     let mut stream = TcpStream::connect(addr).await?;
     println!("connected to {addr}");
 
-    let (result, _) = stream.write_all(b"hello world\n".to_vec()).await;
+    let (result, _) = stream.write_all(b"hello world\n".to_vec()).await.into_parts();
     println!("wrote to stream; success={:?}", result.is_ok());
 
     stream.close().await

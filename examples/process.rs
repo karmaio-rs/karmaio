@@ -30,14 +30,14 @@ async fn main() -> std::io::Result<()> {
 
     // Write to stdin
     let mut stdin = child.take_stdin().expect("stdin should be piped");
-    let (result, _) = stdin.write_all(b"Hello from cat!".to_vec()).await;
+    let (result, _) = stdin.write_all(b"Hello from cat!".to_vec()).await.into_parts();
     result?;
     stdin.shutdown().await?;
 
     // Read from stdout
     let mut stdout = child.take_stdout().expect("stdout should be piped");
     let buf = vec![0; 1024];
-    let (result, buf) = stdout.read(buf).await;
+    let (result, buf) = stdout.read(buf).await.into_parts();
     let n = result?;
     println!("Read {n} bytes: {}", String::from_utf8_lossy(&buf[..n]));
 

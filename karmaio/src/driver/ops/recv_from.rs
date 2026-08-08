@@ -20,7 +20,7 @@ use crate::driver::backends::iouring::{Submission as UringSubmission, UringOpera
 use crate::driver::backends::kqueue::{KqueueAttempt, KqueueOperation};
 
 use crate::{
-    buf::{BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBufMut},
     driver::{
         helpers::io_handle::SharedIoHandle,
         ops::{Completion, Op},
@@ -32,7 +32,7 @@ use crate::{
 //
 // On Linux, iouring does not support recvfrom yet, so have to simulate it with recvmsg
 // On Windows and macOS, the standard recvfrom syscalls are used
-pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
+pub(crate) struct RecvFrom<B: IoBufMut> {
     // Holds a strong ref to the FD, preventing the file from being closed while the operation is in-flight.
     #[allow(unused)]
     io_handle: SharedIoHandle<socket2::Socket>,
@@ -71,32 +71,10 @@ pub(crate) struct RecvFrom<B: BoundedIoBufMut> {
     received_address: Option<rustix::net::SocketAddrAny>,
 }
 
-impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
-    #![allow(unused_mut)] // The linux code uses mutablity
-    pub(crate) fn recv_from(io_handle: &SharedIoHandle<socket2::Socket>, mut buf: B) -> io::Result<Op<RecvFrom<B>>> {
+impl<B: IoBufMut> Op<RecvFrom<B>> {
+    pub(crate) fn recv_from(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> io::Result<Op<RecvFrom<B>>> {
         #[cfg(any(target_os = "linux", windows))]
         let socket_addr = Box::new(unsafe { SockAddr::try_init(|_, _| Ok(()))?.1 });
-
-        #[cfg(target_os = "linux")]
-        let (io_slices, msghdr) = {
-            let mut io_slices = vec![IoSliceMut::new(unsafe {
-                std::slice::from_raw_parts_mut(buf.stable_write_ptr(), buf.bytes_total())
-            })];
-
-            let mut msghdr: Box<libc::msghdr> = Box::new(unsafe { std::mem::zeroed() });
-            msghdr.msg_iov = io_slices.as_mut_ptr().cast();
-            msghdr.msg_iovlen = io_slices.len() as _;
-            msghdr.msg_name = socket_addr.as_ptr() as *mut libc::c_void;
-            msghdr.msg_namelen = socket_addr.len();
-
-            (io_slices, msghdr)
-        };
-
-        #[cfg(windows)]
-        let wsa_buf = windows_sys::Win32::Networking::WinSock::WSABUF {
-            len: buf.bytes_total() as u32,
-            buf: buf.stable_write_ptr() as *mut u8,
-        };
 
         let data = RecvFrom {
             io_handle: io_handle.clone(),
@@ -104,11 +82,11 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
             socket_addr,
             buf,
             #[cfg(target_os = "linux")]
-            io_slices,
+            io_slices: Vec::new(),
             #[cfg(target_os = "linux")]
-            msghdr,
+            msghdr: Box::new(unsafe { std::mem::zeroed() }),
             #[cfg(windows)]
-            wsa_buf: Box::new(wsa_buf),
+            wsa_buf: Box::new(unsafe { std::mem::zeroed() }),
             #[cfg(windows)]
             socket_addr_len: Box::new(0),
             #[cfg(any(
@@ -126,10 +104,20 @@ impl<B: BoundedIoBufMut> Op<RecvFrom<B>> {
 }
 
 #[cfg(target_os = "linux")]
-unsafe impl<B: BoundedIoBufMut> UringOperation for RecvFrom<B> {
+unsafe impl<B: IoBufMut> UringOperation for RecvFrom<B> {
     type Output = BufResult<(usize, SocketAddr), B>;
     fn submit(&mut self) -> UringSubmission {
         use io_uring::{opcode, types};
+
+        let ptr = self.buf.as_uninit().as_mut_ptr().cast::<u8>();
+        let len = self.buf.as_uninit().len();
+        self.io_slices.clear();
+        self.io_slices
+            .push(IoSliceMut::new(unsafe { std::slice::from_raw_parts_mut(ptr, len) }));
+        self.msghdr.msg_iov = self.io_slices.as_mut_ptr().cast();
+        self.msghdr.msg_iovlen = self.io_slices.len() as _;
+        self.msghdr.msg_name = self.socket_addr.as_ptr() as *mut _;
+        self.msghdr.msg_namelen = self.socket_addr.len();
 
         opcode::RecvMsg::new(types::Fd(self.io_handle.raw_fd()), self.msghdr.as_mut() as *mut _).build()
     }
@@ -146,7 +134,7 @@ unsafe impl<B: BoundedIoBufMut> UringOperation for RecvFrom<B> {
     target_os = "openbsd",
     target_os = "dragonfly"
 ))]
-impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
+impl<B: IoBufMut> KqueueOperation for RecvFrom<B> {
     type Output = BufResult<(usize, SocketAddr), B>;
     fn attempt(&mut self) -> KqueueAttempt {
         kqueue_syscall_submit!(
@@ -156,8 +144,12 @@ impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
                 // Safety: the operation owns the buffer for the duration of
                 // the syscall, and the slice covers exactly its writable
                 // capacity.
-                let buf =
-                    unsafe { std::slice::from_raw_parts_mut(self.buf.stable_write_ptr(), self.buf.bytes_total()) };
+                let buf = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        self.buf.as_uninit().as_mut_ptr().cast::<u8>(),
+                        self.buf.as_uninit().len(),
+                    )
+                };
                 rustix::net::recvfrom(&self.io_handle, buf, rustix::net::RecvFlags::empty())
                     .map(|(_, n, address)| {
                         self.received_address = address;
@@ -174,7 +166,7 @@ impl<B: BoundedIoBufMut> KqueueOperation for RecvFrom<B> {
 }
 
 #[cfg(windows)]
-unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
+unsafe impl<B: IoBufMut> IocpOperation for RecvFrom<B> {
     type Output = BufResult<(usize, SocketAddr), B>;
 
     fn submit(&mut self) -> IocpSubmission {
@@ -186,6 +178,8 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
         let mut interest = Interest::new(socket as _);
         let mut flags = 0u32;
         let mut bytes_recv = 0u32;
+        self.wsa_buf.len = self.buf.as_uninit().len() as u32;
+        self.wsa_buf.buf = self.buf.as_uninit().as_mut_ptr().cast::<u8>();
 
         // Must reside in stable memory for the overlapped I/O path.
         *self.socket_addr_len = self.socket_addr.len() as i32;
@@ -210,12 +204,12 @@ unsafe impl<B: BoundedIoBufMut> IocpOperation for RecvFrom<B> {
     }
 }
 
-impl<B: BoundedIoBufMut> RecvFrom<B> {
+impl<B: IoBufMut> RecvFrom<B> {
     fn finish(mut self, completion_result: Completion) -> BufResult<(usize, SocketAddr), B> {
-        let capacity = self.buf.bytes_total();
+        let capacity = self.buf.as_uninit().len();
         let bytes_written = match completion_result.bytes_transferred(capacity) {
             Ok(n) => n,
-            Err(err) => return (Err(err), self.buf),
+            Err(err) => return BufResult(Err(err), self.buf),
         };
 
         #[cfg(windows)]
@@ -223,7 +217,7 @@ impl<B: BoundedIoBufMut> RecvFrom<B> {
             let address_len = match usize::try_from(*self.socket_addr_len) {
                 Ok(length) if length <= self.socket_addr.len() as usize => length,
                 _ => {
-                    return (
+                    return BufResult(
                         Err(io::Error::new(
                             io::ErrorKind::InvalidData,
                             "invalid socket address length",
@@ -251,7 +245,7 @@ impl<B: BoundedIoBufMut> RecvFrom<B> {
                 let address = match self.received_address.take() {
                     Some(address) => address,
                     None => {
-                        return (
+                        return BufResult(
                             Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "kernel returned no socket address",
@@ -262,7 +256,7 @@ impl<B: BoundedIoBufMut> RecvFrom<B> {
                 };
                 match SocketAddr::try_from(address) {
                     Ok(addr) => addr,
-                    Err(err) => return (Err(io::Error::from(err)), self.buf),
+                    Err(err) => return BufResult(Err(io::Error::from(err)), self.buf),
                 }
             }
             #[cfg(any(target_os = "linux", windows))]
@@ -270,7 +264,7 @@ impl<B: BoundedIoBufMut> RecvFrom<B> {
                 match self.socket_addr.as_socket() {
                     Some(addr) => addr,
                     None => {
-                        return (
+                        return BufResult(
                             Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "kernel returned an invalid socket address",
@@ -284,9 +278,9 @@ impl<B: BoundedIoBufMut> RecvFrom<B> {
 
         // Safety: the platform wrote at most `capacity` bytes into the buffer.
         unsafe {
-            self.buf.set_init(bytes_written);
+            self.buf.set_len(bytes_written);
         }
 
-        (Ok((bytes_written, socket_addr)), self.buf)
+        BufResult(Ok((bytes_written, socket_addr)), self.buf)
     }
 }

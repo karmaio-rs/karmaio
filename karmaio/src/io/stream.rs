@@ -4,8 +4,8 @@
 //! sequences can implement them (network framed readers, channels, generators, …).
 
 /// A stream of values produced asynchronously in pure async/await.
-//
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait Stream {
     /// Values yielded by the stream.
@@ -38,11 +38,11 @@ impl<S: ?Sized + Stream> Stream for &mut S {
 }
 
 /// Extension methods for [`Stream`].
-//
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait StreamExt: Stream {
-    // Counts items remaining in the stream, consuming it.
+    /// Counts the remaining items, consuming the stream.
     async fn count(mut self) -> usize
     where
         Self: Sized,

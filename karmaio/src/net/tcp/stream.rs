@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use crate::{
-    buf::{BoundedIoBuf, BoundedIoBufMut, BufResult},
+    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
     io::{AsyncRead, AsyncWrite},
     net::split::{ReadHalf, WriteHalf, split},
@@ -107,35 +107,35 @@ impl TcpStream {
 }
 
 impl AsyncRead for &TcpStream {
-    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         self.inner.recv(buf).await
     }
 
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let (result, bufs) = self.inner.recvmsg(bufs).await;
-        (result.map(|(n, _)| n), bufs)
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
+        let (result, bufs) = self.inner.recvmsg(bufs).await.into_parts();
+        BufResult(result.map(|(n, _)| n), bufs)
     }
 }
 
 impl AsyncRead for TcpStream {
-    async fn read<B: BoundedIoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
         self.inner.recv(buf).await
     }
 
-    async fn read_vectored<B: BoundedIoBufMut>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let (result, bufs) = self.inner.recvmsg(bufs).await;
-        (result.map(|(n, _)| n), bufs)
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
+        let (result, bufs) = self.inner.recvmsg(bufs).await.into_parts();
+        BufResult(result.map(|(n, _)| n), bufs)
     }
 }
 
 impl AsyncWrite for &TcpStream {
-    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         self.inner.send(buf).await
     }
 
-    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let (res, bufs) = self.inner.sendmsg(bufs, None, None::<Vec<u8>>).await;
-        (res.map(|(n, _)| n), bufs)
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, bufs: V) -> BufResult<usize, V> {
+        let (res, bufs) = self.inner.sendmsg(bufs, None, None::<Vec<u8>>).await.into_parts();
+        BufResult(res.map(|(n, _)| n), bufs)
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {
@@ -148,13 +148,13 @@ impl AsyncWrite for &TcpStream {
 }
 
 impl AsyncWrite for TcpStream {
-    async fn write<B: BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+    async fn write<B: IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
         self.inner.send(buf).await
     }
 
-    async fn write_vectored<B: BoundedIoBuf>(&mut self, bufs: Vec<B>) -> BufResult<usize, Vec<B>> {
-        let (res, bufs) = self.inner.sendmsg(bufs, None, None::<Vec<u8>>).await;
-        (res.map(|(n, _)| n), bufs)
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, bufs: V) -> BufResult<usize, V> {
+        let (res, bufs) = self.inner.sendmsg(bufs, None, None::<Vec<u8>>).await.into_parts();
+        BufResult(res.map(|(n, _)| n), bufs)
     }
 
     async fn flush(&mut self) -> std::io::Result<()> {

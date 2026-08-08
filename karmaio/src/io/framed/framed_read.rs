@@ -9,13 +9,13 @@ use crate::{
 /// Read-side state machine for framed decoding
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ReadState {
-    // Actively framing / decoding from the buffer (or need more data).
+    /// Actively framing or decoding from the buffer.
     Framing,
-    // EOF seen once; draining residual frames.
+    /// EOF was observed and residual frames are being drained.
     Pausing,
-    // Fully paused after EOF drain; further reads may resume if more data arrives.
+    /// Fully paused after draining EOF.
     Paused,
-    // Last operation errored; next `next` yields `None` and recovers to Paused.
+    /// The last operation failed; the next poll recovers to paused.
     Errored,
 }
 
@@ -33,7 +33,7 @@ pub struct FramedRead<R, C, F, B = Vec<u8>> {
 }
 
 impl<R, C, F> FramedRead<R, C, F, Vec<u8>> {
-    // Creates a new framed reader with a default buffer capacity.
+    /// Creates a new framed reader with the default buffer capacity.
     pub fn new(io: R, codec: C, framer: F) -> Self {
         Self {
             io,
@@ -216,7 +216,7 @@ where
 {
     async fn fill(&mut self) -> std::io::Result<usize> {
         let (pending_start, fill) = self.read.prepare_fill();
-        let (res, fill) = self.io.read(fill).await;
+        let (res, fill) = self.io.read(fill).await.into_parts();
         self.read.finish_fill(fill, pending_start);
         res
     }
@@ -255,11 +255,11 @@ where
 
         let frame_len = frame.len();
         let slice = self.read.take_inner();
-        let begin = slice.start();
+        let start = slice.start();
         let buf = slice.into_inner();
 
-        // Frame offsets are relative to the pending view (absolute = begin + offset).
-        let abs_prefix = begin + frame.prefix();
+        // Frame offsets are relative to the pending view (absolute = start + offset).
+        let abs_prefix = start + frame.prefix();
         let abs_payload_end = abs_prefix + frame.payload();
         let payload = Slice::new(buf, abs_prefix, abs_payload_end);
         let decoded = if at_eof {
@@ -269,7 +269,7 @@ where
         };
         let buf = payload.into_inner();
 
-        let frame_end = begin + frame_len;
+        let frame_end = start + frame_len;
         self.read.restore_from_parts(buf, frame_end);
 
         decoded

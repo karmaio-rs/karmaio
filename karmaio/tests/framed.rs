@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::io;
 
 use karmaio::Runtime;
-use karmaio::buf::{BoundedIoBufMut, BufResult};
+use karmaio::buf::{BufResult, IoBufMut};
 use karmaio::io::{
     AsyncRead, AsyncWrite, BytesCodec, Framed, FramedRead, FramedWrite, LengthDelimited, LineDelimited, Sink, Stream,
 };
@@ -15,20 +15,20 @@ struct MockRead {
 }
 
 impl AsyncRead for MockRead {
-    async fn read<B: BoundedIoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         match self.calls.pop_front() {
             Some(Ok(data)) => {
-                let n = data.len().min(buf.bytes_total());
+                let n = data.len().min(buf.as_uninit().len());
                 if n > 0 {
                     unsafe {
-                        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.stable_write_ptr(), n);
-                        buf.set_init(n);
+                        std::ptr::copy_nonoverlapping(data.as_ptr(), buf.as_uninit().as_mut_ptr().cast::<u8>(), n);
+                        buf.set_len(n);
                     }
                 }
-                (Ok(n), buf)
+                BufResult(Ok(n), buf)
             }
-            Some(Err(e)) => (Err(e), buf),
-            None => (Ok(0), buf),
+            Some(Err(e)) => BufResult(Err(e), buf),
+            None => BufResult(Ok(0), buf),
         }
     }
 }
@@ -38,15 +38,15 @@ struct MockWrite {
 }
 
 impl AsyncWrite for MockWrite {
-    async fn write<B: karmaio::buf::BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
-        let n = buf.bytes_init();
+    async fn write<B: karmaio::buf::IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        let n = buf.as_init().len();
         if n > 0 {
             unsafe {
-                let slice = std::slice::from_raw_parts(buf.stable_read_ptr(), n);
+                let slice = std::slice::from_raw_parts(buf.as_init().as_ptr(), n);
                 self.data.extend_from_slice(slice);
             }
         }
-        (Ok(n), buf)
+        BufResult(Ok(n), buf)
     }
 
     async fn flush(&mut self) -> io::Result<()> {
@@ -65,33 +65,33 @@ struct Cursor {
 }
 
 impl AsyncRead for Cursor {
-    async fn read<B: BoundedIoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
+    async fn read<B: IoBufMut>(&mut self, mut buf: B) -> BufResult<usize, B> {
         if self.pos >= self.data.len() {
-            return (Ok(0), buf);
+            return BufResult(Ok(0), buf);
         }
         let remaining = &self.data[self.pos..];
-        let n = remaining.len().min(buf.bytes_total());
+        let n = remaining.len().min(buf.as_uninit().len());
         if n > 0 {
             unsafe {
-                std::ptr::copy_nonoverlapping(remaining.as_ptr(), buf.stable_write_ptr(), n);
-                buf.set_init(n);
+                std::ptr::copy_nonoverlapping(remaining.as_ptr(), buf.as_uninit().as_mut_ptr().cast::<u8>(), n);
+                buf.set_len(n);
             }
             self.pos += n;
         }
-        (Ok(n), buf)
+        BufResult(Ok(n), buf)
     }
 }
 
 impl AsyncWrite for Cursor {
-    async fn write<B: karmaio::buf::BoundedIoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
-        let n = buf.bytes_init();
+    async fn write<B: karmaio::buf::IoBuf>(&mut self, buf: B) -> BufResult<usize, B> {
+        let n = buf.as_init().len();
         if n > 0 {
             unsafe {
-                let slice = std::slice::from_raw_parts(buf.stable_read_ptr(), n);
+                let slice = std::slice::from_raw_parts(buf.as_init().as_ptr(), n);
                 self.data.extend_from_slice(slice);
             }
         }
-        (Ok(n), buf)
+        BufResult(Ok(n), buf)
     }
 
     async fn flush(&mut self) -> io::Result<()> {

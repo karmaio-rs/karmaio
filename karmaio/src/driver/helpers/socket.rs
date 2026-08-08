@@ -7,7 +7,7 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, RawFd};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket, RawSocket};
 
-use crate::buf::{BoundedIoBuf, BoundedIoBufMut, BufResult};
+use crate::buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut};
 use crate::driver::helpers::attached_handle::AttachedHandle;
 use crate::driver::ops::Op;
 
@@ -148,7 +148,7 @@ impl Socket {
     //  Connection Control
     // ================================
 
-    /// Begins listening for incoming connections.
+    /// Starts listening for incoming connections.
     pub(crate) fn listen(&self, backlog: c_int) -> Result<()> {
         self.handle.listen(backlog)
     }
@@ -182,19 +182,19 @@ impl Socket {
     // ================================
 
     /// Reads a message from the socket from the connected address
-    pub(crate) async fn recv<B: BoundedIoBufMut>(&self, buf: B) -> BufResult<usize, B> {
+    pub(crate) async fn recv<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         let op = Op::recv(&self.handle, buf).unwrap();
         op.await
     }
 
     /// Reads a message from the socket along with the receiver address
-    pub(crate) async fn recv_from<B: BoundedIoBufMut>(&self, buf: B) -> BufResult<(usize, SocketAddr), B> {
+    pub(crate) async fn recv_from<B: IoBufMut>(&self, buf: B) -> BufResult<(usize, SocketAddr), B> {
         let op = Op::recv_from(&self.handle, buf).unwrap();
         op.await
     }
 
     /// Performs a scattered read into the supplied buffers along with the receiver address
-    pub(crate) async fn recvmsg<B: BoundedIoBufMut>(&self, buf: Vec<B>) -> BufResult<(usize, SocketAddr), Vec<B>> {
+    pub(crate) async fn recvmsg<V: IoVectoredBufMut>(&self, buf: V) -> BufResult<(usize, SocketAddr), V> {
         let op = Op::recvmsg(&self.handle, buf).unwrap();
         op.await
     }
@@ -204,25 +204,25 @@ impl Socket {
     // ================================
 
     /// Writes the buffer on the connected socket
-    pub(crate) async fn send<B: BoundedIoBuf>(&self, buf: B) -> BufResult<usize, B> {
+    pub(crate) async fn send<B: IoBuf>(&self, buf: B) -> BufResult<usize, B> {
         let op = Op::send(&self.handle, buf).unwrap();
         op.await
     }
 
     /// Writes the buffer to the specified address on the socket
-    pub(crate) async fn send_to<B: BoundedIoBuf>(&self, buf: B, socket_addr: SocketAddr) -> BufResult<usize, B> {
+    pub(crate) async fn send_to<B: IoBuf>(&self, buf: B, socket_addr: SocketAddr) -> BufResult<usize, B> {
         let op = Op::send_to(&self.handle, buf, socket_addr).unwrap();
         op.await
     }
 
     /// Performes a gather write on the socket with data from the specified buffers
     /// Needs an address if the socket is not connected to an address
-    pub(crate) async fn sendmsg<B: BoundedIoBuf, C: BoundedIoBuf>(
+    pub(crate) async fn sendmsg<V: IoVectoredBuf, C: IoBuf>(
         &self,
-        io_slices: Vec<B>,
+        io_slices: V,
         socket_addr: Option<SocketAddr>,
         control: Option<C>,
-    ) -> BufResult<(usize, Option<C>), Vec<B>> {
+    ) -> BufResult<(usize, Option<C>), V> {
         let op = Op::sendmsg(&self.handle, io_slices, control, socket_addr).unwrap();
         op.await
     }

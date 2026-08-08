@@ -191,7 +191,7 @@ impl IoUringBackend {
 }
 
 impl IoUringBackend {
-    pub(crate) fn submit_op<T: UringOperation + 'static>(&mut self, mut data: T, handle: Handle) -> Result<Op<T>> {
+    pub(crate) fn submit_op<T: UringOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
         if self.shutting_down {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -199,11 +199,15 @@ impl IoUringBackend {
             ));
         }
 
+        // Stabilize the operation before deriving any pointer that may be
+        // embedded in the SQE. Moving the returned future only moves this box.
+        let mut data = Box::new(data);
+
         // Allocate a new entry in the driver
         let key = self.ops.insert(State::Submitted)?;
 
         // Submit the new operation to the kernel
-        let entry = UringOperation::submit(&mut data).user_data(key.as_u64());
+        let entry = UringOperation::submit(&mut *data).user_data(key.as_u64());
 
         while unsafe { self.uring.submission().push(&entry).is_err() } {
             // If the submission queue is full, flush it to the kernel
@@ -239,7 +243,7 @@ impl IoUringBackend {
             // We do not submit AsyncCancel here; cancellation is reserved for driver Drop.
             State::Submitted | State::Waiting(..) => {
                 let data = op.take_data().expect("op data missing on detach");
-                *state = State::Ignored(Box::new(data));
+                *state = State::Ignored(data);
                 None
             }
             State::Completed(_) => {

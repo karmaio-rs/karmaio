@@ -6,8 +6,8 @@
 use crate::io::Stream;
 
 /// A sink into which values can be sent asynchronously in pure async/await.
-//
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait Sink<Item> {
     /// The type of value produced by the sink when an error occurs.
@@ -43,11 +43,11 @@ impl<T, S: ?Sized + Sink<T>> Sink<T> for &mut S {
 }
 
 /// Extension methods for [`Sink`].
-//
-// Share-nothing runtime: futures are `!Send` by design, so `async fn` in traits is intentional.
+///
+/// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait SinkExt<Item>: Sink<Item> {
-    // Sends all items from `stream` into this sink, then flushes.
+    /// Sends all items from `stream` into this sink, then flushes.
     async fn send_all<S>(&mut self, stream: &mut S) -> Result<(), Self::Error>
     where
         S: Stream<Item = Item> + ?Sized,

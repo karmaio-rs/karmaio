@@ -30,8 +30,8 @@ use rustix::{
 };
 
 use crate::driver::ops::{
-    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, CompletionKey,
-    DeferredAction, Op, OpKey, OpTable,
+    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, CompletionKey, DeferredAction, Op,
+    OpKey, OpTable,
 };
 use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
@@ -571,12 +571,19 @@ impl KqueueBackend {
     fn install_registration(&mut self, key: OpKey, registration: Registration) {
         self.interests
             .insert((registration.interest.fd, registration.interest.direction), key);
-        self.ops.get_mut(key).expect("operation missing while registering").registration = Some(registration);
+        self.ops
+            .get_mut(key)
+            .expect("operation missing while registering")
+            .registration = Some(registration);
     }
 
     fn take_registration(&mut self, key: OpKey) -> Option<Registration> {
         let registration = self.ops.get_mut(key)?.registration.take()?;
-        if self.interests.get(&(registration.interest.fd, registration.interest.direction)) == Some(&key) {
+        if self
+            .interests
+            .get(&(registration.interest.fd, registration.interest.direction))
+            == Some(&key)
+        {
             self.interests
                 .remove(&(registration.interest.fd, registration.interest.direction));
         }
@@ -589,8 +596,8 @@ impl KqueueBackend {
         // Mandatory: the syscall's side effect (e.g. closing an fd) must run
         // even if the runtime shuts down before the pool picks the job up.
         pool.try_dispatch_mandatory(Box::new(move || {
-            let result =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked")),));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job.run()))
+                .unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked"))));
             guard.complete(result);
         }))
     }
@@ -705,8 +712,10 @@ impl KqueueBackend {
                         }
 
                         self.install_registration(key, Registration { interest, on_ready });
-                        self.ops.get_mut(key).expect("operation removed while registering").state =
-                            State::Waiting(cx.waker().clone());
+                        self.ops
+                            .get_mut(key)
+                            .expect("operation removed while registering")
+                            .state = State::Waiting(cx.waker().clone());
                         Poll::Pending
                     }
                     KqueueAttempt::Blocking(job) => {
@@ -936,7 +945,7 @@ mod tests {
         type Output = ();
 
         fn attempt(&mut self) -> KqueueAttempt {
-            KqueueAttempt::Ready(Completion::new(Ok(0) ))
+            KqueueAttempt::Ready(Completion::new(Ok(0)))
         }
 
         fn complete(self, _completion: Completion) -> Self::Output {

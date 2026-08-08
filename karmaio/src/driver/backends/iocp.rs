@@ -23,8 +23,7 @@ use windows_sys::Win32::{
 
 use crate::driver::helpers::io_handle::HandleRegistration;
 use crate::driver::ops::{
-    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, DeferredAction, Op,
-    OpKey, OpTable,
+    BlockingCompletionGuard, BlockingCompletionQueue, BlockingJob, Completion, DeferredAction, Op, OpKey, OpTable,
 };
 use crate::driver::{Handle, Wakeup};
 use crate::runtime::blocking::BlockingPoolHandle;
@@ -405,7 +404,8 @@ impl IocpBackend {
         // Mandatory: the syscall's side effect (e.g. closing a handle) must run
         // even if the runtime shuts down before the pool picks the job up.
         pool.try_dispatch_mandatory(Box::new(move || {
-            let result = panic::catch_unwind(AssertUnwindSafe(|| job.run())).unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked")),));
+            let result = panic::catch_unwind(AssertUnwindSafe(|| job.run()))
+                .unwrap_or_else(|_| Completion::new(Err(Error::other("blocking operation panicked"))));
             guard.complete(result);
         }))
     }
@@ -746,7 +746,7 @@ mod tests {
         type Output = ();
 
         fn submit(&mut self) -> IocpSubmission {
-            IocpSubmission::Ready(Completion::new(Ok(0) ))
+            IocpSubmission::Ready(Completion::new(Ok(0)))
         }
 
         fn complete(self, _completion: Completion) -> Self::Output {

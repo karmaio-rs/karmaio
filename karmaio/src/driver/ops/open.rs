@@ -1,11 +1,6 @@
 use std::path::Path;
 
 #[cfg(windows)]
-use std::os::windows::io::RawHandle;
-#[cfg(windows)]
-use std::sync::{Arc, Mutex};
-
-#[cfg(windows)]
 use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
@@ -30,23 +25,8 @@ use crate::{
     runtime::local::CURRENT_DRIVER,
 };
 
-#[cfg(any(
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-))]
+#[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
-#[cfg(any(
-    target_os = "macos",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd",
-    target_os = "dragonfly"
-))]
-use std::os::fd::IntoRawFd;
 #[cfg(windows)]
 use std::os::windows::io::FromRawHandle;
 
@@ -54,8 +34,6 @@ use std::os::windows::io::FromRawHandle;
 pub(crate) struct Open {
     pub(crate) path: OsPath,
     options: OpenOptions,
-    #[cfg(windows)]
-    handle: Arc<Mutex<Option<isize>>>,
 }
 
 impl Op<Open> {
@@ -75,12 +53,7 @@ impl Op<Open> {
 
         let path = cstr(path)?;
 
-        let data = Open {
-            path,
-            options,
-            #[cfg(windows)]
-            handle: Arc::new(Mutex::new(None)),
-        };
+        let data = Open { path, options };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
     }
@@ -129,13 +102,13 @@ impl KqueueOperation for Open {
         let access_mode = match self.options.access_mode() {
             Ok(m) => m,
             Err(e) => {
-                return KqueueAttempt::Ready(Completion::new(Err(e) ));
+                return KqueueAttempt::Ready(Completion::new(Err(e)));
             }
         };
         let creation_mode = match self.options.creation_mode() {
             Ok(m) => m,
             Err(e) => {
-                return KqueueAttempt::Ready(Completion::new(Err(e) ));
+                return KqueueAttempt::Ready(Completion::new(Err(e)));
             }
         };
 
@@ -146,16 +119,15 @@ impl KqueueOperation for Open {
         let path = self.path.clone();
         let mode = Mode::from_raw_mode(self.options.mode as _);
 
-        kqueue_syscall_blocking!({
+        kqueue_syscall_blocking!(value {
             rustix::fs::open(path.as_c_str(), flags, mode)
-                .map(|fd| fd.into_raw_fd() as u32)
+                .map(std::fs::File::from)
                 .map_err(std::io::Error::from)
         })
     }
 
-    fn complete(self, cqe: Completion) -> Self::Output {
-        // Safety: open returned a new open file descriptor; ownership transfers here.
-        let file = unsafe { std::fs::File::from_raw_fd(cqe.result? as _) };
+    fn complete(self, completion: Completion) -> Self::Output {
+        let file = completion.into_blocking_value::<std::fs::File>()?;
         Ok(File {
             handle: AttachedHandle::new(file)?,
         })
@@ -174,9 +146,8 @@ unsafe impl IocpOperation for Open {
         let path = self.path.clone();
         let share_mode = self.options.share_mode;
         let flags_and_attributes = self.options.get_flags_and_attributes();
-        let handle_slot = Arc::clone(&self.handle);
 
-        windows_syscall_blocking!({
+        windows_syscall_blocking!(value {
             // Safety: `path` is an owned, NUL-terminated UTF-16 buffer that
             // remains alive for the call; the optional pointer arguments are null.
             let handle = unsafe {
@@ -194,42 +165,16 @@ unsafe impl IocpOperation for Open {
             if handle == INVALID_HANDLE_VALUE {
                 Err(std::io::Error::last_os_error())
             } else {
-                *handle_slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(handle as isize);
-                Ok(0_u32)
+                // Safety: `CreateFileW` returned a new owned file handle.
+                Ok(unsafe { std::fs::File::from_raw_handle(handle) })
             }
         })
     }
 
-    fn complete(self, cqe: Completion) -> Self::Output {
-        cqe.result?;
-        let handle = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .expect("open handle missing after successful completion");
-        // Safety: open produced an open Win32 file handle; ownership transfers here.
-        let file = unsafe { std::fs::File::from_raw_handle(handle as RawHandle) };
+    fn complete(self, completion: Completion) -> Self::Output {
+        let file = completion.into_blocking_value::<std::fs::File>()?;
         Ok(File {
             handle: AttachedHandle::new(file)?,
         })
-    }
-}
-
-#[cfg(windows)]
-impl Drop for Open {
-    fn drop(&mut self) {
-        if let Some(handle) = self
-            .handle
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-        {
-            // Safety: the result slot owns this successfully opened handle and
-            // `take` ensures it is closed at most once.
-            unsafe {
-                windows_sys::Win32::Foundation::CloseHandle(handle as _);
-            }
-        }
     }
 }

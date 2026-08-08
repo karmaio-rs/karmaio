@@ -7,6 +7,7 @@ use std::{
 
 #[cfg(not(target_os = "linux"))]
 use std::{
+    any::Any,
     collections::VecDeque,
     sync::{Arc, Mutex},
 };
@@ -90,20 +91,61 @@ pub(crate) struct Completion {
     pub(crate) result: io::Result<u32>,
     #[allow(dead_code)] // Reserved for multishot / CQE metadata consumers.
     pub(crate) flags: u32,
+    /// Owned result produced by a blocking syscall when it cannot be represented
+    /// by the portable scalar completion value.
+    #[cfg(not(target_os = "linux"))]
+    blocking_value: Option<Box<dyn Any + Send>>,
 }
 
 impl Completion {
     /// Construct a terminal completion with no backend metadata flags.
     #[inline]
     pub(crate) fn new(result: io::Result<u32>) -> Self {
-        Self { result, flags: 0 }
+        Self {
+            result,
+            flags: 0,
+            #[cfg(not(target_os = "linux"))]
+            blocking_value: None,
+        }
     }
 
     /// Construct a terminal completion that carries backend metadata flags.
     #[inline]
     #[allow(dead_code)] // Used by backends that surface CQE/completion flags.
     pub(crate) fn with_flags(result: io::Result<u32>, flags: u32) -> Self {
-        Self { result, flags }
+        Self {
+            result,
+            flags,
+            #[cfg(not(target_os = "linux"))]
+            blocking_value: None,
+        }
+    }
+
+    /// Construct a completion from a blocking operation with a typed result.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn from_blocking_result<T: Send + 'static>(result: io::Result<T>) -> Self {
+        match result {
+            Ok(value) => Self {
+                result: Ok(0),
+                flags: 0,
+                blocking_value: Some(Box::new(value)),
+            },
+            Err(error) => Self::new(Err(error)),
+        }
+    }
+
+    /// Recover the typed value produced by a successful blocking operation.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn into_blocking_value<T: Send + 'static>(mut self) -> io::Result<T> {
+        self.result?;
+        let value = self
+            .blocking_value
+            .take()
+            .unwrap_or_else(|| panic!("blocking completion missing {}", std::any::type_name::<T>()));
+        Ok(value
+            .downcast::<T>()
+            .map(|value| *value)
+            .unwrap_or_else(|_| panic!("blocking completion type mismatch for {}", std::any::type_name::<T>())))
     }
 
     /// Validate a byte-count completion against the submitted buffer capacity.
@@ -202,7 +244,8 @@ impl Drop for BlockingCompletionGuard {
     fn drop(&mut self) {
         self.send(Completion::new(Err(io::Error::new(
             io::ErrorKind::Interrupted,
-            "blocking operation cancelled before completion"))));
+            "blocking operation cancelled before completion",
+        ))));
     }
 }
 
@@ -251,7 +294,7 @@ mod blocking_completion_tests {
         let key = OpTable::new(1).unwrap().insert(()).unwrap();
         let guard = BlockingCompletionGuard::new(key, Arc::clone(&queue), wakeup);
 
-        guard.complete(Completion::new(Ok(7) ));
+        guard.complete(Completion::new(Ok(7)));
 
         let completions = queue.lock().unwrap();
         assert_eq!(completions.len(), 1);

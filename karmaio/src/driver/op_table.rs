@@ -310,10 +310,7 @@ mod key_tests {
         assert_eq!(OpKey::from_raw(CompletionKey::wake_cancel_raw()), None);
 
         let key = OpTable::new(1).unwrap().insert(()).unwrap();
-        assert_eq!(
-            CompletionKey::decode(key.as_u64()),
-            Some(CompletionKey::Operation(key))
-        );
+        assert_eq!(CompletionKey::decode(key.as_u64()), Some(CompletionKey::Operation(key)));
         assert_eq!(CompletionKey::decode(0), None);
         assert_eq!(CompletionKey::decode(OpKey::INVALID.as_u64()), None);
     }

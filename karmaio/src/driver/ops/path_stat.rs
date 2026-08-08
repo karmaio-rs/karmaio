@@ -25,14 +25,6 @@ pub(crate) struct PathStat {
     follow_symlinks: bool,
     #[cfg(target_os = "linux")]
     statx_buf: Box<libc::statx>,
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))]
-    stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<rustix::fs::Stat>>>>,
 }
 
 impl Op<PathStat> {
@@ -42,14 +34,6 @@ impl Op<PathStat> {
             follow_symlinks,
             #[cfg(target_os = "linux")]
             statx_buf: Box::new(unsafe { std::mem::zeroed() }),
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "openbsd",
-                target_os = "dragonfly"
-            ))]
-            stat_shared: None,
         };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
@@ -93,38 +77,22 @@ impl KqueueOperation for PathStat {
     type Output = io::Result<Metadata>;
 
     fn attempt(&mut self) -> KqueueAttempt {
-        use std::sync::{Arc, Mutex};
-
-        let slot = Arc::new(Mutex::new(None));
-        self.stat_shared = Some(Arc::clone(&slot));
         let path = self.path.clone();
         let follow_symlinks = self.follow_symlinks;
 
-        kqueue_syscall_blocking!({
+        kqueue_syscall_blocking!(value {
             let result = if follow_symlinks {
                 rustix::fs::stat(path.as_c_str())
             } else {
                 rustix::fs::lstat(path.as_c_str())
             };
 
-            result
-                .map(|stat| {
-                    *slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(stat);
-                    0_u32
-                })
-                .map_err(io::Error::from)
+            result.map_err(io::Error::from)
         })
     }
 
     fn complete(self, completion: Completion) -> Self::Output {
-        completion.result?;
-        let stat = self
-            .stat_shared
-            .expect("path stat shared slot missing after submission")
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .expect("path stat result missing after successful completion");
+        let stat = completion.into_blocking_value::<rustix::fs::Stat>()?;
         Ok(Metadata::from_stat(stat))
     }
 }

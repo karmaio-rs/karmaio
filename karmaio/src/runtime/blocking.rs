@@ -48,7 +48,7 @@ use std::{
 use crate::{
     driver::Wakeup,
     runtime::Schedule,
-    task::{new_task, JoinHandle, Task},
+    task::{JoinHandle, Task, new_task},
 };
 
 /// Boxed unit of work dispatched to the pool.
@@ -202,7 +202,10 @@ impl BlockingPoolHandle {
 
     /// Fallible dispatch used by tests and internal callers.
     pub(crate) fn try_dispatch(&self, job: JobWork) -> io::Result<()> {
-        self.inner.dispatch(Job { work: job, mandatory: false })
+        self.inner.dispatch(Job {
+            work: job,
+            mandatory: false,
+        })
     }
 
     /// Fallible dispatch of a mandatory job that must run even during shutdown.
@@ -210,7 +213,10 @@ impl BlockingPoolHandle {
     /// Used by the drivers to offload syscalls whose side effects (such as
     /// closing an fd) must not be dropped with the runtime.
     pub(crate) fn try_dispatch_mandatory(&self, job: JobWork) -> io::Result<()> {
-        self.inner.dispatch(Job { work: job, mandatory: true })
+        self.inner.dispatch(Job {
+            work: job,
+            mandatory: true,
+        })
     }
 }
 
@@ -360,7 +366,10 @@ impl PoolInner {
                         if now >= deadline {
                             break;
                         }
-                        let (guard, _) = self.condvar.wait_timeout(shared, deadline - now).unwrap_or_else(|e| e.into_inner());
+                        let (guard, _) = self
+                            .condvar
+                            .wait_timeout(shared, deadline - now)
+                            .unwrap_or_else(|e| e.into_inner());
                         shared = guard;
                     }
                     None => shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner()),
@@ -401,7 +410,10 @@ impl PoolInner {
                     if now >= deadline {
                         break;
                     }
-                    let (guard, _) = self.condvar.wait_timeout(shared, deadline - now).unwrap_or_else(|e| e.into_inner());
+                    let (guard, _) = self
+                        .condvar
+                        .wait_timeout(shared, deadline - now)
+                        .unwrap_or_else(|e| e.into_inner());
                     shared = guard;
                 }
                 None => shared = self.condvar.wait(shared).unwrap_or_else(|e| e.into_inner()),

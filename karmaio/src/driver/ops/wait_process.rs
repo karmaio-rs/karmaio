@@ -68,7 +68,7 @@ mod tests {
     fn failed_pidfd_poll_does_not_wait_for_child() {
         let waited = Cell::new(false);
         let error = reap_after_pidfd_ready(
-            Completion::new(Err(io::Error::from_raw_os_error(libc::ECANCELED)),),
+            Completion::new(Err(io::Error::from_raw_os_error(libc::ECANCELED))),
             || {
                 waited.set(true);
                 Ok(())

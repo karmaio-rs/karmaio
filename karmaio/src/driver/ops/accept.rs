@@ -194,7 +194,7 @@ unsafe impl IocpOperation for Accept {
                 let socket = match create_accept_socket(listen_socket) {
                     Ok(socket) => socket,
                     Err(err) => {
-                        return IocpSubmission::Ready(Completion::new(Err(err) ));
+                        return IocpSubmission::Ready(Completion::new(Err(err)));
                     }
                 };
 

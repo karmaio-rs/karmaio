@@ -19,9 +19,7 @@ macro_rules! kqueue_syscall {
 
 macro_rules! __kqueue_syscall_ready {
     ($result:expr) => {
-        return $crate::driver::backends::kqueue::KqueueAttempt::Ready(
-            $crate::driver::ops::Completion::new($result),
-        )
+        return $crate::driver::backends::kqueue::KqueueAttempt::Ready($crate::driver::ops::Completion::new($result))
     };
 }
 
@@ -51,14 +49,19 @@ macro_rules! __kqueue_syscall_register_connect {
 /// Captures outer locals with `move`. Prefer this for path-based FS ops and other
 /// syscalls that cannot use kqueue readiness (open, mkdir, rename, fstat, …).
 macro_rules! kqueue_syscall_blocking {
+    (value $block:block) => {{
+        $crate::driver::backends::kqueue::KqueueAttempt::Blocking($crate::driver::ops::BlockingJob::new(move || {
+            $crate::driver::ops::Completion::from_blocking_result({ $block })
+        }))
+    }};
     ($block:block) => {{
         // EINTR is retried by [`BlockingJob::run`]; the closure itself is a single attempt.
-        $crate::driver::backends::kqueue::KqueueAttempt::Blocking($crate::driver::ops::BlockingJob::new(move || {
-            match { $block } {
+        $crate::driver::backends::kqueue::KqueueAttempt::Blocking($crate::driver::ops::BlockingJob::new(
+            move || match { $block } {
                 Ok(val) => $crate::driver::ops::Completion::new(Ok(val)),
                 Err(err) => $crate::driver::ops::Completion::new(Err(err)),
-            }
-        }))
+            },
+        ))
     }};
 }
 

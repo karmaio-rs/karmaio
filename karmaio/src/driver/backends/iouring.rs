@@ -375,8 +375,7 @@ impl IoUringBackend {
             };
 
             if let Some(state) = self.ops.get_mut(key) {
-                let (remove, waker, cleanup) =
-                    state.complete(Completion::with_flags(result, completion.flags()));
+                let (remove, waker, cleanup) = state.complete(Completion::with_flags(result, completion.flags()));
                 if let Some(waker) = waker {
                     deferred.push(DeferredAction::new(move || waker.wake()));
                 }

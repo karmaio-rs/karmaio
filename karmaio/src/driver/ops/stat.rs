@@ -26,17 +26,6 @@ pub(crate) struct Stat {
     handle: SharedIoHandle<std::fs::File>,
     #[cfg(target_os = "linux")]
     statx_buf: Box<libc::statx>,
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "freebsd",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "dragonfly"
-    ))]
-    /// Filled by the blocking-pool job via shared storage.
-    stat_shared: Option<std::sync::Arc<std::sync::Mutex<Option<rustix::fs::Stat>>>>,
-    #[cfg(windows)]
-    metadata_shared: std::sync::Arc<std::sync::Mutex<Option<Metadata>>>,
 }
 
 impl Op<Stat> {
@@ -54,16 +43,10 @@ impl Op<Stat> {
             target_os = "openbsd",
             target_os = "dragonfly"
         ))]
-        let data = Stat {
-            handle: handle.clone(),
-            stat_shared: None,
-        };
+        let data = Stat { handle: handle.clone() };
 
         #[cfg(windows)]
-        let data = Stat {
-            handle: handle.clone(),
-            metadata_shared: std::sync::Arc::new(std::sync::Mutex::new(None)),
-        };
+        let data = Stat { handle: handle.clone() };
 
         CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
     }
@@ -103,37 +86,18 @@ unsafe impl UringOperation for Stat {
 impl KqueueOperation for Stat {
     type Output = io::Result<Metadata>;
     fn attempt(&mut self) -> KqueueAttempt {
-        use std::sync::{Arc, Mutex};
-
-        // fstat fills a buffer we need after the pool job; share it with the worker.
-        let slot = Arc::new(Mutex::new(None::<rustix::fs::Stat>));
-        self.stat_shared = Some(Arc::clone(&slot));
         let fd = self.handle.raw_fd();
 
-        kqueue_syscall_blocking!({
+        kqueue_syscall_blocking!(value {
             // Safety: the operation retains the owning file handle until this
             // blocking job completes.
             let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
-            match rustix::fs::fstat(fd) {
-                Ok(stat) => {
-                    *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(stat);
-                    Ok(0_u32)
-                }
-                Err(err) => Err(std::io::Error::from(err)),
-            }
+            rustix::fs::fstat(fd).map_err(std::io::Error::from)
         })
     }
 
     fn complete(self, completion: Completion) -> Self::Output {
-        completion.result?;
-        let slot = self
-            .stat_shared
-            .expect("fstat shared slot missing after successful submit");
-        let stat = slot
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .expect("fstat result missing after successful submit");
+        let stat = completion.into_blocking_value::<rustix::fs::Stat>()?;
         Ok(Metadata::from_stat(stat))
     }
 }
@@ -145,26 +109,13 @@ unsafe impl IocpOperation for Stat {
         use windows_sys::Win32::Foundation::HANDLE;
 
         let handle = self.handle.raw_handle() as isize;
-        let metadata_slot = std::sync::Arc::clone(&self.metadata_shared);
 
-        windows_syscall_blocking!({
-            match Metadata::from_handle(handle as HANDLE) {
-                Ok(metadata) => {
-                    *metadata_slot.lock().unwrap_or_else(|error| error.into_inner()) = Some(metadata);
-                    Ok(0_u32)
-                }
-                Err(error) => Err(error),
-            }
+        windows_syscall_blocking!(value {
+            Metadata::from_handle(handle as HANDLE)
         })
     }
 
     fn complete(self, completion: Completion) -> Self::Output {
-        completion.result?;
-        Ok(self
-            .metadata_shared
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .take()
-            .expect("metadata missing after successful completion"))
+        completion.into_blocking_value::<Metadata>()
     }
 }

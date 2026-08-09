@@ -7,9 +7,17 @@ use crate::{driver::helpers::socket::Socket, net::tcp::TcpStream};
 #[cfg(windows)]
 use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 
+#[cfg(target_os = "linux")]
+use crate::driver::helpers::socket::Incoming;
+#[cfg(target_os = "linux")]
+use crate::io::Stream;
+
 /// A TCP socket server listening for connections.
 ///
 /// You can accept a new connection by using the [`accept`](`TcpListener::accept`) method.
+///
+/// On Linux, [`incoming`](`TcpListener::incoming`) provides a stream of accepts
+/// backed by io_uring multishot accept.
 ///
 /// # Closing
 ///
@@ -17,6 +25,39 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 /// still closes the OS socket synchronously when the last reference is dropped.
 pub struct TcpListener {
     pub(super) inner: Socket,
+}
+
+/// A stream of incoming TCP connections (Linux only).
+///
+/// Produced by [`TcpListener::incoming`]. Thin public mapping over the shared
+/// [`Socket`] accept stream: each item is a connected [`TcpStream`] and peer
+/// [`SocketAddr`]. Dropping the stream cancels the underlying accept request.
+///
+/// # Implementation notes
+///
+/// On Linux this uses **io_uring multishot accept** (requires kernel **6.12+**).
+/// karmaio does not probe the kernel version at runtime. The multishot SQE is
+/// **not** automatically re-armed after it terminates (error, cancel, or kernel
+/// disarm). Call [`TcpListener::incoming`] again to start a new request.
+#[cfg(target_os = "linux")]
+#[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+pub struct TcpIncoming {
+    inner: Incoming,
+}
+
+#[cfg(target_os = "linux")]
+impl Stream for TcpIncoming {
+    type Item = std::io::Result<(TcpStream, SocketAddr)>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        let item = self.inner.next().await?;
+        Some(match item {
+            Ok((socket, addr)) => addr
+                .ok_or_else(|| std::io::Error::other("Could not get socket IP address"))
+                .map(|addr| (TcpStream { inner: socket }, addr)),
+            Err(err) => Err(err),
+        })
+    }
 }
 
 impl TcpListener {
@@ -58,6 +99,32 @@ impl TcpListener {
         let stream = TcpStream { inner: socket };
         let socket_addr = socket_addr.ok_or_else(|| std::io::Error::other("Could not get socket IP address"))?;
         Ok((stream, socket_addr))
+    }
+
+    /// Returns a stream of incoming connections to this listener (Linux only).
+    ///
+    /// Prefer this over a manual `loop { accept().await }` when accepting many
+    /// connections on Linux. Submission lives on the shared [`Socket`] helper
+    /// (same layer as oneshot [`accept`](Self::accept)); this method maps
+    /// accepted sockets into [`TcpStream`].
+    ///
+    /// # Implementation notes
+    ///
+    /// Backed by **io_uring multishot accept** (Linux **6.12+**). The runtime
+    /// does not probe the kernel version. The multishot request is **not**
+    /// re-armed after it ends; call this method again to start a new stream.
+    /// Dropping the returned stream cancels the in-flight request.
+    ///
+    /// # Concurrent use
+    ///
+    /// Do not run more than one incoming stream at a time on the same listener
+    /// on the same runtime thread.
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub fn incoming(&self) -> std::io::Result<TcpIncoming> {
+        Ok(TcpIncoming {
+            inner: self.inner.incoming()?,
+        })
     }
 }
 

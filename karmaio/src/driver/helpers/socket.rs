@@ -9,7 +9,13 @@ use std::os::windows::io::{AsRawSocket, AsSocket, BorrowedSocket, FromRawSocket,
 
 use crate::buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut};
 use crate::driver::helpers::attached_handle::AttachedHandle;
+#[cfg(target_os = "linux")]
+use crate::driver::ops::MultiOp;
 use crate::driver::ops::Op;
+#[cfg(target_os = "linux")]
+use crate::driver::ops::accept_multi::AcceptMulti;
+#[cfg(target_os = "linux")]
+use crate::io::Stream;
 
 // This is an internal wrapper around socket operations for the runtime.
 // This wrapper abstracts and handles all the driver operations and os compatiblity,
@@ -144,6 +150,22 @@ impl Socket {
         op.await
     }
 
+    /// Stream of incoming connections (Linux io_uring multishot accept).
+    ///
+    /// Yields the same item shape as [`accept`](Self::accept): an owned
+    /// [`Socket`] and optional peer IP address. Peer addresses are resolved
+    /// with `getpeername` after each successful accept.
+    ///
+    /// Uses multishot accept under the hood (Linux 6.12+). Dropping the stream
+    /// cancels the request. The multishot SQE is **not** re-armed after it
+    /// terminates; call [`incoming`](Self::incoming) again to start a new one.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn incoming(&self) -> Result<Incoming> {
+        Ok(Incoming {
+            inner: MultiOp::accept_multi(&self.handle)?,
+        })
+    }
+
     // ================================
     //  Connection Control
     // ================================
@@ -261,6 +283,35 @@ impl AsRawSocket for Socket {
 impl From<AttachedHandle<socket2::Socket>> for Socket {
     fn from(value: AttachedHandle<socket2::Socket>) -> Self {
         Self { handle: value }
+    }
+}
+
+/// Stream of incoming connections owned by the shared [`Socket`] helper.
+///
+/// Each item matches oneshot [`Socket::accept`]: `(Socket, Option<SocketAddr>)`.
+/// Public listeners map this into their domain types (`TcpStream`, `UnixStream`).
+///
+/// Backed by io_uring multishot accept on Linux 6.12+. Dropping the stream
+/// cancels the in-flight request. The multishot SQE is not re-armed after it
+/// ends; construct a new stream via [`Socket::incoming`].
+#[cfg(target_os = "linux")]
+pub(crate) struct Incoming {
+    inner: MultiOp<AcceptMulti>,
+}
+
+#[cfg(target_os = "linux")]
+impl Stream for Incoming {
+    type Item = Result<(Socket, Option<SocketAddr>)>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        let accepted = self.inner.next().await?;
+        Some(match accepted {
+            Ok(socket) => match socket.handle.peer_addr() {
+                Ok(addr) => Ok((socket, addr.as_socket())),
+                Err(err) => Err(err),
+            },
+            Err(err) => Err(err),
+        })
     }
 }
 

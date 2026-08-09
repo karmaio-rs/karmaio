@@ -28,6 +28,16 @@ path = "echo_tcp.rs"
 required-features = ["macros", "net"]
 
 [[example]]
+name = "echo_tcp_multi"
+path = "echo_tcp_multi.rs"
+required-features = ["macros", "net"]
+
+[[example]]
+name = "accept_multi"
+path = "accept_multi.rs"
+required-features = ["macros", "net"]
+
+[[example]]
 name = "framed_echo"
 path = "framed_echo.rs"
 required-features = ["macros", "net"]

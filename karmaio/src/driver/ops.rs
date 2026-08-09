@@ -14,6 +14,10 @@ use std::{
 
 use crate::driver::Handle;
 use crate::driver::backends::Operation;
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::UringMultishotOperation;
+#[cfg(target_os = "linux")]
+use crate::io::Stream;
 
 // Generational op identities live in their own module; re-export so op and
 // backend call sites can keep using `crate::driver::ops::{OpKey, OpTable, ...}`.
@@ -57,6 +61,8 @@ pub(crate) mod writev;
 // Network ops (`feature = "net"`).
 #[cfg(feature = "net")]
 pub(crate) mod accept;
+#[cfg(all(feature = "net", target_os = "linux"))]
+pub(crate) mod accept_multi;
 #[cfg(feature = "net")]
 pub(crate) mod connect;
 #[cfg(feature = "net")]
@@ -362,6 +368,89 @@ impl<T: Operation + 'static> Drop for Op<T> {
     fn drop(&mut self) {
         if let Some(driver) = self.driver.upgrade() {
             driver.remove_op(self);
+        }
+    }
+}
+
+/// A typed multishot operation that yields zero or more items as a stream.
+///
+/// Multishot ops submit one SQE that may produce many CQEs. Intermediate CQEs
+/// carry `IORING_CQE_F_MORE`; the final CQE does not. Dropping the stream
+/// cancels the in-flight request (unlike oneshot [`Op`], which detaches).
+///
+/// Multishot APIs require Linux 6.12+. karmaio does not probe the kernel
+/// version at runtime; callers must meet that floor.
+///
+/// Completions are staged on the driver and converted via
+/// [`UringMultishotOperation::complete_item`] when polled.
+#[cfg(target_os = "linux")]
+pub(crate) struct MultiOp<T: UringMultishotOperation + 'static> {
+    driver: Handle,
+    key: OpKey,
+    data: Option<Box<T>>,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: UringMultishotOperation + 'static> MultiOp<T> {
+    pub(crate) fn new(key: OpKey, data: Box<T>, driver: Handle) -> Self {
+        Self {
+            driver,
+            key,
+            data: Some(data),
+        }
+    }
+
+    pub(crate) fn key(&self) -> OpKey {
+        self.key
+    }
+
+    pub(crate) fn take_data(&mut self) -> Option<Box<T>> {
+        self.data.take()
+    }
+
+    pub(crate) fn data_mut(&mut self) -> Option<&mut T> {
+        self.data.as_deref_mut()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T: UringMultishotOperation + 'static> Stream for MultiOp<T> {
+    type Item = T::Item;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        MultiOpNext { op: self }.await
+    }
+}
+
+/// One poll step of [`MultiOp::next`].
+#[cfg(target_os = "linux")]
+struct MultiOpNext<'a, T: UringMultishotOperation + 'static> {
+    op: &'a mut MultiOp<T>,
+}
+
+#[cfg(target_os = "linux")]
+impl<T: UringMultishotOperation + 'static> Future for MultiOpNext<'_, T> {
+    type Output = Option<T::Item>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        let driver = this.op.driver.upgrade().expect("Not in runtime context");
+        match driver.poll_multi_op(this.op, cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(Some(completion)) => {
+                let data = this.op.data_mut().expect("multishot op data missing while streaming");
+                Poll::Ready(Some(UringMultishotOperation::complete_item(data, completion)))
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T: UringMultishotOperation + 'static> Drop for MultiOp<T> {
+    fn drop(&mut self) {
+        if let Some(driver) = self.driver.upgrade() {
+            driver.remove_multi_op(self);
         }
     }
 }

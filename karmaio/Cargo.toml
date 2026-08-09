@@ -79,6 +79,10 @@ name = "framed_tcp"
 required-features = ["macros", "net"]
 
 [[test]]
+name = "accept_multi"
+required-features = ["macros", "net"]
+
+[[test]]
 name = "fs"
 required-features = ["fs"]
 

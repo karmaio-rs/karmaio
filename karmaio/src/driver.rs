@@ -17,8 +17,14 @@ pub(super) mod helpers;
 pub(crate) mod op_table;
 pub(crate) mod ops;
 
+#[cfg(target_os = "linux")]
+use crate::driver::backends::iouring::UringMultishotOperation;
 #[cfg(windows)]
 use crate::driver::helpers::io_handle::HandleRegistration;
+#[cfg(target_os = "linux")]
+use crate::driver::ops::Completion;
+#[cfg(target_os = "linux")]
+use crate::driver::ops::MultiOp;
 use crate::driver::ops::{DeferredAction, Op};
 
 // Shared, cloneable handle to the platform driver.
@@ -72,6 +78,15 @@ impl Driver {
         self.backend.borrow_mut().submit_op(data, self.into())
     }
 
+    /// Submit a multishot operation and return a stream of completions.
+    ///
+    /// Requires Linux 6.12+. See multishot method docs on public types.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn submit_multi_op<T: UringMultishotOperation + 'static>(&self, data: T) -> io::Result<MultiOp<T>> {
+        let (key, data) = self.backend.borrow_mut().submit_multi_op(data)?;
+        Ok(MultiOp::new(key, data, self.into()))
+    }
+
     pub(crate) fn remove_op<T: Operation + 'static>(&self, op: &mut Op<T>) {
         // Run typed complete outside the backend borrow: `complete` may drop
         // user buffers or construct resources that re-enter the driver.
@@ -83,6 +98,15 @@ impl Driver {
         }
     }
 
+    /// Cancel a multishot operation (called from [`MultiOp`] drop).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn remove_multi_op<T: UringMultishotOperation + 'static>(&self, op: &mut MultiOp<T>) {
+        let Some(data) = op.take_data() else {
+            return;
+        };
+        self.backend.borrow_mut().remove_multi_op(op.key(), data);
+    }
+
     #[cfg(target_os = "linux")]
     pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
         match self.backend.borrow_mut().poll_op(op, cx) {
@@ -92,6 +116,16 @@ impl Driver {
                 Poll::Ready(Operation::complete(*data, completion))
             }
         }
+    }
+
+    /// Poll the next multishot completion (raw CQE), if any.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn poll_multi_op<T: UringMultishotOperation + 'static>(
+        &self,
+        op: &mut MultiOp<T>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Completion>> {
+        self.backend.borrow_mut().poll_multi_op(op.key(), cx)
     }
 
     #[cfg(any(

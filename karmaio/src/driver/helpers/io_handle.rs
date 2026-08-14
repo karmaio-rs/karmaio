@@ -171,6 +171,7 @@ impl<T: AsRawOsHandle> SharedIoHandle<T> {
 
     /// Windows-only alias used by existing ops.
     #[cfg(windows)]
+    #[allow(dead_code)] // Convenience alias; no op calls it yet.
     pub(crate) fn raw_os_handle(&self) -> OsRawHandle {
         self.as_raw_os_handle()
     }

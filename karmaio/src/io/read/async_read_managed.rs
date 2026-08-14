@@ -7,7 +7,7 @@ use std::io;
 ///
 /// Unlike [`crate::io::AsyncRead`], the application does not supply a buffer.
 /// The implementation selects one from the runtime pool and returns a lease
-/// ([`crate::buf::PooledBuf`] on Linux).
+/// (`PooledBuf` on Linux).
 ///
 /// # Buffer ownership
 ///

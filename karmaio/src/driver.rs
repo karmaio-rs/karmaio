@@ -233,25 +233,6 @@ impl Driver {
     pub(crate) fn blocking_pool(&self) -> &BlockingPoolHandle {
         &self.blocking
     }
-
-    /// Build a driver around an already-constructed backend for unit tests.
-    ///
-    /// Uses a no-op cross-thread wakeup: remote `Wakeup::wake` calls do not
-    /// unblock `wait`. Prefer [`Driver::new`] for any production path.
-    #[cfg(test)]
-    pub(crate) fn for_tests(backend: PlatformBackend, blocking: BlockingPoolHandle) -> Self {
-        let backend = Rc::new(RefCell::new(backend));
-        let wakeup = Wakeup::new(|| {});
-        #[cfg(windows)]
-        let association = backend.borrow().association();
-        Self {
-            backend,
-            wakeup,
-            blocking,
-            #[cfg(windows)]
-            association,
-        }
-    }
 }
 
 #[cfg(unix)]

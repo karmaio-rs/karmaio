@@ -6,11 +6,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle};
 
 use crate::{
-    buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
+    buf::{BufResult, IoBuf, IoBufMut},
     driver::{helpers::attached_handle::AttachedHandle, ops::Op},
     fs::{Metadata, OpenOptions, Permissions},
     io::{AsyncReadAt, AsyncWriteAt},
 };
+// Vectored I/O is only available off Windows (see `ops::readv` / `ops::writev`).
+#[allow(unused_imports)]
+use crate::buf::{IoVectoredBuf, IoVectoredBufMut};
 
 /// A reference to an open file on the filesystem.
 ///
@@ -28,7 +31,7 @@ use crate::{
 /// **synchronously** when the last reference is dropped.
 /// Explicit `close().await` is recommended when you need non-blocking close or to
 /// observe close errors. Closing a file does not guarantee writes have persisted
-/// to disk; use [`sync_all`] for that.
+/// to disk; use [`File::sync_all`] for that.
 #[derive(Debug, Clone)]
 pub struct File {
     /// Open file; associated with the driver and shared so in-flight ops can

@@ -23,8 +23,8 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 /// In karmaio, there are basically two main ways to use `UdpSocket`:
 /// - one to many: [`bind`](`UdpSocket::bind`) and use [`send_to`](`UdpSocket::send_to`)
 ///   and [`recv_from`](`UdpSocket::recv_from`) to communicate with many different addresses
-/// - one to one: [`connect`](`UdpSocket::connect`) and associate with a single address, using [`write`](`UdpSocket::write`)
-///   and [`read`](`UdpSocket::read`) to communicate only with that remote address
+/// - one to one: [`connect`](`UdpSocket::connect`) and associate with a single address, using
+///   [`send`](`UdpSocket::send`) and [`recv`](`UdpSocket::recv`) to communicate only with that remote address
 ///
 /// # Closing
 ///

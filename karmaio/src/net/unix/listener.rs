@@ -9,7 +9,7 @@ use crate::io::Stream;
 
 /// A Unix domain socket server listening for connections.
 ///
-/// On Linux, [`incoming`](`UnixListener::incoming`) provides a stream of accepts
+/// On Linux, `UnixListener::incoming` provides a stream of accepts
 /// backed by io_uring multishot accept.
 ///
 /// # Closing
@@ -78,10 +78,8 @@ impl UnixListener {
     /// Accepts a new incoming connection from this listener.
     ///
     /// This function will yield once a new Unix domain socket connection
-    /// is established. When established, the corresponding [`UnixStream`] and
+    /// is established. When established, the corresponding [`UnixStream`]
     /// will be returned.
-    ///
-    /// [`UnixStream`]: struct@crate::net::UnixStream
     pub async fn accept(&self) -> std::io::Result<UnixStream> {
         let (socket, _) = self.inner.accept().await?;
         let stream = UnixStream { inner: socket };

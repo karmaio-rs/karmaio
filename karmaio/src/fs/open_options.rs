@@ -25,7 +25,7 @@ use crate::{driver::ops::Op, fs::File};
 /// Generally speaking, when using `OpenOptions`,
 /// you'll first call [`OpenOptions::new`], then chain calls to methods to set each option,
 /// then call [`OpenOptions::open`], passing the path of the file you're trying to open.
-/// This will give you a [`io::Result`] with a [`File`] inside that you can further operate on.
+/// This will give you a [`std::io::Result`] with a [`File`] inside that you can further operate on.
 #[derive(Debug, Clone)]
 pub struct OpenOptions {
     read: bool,

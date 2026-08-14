@@ -2,8 +2,8 @@
 //!
 //! These wrap the OS pipe ends handed to us by [`std::process::Child`] and
 //! expose them through the crate's [`AsyncRead`]/[`AsyncWrite`] traits.
-//! The underlying pipe ends are stored as a cloneable [`SharedIoHandle`] so that the
-//! completion driver owns a reference for the duration of each in-flight operation;
+//! The underlying pipe ends are stored in a cloneable internal handle so that
+//! the completion driver owns a reference for the duration of each in-flight operation;
 //! dropping the user-facing handle closes the pipe end exactly once
 //! and never races with a submission in progress.
 //!

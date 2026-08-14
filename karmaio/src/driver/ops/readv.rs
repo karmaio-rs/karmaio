@@ -1,7 +1,5 @@
 use std::io;
 
-#[cfg(windows)]
-use crate::driver::backends::iocp::{IocpOperation, IocpSubmission};
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::{Submission as UringSubmission, UringOperation};
 #[cfg(any(
@@ -28,8 +26,6 @@ pub(crate) struct Readv<V: IoVectoredBufMut> {
     pub(crate) bufs: V,
     #[cfg(unix)]
     iovs: Vec<libc::iovec>,
-    #[cfg(windows)]
-    segments: Vec<windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT>,
     offset: u64,
 }
 
@@ -40,8 +36,6 @@ impl<V: IoVectoredBufMut> Op<Readv<V>> {
             bufs,
             #[cfg(unix)]
             iovs: Vec::new(),
-            #[cfg(windows)]
-            segments: Vec::new(),
             offset,
         };
 
@@ -60,21 +54,6 @@ impl<V: IoVectoredBufMut> Readv<V> {
                 iov_len: buf.len(),
             })
             .collect();
-    }
-
-    #[cfg(windows)]
-    fn rebuild_segments(&mut self) {
-        self.segments = self
-            .bufs
-            .iter_uninit_slice()
-            .map(|buf| windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT {
-                Buffer: buf.as_mut_ptr().cast(),
-            })
-            .collect();
-        self.segments
-            .push(windows_sys::Win32::Storage::FileSystem::FILE_SEGMENT_ELEMENT {
-                Buffer: std::ptr::null_mut(),
-            });
     }
 
     fn finish(mut self, completion: Completion) -> BufResult<usize, V> {
@@ -144,41 +123,6 @@ impl<V: IoVectoredBufMut> KqueueOperation for Readv<V> {
             rustix::io::preadv(fd, &mut bufs, offset)
                 .map(|n| n as u32)
                 .map_err(std::io::Error::from)
-        })
-    }
-
-    fn complete(self, completion: Completion) -> Self::Output {
-        self.finish(completion)
-    }
-}
-
-#[cfg(windows)]
-unsafe impl<V: IoVectoredBufMut> IocpOperation for Readv<V> {
-    type Output = BufResult<usize, V>;
-
-    fn submit(&mut self) -> IocpSubmission {
-        use crate::driver::backends::iocp::Interest;
-        use windows_sys::Win32::Storage::FileSystem::ReadFileScatter;
-
-        let total_bytes = self.bufs.total_capacity() as u32;
-        self.rebuild_segments();
-        let handle = self.io_handle.raw_handle();
-        let mut interest = Interest::new(handle as _);
-
-        unsafe {
-            let overlapped = &mut *interest.as_mut_ptr();
-            overlapped.Anonymous.Anonymous.Offset = (self.offset & 0xFFFF_FFFF) as u32;
-            overlapped.Anonymous.Anonymous.OffsetHigh = (self.offset >> 32) as u32;
-        }
-
-        windows_syscall_submit_overlapped!(interest, file, {
-            ReadFileScatter(
-                handle as _,
-                self.segments.as_ptr(),
-                total_bytes,
-                std::ptr::null(),
-                interest.as_mut_ptr(),
-            )
         })
     }
 

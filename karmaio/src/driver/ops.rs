@@ -21,7 +21,11 @@ use crate::io::Stream;
 
 // Generational op identities live in their own module; re-export so op and
 // backend call sites can keep using `crate::driver::ops::{OpKey, OpTable, ...}`.
-pub(crate) use crate::driver::op_table::{CompletionKey, OpKey, OpTable};
+pub(crate) use crate::driver::op_table::{OpKey, OpTable};
+// The IOCP backend decodes completions from raw pointers instead of reserved
+// control tokens, so it never needs the completion key type.
+#[cfg(not(target_os = "windows"))]
+pub(crate) use crate::driver::op_table::CompletionKey;
 
 // Always available: every `SharedIoHandle<T>` path closes through the driver.
 pub(crate) mod close;
@@ -37,7 +41,10 @@ pub(crate) mod open;
 pub(crate) mod path_stat;
 #[cfg(feature = "fs")]
 pub(crate) mod read_at;
-#[cfg(feature = "fs")]
+// Vectored file I/O is only wired up on Unix and Linux; on Windows the
+// scatter/gather syscalls require page-aligned segments that the generic
+// `IoVectoredBuf` API cannot guarantee.
+#[cfg(all(feature = "fs", not(target_os = "windows")))]
 pub(crate) mod readv;
 #[cfg(feature = "fs")]
 pub(crate) mod rename;
@@ -55,7 +62,7 @@ pub(crate) mod truncate;
 pub(crate) mod unlink;
 #[cfg(feature = "fs")]
 pub(crate) mod write_at;
-#[cfg(feature = "fs")]
+#[cfg(all(feature = "fs", not(target_os = "windows")))]
 pub(crate) mod writev;
 
 // Network ops (`feature = "net"`).

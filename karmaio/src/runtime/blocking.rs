@@ -9,12 +9,12 @@
 //! - Dynamic worker growth up to a configurable cap.
 //! - Workers exit after an idle keep-alive period.
 //! - Zero extra dependencies: `Mutex` + `Condvar` + `VecDeque`.
-//! - Completions wake the runtime through the driver's [`Wakeup`] token.
+//! - Completions wake the runtime through the driver's internal `Wakeup` token.
 //!
 //! # Shutdown semantics
 //!
 //! Every job carries a `mandatory` flag. Driver-dispatched syscalls (for
-//! example [`crate::driver::ops::close`]) are mandatory: their side effect —
+//! example the driver's close operation) are mandatory: their side effect —
 //! usually releasing an OS resource such as an fd — must happen even during
 //! shutdown, otherwise the resource leaks. User work spawned through
 //! [`crate::runtime::spawn_blocking`] is optional and may be dropped if the
@@ -212,6 +212,9 @@ impl BlockingPoolHandle {
     ///
     /// Used by the drivers to offload syscalls whose side effects (such as
     /// closing an fd) must not be dropped with the runtime.
+    // Mandatory jobs are dispatched by the kqueue and IOCP backends; io_uring
+    // performs the equivalent work in-kernel.
+    #[allow(dead_code)]
     pub(crate) fn try_dispatch_mandatory(&self, job: JobWork) -> io::Result<()> {
         self.inner.dispatch(Job {
             work: job,

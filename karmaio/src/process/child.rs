@@ -2,7 +2,8 @@
 //!
 //! The child's pipes (when configured with [`std::process::Stdio::piped`]) are
 //! exposed as [`ChildStdin`], [`ChildStdout`] and [`ChildStderr`], which
-//! implement [`AsyncRead`]/[`AsyncWrite`] and are driven by the completion
+//! implement [`AsyncRead`] and
+//! [`AsyncWrite`](crate::io::AsyncWrite) and are driven by the completion
 //! driver. Waiting is asynchronous: the blocking `wait` is offloaded to the
 //! runtime's blocking pool so the executor is never blocked on the child.
 
@@ -132,8 +133,7 @@ impl Child {
         }
     }
 
-    /// Initiates a kill without waiting for the child to finish,
-    /// mirroring [`std::process::Child::start_kill`].
+    /// Initiates a kill without waiting for the child to finish.
     pub fn start_kill(&mut self) -> io::Result<()> {
         match self.child.as_mut() {
             Some(child) => child.kill(),

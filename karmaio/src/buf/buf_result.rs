@@ -56,14 +56,6 @@ impl<T, B> BufResult<T, B> {
         BufResult(self.0.map(f), self.1)
     }
 
-    /// Maps a successful result without changing the returned buffer.
-    ///
-    /// This is the compio-compatible spelling of [`Self::map_result`].
-    #[inline]
-    pub fn map_res<U>(self, f: impl FnOnce(T) -> U) -> BufResult<U, B> {
-        self.map_result(f)
-    }
-
     /// Maps the returned buffer without changing the operation result.
     #[inline]
     pub fn map_buffer<C>(self, f: impl FnOnce(B) -> C) -> BufResult<T, C> {

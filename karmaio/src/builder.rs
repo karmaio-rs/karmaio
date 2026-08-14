@@ -1,7 +1,7 @@
 //! Runtime configuration and builder.
 //!
 //! [`RuntimeBuilder`] follows the builder pattern:
-//! construct it with [`RuntimeBuilder::new`], tweak knobs via the fluent [`must_use`] setters,
+//! construct it with [`RuntimeBuilder::new`], tweak knobs via the fluent `#[must_use]` setters,
 //! then call [`RuntimeBuilder::build`] to obtain a [`Runtime`].
 //!
 //! Every knob has a sensible default value if don't wish to provide one.
@@ -115,7 +115,7 @@ impl RuntimeBuilder {
 
     /// Set the maximum number of worker threads in the blocking thread pool.
     ///
-    /// Defaults to [`256`] (256)
+    /// Defaults to `256`.
     #[must_use]
     pub fn blocking_threads(mut self, threads: usize) -> Self {
         self.config.blocking_threads = threads.max(1);
@@ -124,7 +124,7 @@ impl RuntimeBuilder {
 
     /// Set the idle keep-alive duration before a blocking worker thread exits.
     ///
-    /// Defaults to [`Duration::from_secs(60)`] (60s).
+    /// Defaults to `Duration::from_secs(60)` (60 seconds).
     #[must_use]
     pub fn blocking_keep_alive(mut self, keep_alive: Duration) -> Self {
         self.config.blocking_keep_alive = keep_alive;
@@ -135,7 +135,7 @@ impl RuntimeBuilder {
     ///
     /// This controls the size of the op-tracking slab and the I/O entries/events
     /// buffer used by the underlying platform backend (io_uring / IOCP /
-    /// kqueue). Defaults to [`1024`] (1024).
+    /// kqueue). Defaults to `1024`.
     #[must_use]
     pub fn driver_capacity(mut self, capacity: usize) -> Self {
         self.config.driver_capacity = capacity.max(1);
@@ -164,7 +164,7 @@ impl RuntimeBuilder {
     /// up to a power of two when the pool is first created. The maximum is
     /// `32768`, as required by the kernel. Defaults to `64`.
     ///
-    /// Holding many outstanding [`crate::buf::PooledBuf`] leases without
+    /// Holding many outstanding `PooledBuf` leases without
     /// recycling them can exhaust this pool and end multishot receives with
     /// `ENOBUFS`. Prefer smaller hold times or a larger pool under load.
     ///

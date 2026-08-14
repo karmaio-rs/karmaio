@@ -1,6 +1,6 @@
 //! Pre-allocated storage for a uniform data type.
 //!
-//! Adapted from the `slab` crate (https://github.com/tokio-rs/slab, MIT
+//! Adapted from the `slab` crate (<https://github.com/tokio-rs/slab>, MIT
 //! license) so the runtime has no non-platform dependencies. `Slab` provides
 //! pre-allocated storage for a single data type: in exchange for giving up
 //! contiguous memory layout, it returns a key that identifies each stored
@@ -91,12 +91,14 @@ impl<T> Slab<T> {
     }
 
     /// Return the number of values the slab can store without reallocating.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn capacity(&self) -> usize {
         self.entries.capacity()
     }
 
     /// Clear the slab of all values.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         self.entries.clear();
         self.len = 0;
@@ -104,12 +106,14 @@ impl<T> Slab<T> {
     }
 
     /// Return the number of stored values.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
     }
 
     /// Return `true` if there are no values stored in the slab.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.len == 0
@@ -127,6 +131,7 @@ impl<T> Slab<T> {
     }
 
     /// Return an iterator that allows modifying each stored value.
+    #[allow(dead_code)]
     pub(crate) fn iter_mut(&mut self) -> IterMut<'_, T> {
         IterMut {
             entries: self.entries.iter_mut().enumerate(),
@@ -135,6 +140,7 @@ impl<T> Slab<T> {
     }
 
     /// Return a reference to the value associated with `key`, if any.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn get(&self, key: usize) -> Option<&T> {
         match self.entries.get(key) {
@@ -156,6 +162,7 @@ impl<T> Slab<T> {
     ///
     /// The returned key can later be used to retrieve or remove the value.
     /// Additional capacity is allocated if needed.
+    #[allow(dead_code)]
     pub(crate) fn insert(&mut self, val: T) -> usize {
         let key = self.next;
 
@@ -228,6 +235,7 @@ impl<T> Slab<T> {
     }
 
     /// Return `true` if a value is associated with `key`.
+    #[cfg_attr(target_os = "windows", allow(dead_code))]
     #[inline]
     pub(crate) fn contains(&self, key: usize) -> bool {
         matches!(self.entries.get(key), Some(&Entry::Occupied(_)))
@@ -243,6 +251,7 @@ pub(crate) struct VacantEntry<'a, T> {
 
 impl<'a, T> VacantEntry<'a, T> {
     /// Return the key associated with this entry.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn key(&self) -> usize {
         self.key
@@ -309,6 +318,7 @@ impl<T> ExactSizeIterator for Iter<'_, T> {
 impl<T> FusedIterator for Iter<'_, T> {}
 
 /// A mutable iterator over the values stored in a [`Slab`].
+#[allow(dead_code)]
 pub(crate) struct IterMut<'a, T> {
     entries: iter::Enumerate<slice::IterMut<'a, Entry<T>>>,
     len: usize,

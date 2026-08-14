@@ -16,7 +16,7 @@ use crate::io::Stream;
 ///
 /// You can accept a new connection by using the [`accept`](`TcpListener::accept`) method.
 ///
-/// On Linux, [`incoming`](`TcpListener::incoming`) provides a stream of accepts
+/// On Linux, `TcpListener::incoming` provides a stream of accepts
 /// backed by io_uring multishot accept.
 ///
 /// # Closing

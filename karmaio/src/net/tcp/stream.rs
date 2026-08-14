@@ -20,7 +20,8 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 /// A TCP stream between a local and a remote socket.
 ///
 /// A TCP stream can either be created by connecting to an endpoint
-/// via the [`connect`] method, or by [`accepting`] a connection from a [`listener`].
+/// via [`TcpStream::connect`], or by accepting a connection from a
+/// [`TcpListener`](crate::net::tcp::TcpListener).
 ///
 /// # Closing
 ///
@@ -103,9 +104,8 @@ impl TcpStream {
     /// Splits a [`TcpStream`] into a read half and a write half, which can be
     /// used to read and write the stream concurrently.
     ///
-    /// This method is more efficient than
-    /// [`into_split`](TcpStream::into_split), but the halves cannot
-    /// be moved into independently spawned tasks.
+    /// The returned halves borrow the stream and cannot be moved into
+    /// independently spawned tasks.
     pub fn split(&self) -> (ReadHalf<'_, Self>, WriteHalf<'_, Self>) {
         split(self)
     }

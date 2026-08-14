@@ -26,13 +26,20 @@ impl OpKey {
     /// Largest number of operation slots representable by this token.
     pub(crate) const MAX_CAPACITY: usize = Self::INDEX_MASK;
 
+    // Only the IOCP backend needs an explicit invalid token.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
     pub(crate) const INVALID: Self = Self(0);
 
+    // Used by the kqueue backend for event ids; unused by io_uring (user-data
+    // u64) and IOCP (raw pointers decoded via `from_raw`).
+    #[cfg_attr(any(target_os = "linux", target_os = "windows"), allow(dead_code))]
     #[inline]
     pub(crate) fn raw(self) -> usize {
         self.0
     }
 
+    // Used by the io_uring backend as the SQE user-data value.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     #[inline]
     pub(crate) fn as_u64(self) -> u64 {
         self.0 as u64
@@ -224,6 +231,9 @@ impl<T> OpTable<T> {
         Some(value)
     }
 
+    // Used by the io_uring and kqueue backends; the IOCP backend tracks
+    // drain readiness through its own completion loop.
+    #[allow(dead_code)]
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
         self.active_len == 0
@@ -236,6 +246,8 @@ impl<T> OpTable<T> {
             .filter_map(move |(slot, value)| OpKey::from_components(slot, generations[slot]).zip(value.as_ref()))
     }
 
+    // Used by the io_uring and IOCP backends to walk live slots.
+    #[allow(dead_code)]
     pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = (OpKey, &mut T)> {
         let generations = &self.generations;
         self.entries
@@ -243,6 +255,9 @@ impl<T> OpTable<T> {
             .filter_map(move |(slot, value)| OpKey::from_components(slot, generations[slot]).zip(value.as_mut()))
     }
 
+    // Used by the kqueue and IOCP backends; io_uring retires each slot on its
+    // terminal CQE instead.
+    #[allow(dead_code)]
     pub(crate) fn clear(&mut self) {
         let active: Vec<_> = self
             .entries

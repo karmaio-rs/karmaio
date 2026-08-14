@@ -71,9 +71,8 @@ impl UnixStream {
     /// Splits a [`UnixStream`] into a read half and a write half, which can be
     /// used to read and write the stream concurrently.
     ///
-    /// This method is more efficient than
-    /// [`into_split`](UnixStream::into_split), but the halves cannot
-    /// be moved into independently spawned tasks.
+    /// The returned halves borrow the stream and cannot be moved into
+    /// independently spawned tasks.
     pub fn split(&self) -> (ReadHalf<'_, Self>, WriteHalf<'_, Self>) {
         split(self)
     }

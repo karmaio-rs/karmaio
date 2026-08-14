@@ -36,7 +36,7 @@
 //! # Implementation notes
 //! - On Unix, an OS signal handler is installed lazily for each distinct signal
 //!   and notifies every registered listener directly. The registry is read from
-//!   the handler through a lock-free [`half_lock`] structure so it stays async-signal-safe.
+//!   the handler through a lock-free `half_lock` structure so it stays async-signal-safe.
 //! - On Windows, Ctrl-C is handled via `SetConsoleCtrlHandler`.
 //! - Signals coalesce: a listener that does not keep up with rapid deliveries
 //!   observes a single notification, matching the behaviour of most runtimes.

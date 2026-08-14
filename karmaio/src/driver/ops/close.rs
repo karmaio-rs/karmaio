@@ -63,9 +63,7 @@ impl KqueueOperation for Close {
     type Output = io::Result<()>;
     fn attempt(&mut self) -> KqueueAttempt {
         // Own the raw fd for the pool job (Close owns the handle exclusively).
-        let fd = match self.io_handle {
-            OsRawHandle::Fd(fd) => fd,
-        };
+        let OsRawHandle::Fd(fd) = self.io_handle;
         kqueue_syscall_blocking!({
             // Safety: `Close` owns this descriptor exclusively and consumes it.
             unsafe { rustix::io::try_close(fd) }

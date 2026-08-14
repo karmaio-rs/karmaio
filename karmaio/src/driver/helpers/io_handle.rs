@@ -237,13 +237,13 @@ impl<T> Deref for SharedIoHandle<T> {
 impl<T> Drop for SharedIoHandle<T> {
     fn drop(&mut self) {
         let mut state = self.inner.state.borrow_mut();
-        if let State::Waiting(_) = *state {
-            if let State::Waiting(waker) = mem::replace(&mut *state, State::Init) {
-                // Wake the task wanting to take/close this handle and let it try again.
-                // If it finds there are no more outstanding clones, it will succeed.
-                // Otherwise it will start a new Future, waiting for another drop.
-                waker.wake();
-            }
+        if let State::Waiting(_) = *state
+            && let State::Waiting(waker) = mem::replace(&mut *state, State::Init)
+        {
+            // Wake the task wanting to take/close this handle and let it try again.
+            // If it finds there are no more outstanding clones, it will succeed.
+            // Otherwise it will start a new Future, waiting for another drop.
+            waker.wake();
         }
     }
 }

@@ -67,7 +67,7 @@ impl Socket {
     }
 
     pub(crate) fn set_async_flags(&self) -> Result<()> {
-        configure_async_socket(&*self.handle)
+        configure_async_socket(&self.handle)
     }
 
     /// Creates a new network socket (TCP/UDP)

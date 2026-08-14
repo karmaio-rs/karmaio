@@ -76,7 +76,7 @@ impl Child {
     /// Attempts to reap the child without blocking. Returns `Ok(Some(status))`
     /// if it has exited, `Ok(None)` if it is still running.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        if let Some(status) = self.status.clone() {
+        if let Some(status) = self.status {
             return Ok(Some(status));
         }
         match self.child.as_mut() {
@@ -87,7 +87,7 @@ impl Child {
                 }
                 Ok(status)
             }
-            None => Ok(self.status.clone()),
+            None => Ok(self.status),
         }
     }
 
@@ -96,7 +96,7 @@ impl Child {
     /// Reaping is performed asynchronously: the blocking `wait` runs on the
     /// runtime's blocking pool, so the executor is never blocked on the child.
     pub async fn wait(&mut self) -> io::Result<ExitStatus> {
-        if let Some(status) = self.status.clone() {
+        if let Some(status) = self.status {
             return Ok(status);
         }
         if let Some(status) = self.try_wait()? {
@@ -115,7 +115,7 @@ impl Child {
 
         let status = spawn_blocking(move || child.wait())
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to wait for child"))??;
+            .map_err(|_| io::Error::other("failed to wait for child"))??;
         self.status = Some(status);
         Ok(status)
     }
@@ -192,10 +192,10 @@ impl Child {
 
         let stdout_data = out_handle
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to read child stdout"))??;
+            .map_err(|_| io::Error::other("failed to read child stdout"))??;
         let stderr_data = err_handle
             .await
-            .map_err(|_| io::Error::new(io::ErrorKind::Other, "failed to read child stderr"))??;
+            .map_err(|_| io::Error::other("failed to read child stderr"))??;
 
         let status = self.wait().await?;
         Ok(Output {
@@ -208,10 +208,10 @@ impl Child {
 
 impl Drop for Child {
     fn drop(&mut self) {
-        if self.kill_on_drop {
-            if let Some(child) = self.child.as_mut() {
-                let _ = child.kill();
-            }
+        if self.kill_on_drop
+            && let Some(child) = self.child.as_mut()
+        {
+            let _ = child.kill();
         }
     }
 }

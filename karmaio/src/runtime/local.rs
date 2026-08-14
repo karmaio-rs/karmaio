@@ -336,7 +336,7 @@ mod tests {
         let mut runtime = Runtime::new().expect("runtime should start");
         let task = runtime.spawn(async { 7usize });
 
-        let output = runtime.block_on(async { task.await });
+        let output = runtime.block_on(task);
 
         assert_eq!(output.expect("task should succeed"), 7);
     }
@@ -350,9 +350,7 @@ mod tests {
             7usize
         });
 
-        let err = runtime
-            .block_on(async { task.await })
-            .expect_err("task should report panic");
+        let err = runtime.block_on(task).expect_err("task should report panic");
 
         assert!(err.is_panic());
     }
@@ -363,9 +361,7 @@ mod tests {
         let task = runtime.spawn(pending::<usize>());
 
         task.abort();
-        let err = runtime
-            .block_on(async { task.await })
-            .expect_err("task should be cancelled");
+        let err = runtime.block_on(task).expect_err("task should be cancelled");
 
         assert!(err.is_cancelled());
     }
@@ -379,7 +375,7 @@ mod tests {
 
         // Fire-and-forget tasks (JoinHandle dropped) still in the local queue.
         for _ in 0..8 {
-            let _ = runtime.spawn(pending::<()>());
+            drop(runtime.spawn(pending::<()>()));
         }
 
         // One task that parks a waker on another thread, so a remote schedule
@@ -553,7 +549,7 @@ mod tests {
             waker.wake();
         });
 
-        let output = runtime.block_on(async { task.await });
+        let output = runtime.block_on(task);
         wake_thread.join().expect("wake thread should finish");
 
         assert_eq!(output.expect("task should succeed"), 11);
@@ -656,7 +652,7 @@ mod tests {
         second.block_on(async move { waker.wake_by_ref() });
         assert!(!task.is_finished());
 
-        let output = first.block_on(async move { task.await });
+        let output = first.block_on(task);
         assert_eq!(output.expect("task should finish on its own runtime"), 17);
     }
 
@@ -779,7 +775,7 @@ mod tests {
         // even though the spawned future itself was !Send.
         assert_send::<JoinHandle<usize>>();
 
-        let output = runtime.block_on(async { task.await });
+        let output = runtime.block_on(task);
         assert_eq!(output.expect("task should succeed"), 42);
     }
 
@@ -833,7 +829,7 @@ mod tests {
     fn spawn_blocking_returns_value() {
         let mut runtime = Runtime::new().expect("runtime should start");
         let handle = runtime.spawn_blocking(|| 42usize);
-        let output = runtime.block_on(async { handle.await });
+        let output = runtime.block_on(handle);
         assert_eq!(output.expect("blocking task should succeed"), 42);
     }
 
@@ -848,9 +844,7 @@ mod tests {
     fn spawn_blocking_reports_panics() {
         let mut runtime = Runtime::new().expect("runtime should start");
         let handle = runtime.spawn_blocking(|| panic!("blocking boom"));
-        let err = runtime
-            .block_on(async { handle.await })
-            .expect_err("blocking panic should surface");
+        let err = runtime.block_on(handle).expect_err("blocking panic should surface");
         assert!(err.is_panic());
     }
 

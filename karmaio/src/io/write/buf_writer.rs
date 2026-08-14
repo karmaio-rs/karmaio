@@ -120,7 +120,7 @@ impl<W: AsyncWrite> AsyncWrite for BufWriter<W> {
                     .copy_from_nonoverlapping(buf.as_init().as_ptr(), bytes_to_write);
             }
             self.written += bytes_to_write;
-            return BufResult(Ok(bytes_to_write), buf);
+            BufResult(Ok(bytes_to_write), buf)
         }
     }
 

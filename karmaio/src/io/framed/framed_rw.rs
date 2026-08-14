@@ -266,10 +266,10 @@ where
     }
 
     fn try_decode_eof(&mut self) -> Result<Option<C::Item>, C::Error> {
-        if !self.read.is_empty() {
-            if let Some(item) = self.try_decode()? {
-                return Ok(Some(item));
-            }
+        if !self.read.is_empty()
+            && let Some(item) = self.try_decode()?
+        {
+            return Ok(Some(item));
         }
 
         let frame = {

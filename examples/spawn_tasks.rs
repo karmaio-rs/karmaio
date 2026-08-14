@@ -44,9 +44,7 @@ fn main() {
         let handle = rt.spawn(pending::<()>());
         handle.abort();
 
-        let err = rt
-            .block_on(async { handle.await })
-            .expect_err("aborted task should error");
+        let err = rt.block_on(handle).expect_err("aborted task should error");
         assert!(err.is_cancelled());
         println!("  abort reported cancelled: {}", err);
     }
@@ -59,10 +57,10 @@ fn main() {
         let mut rt = Runtime::new().expect("runtime");
 
         // Dropping the handle detaches; the task is not cancelled.
-        let _ = rt.spawn(async {
+        drop(rt.spawn(async {
             sleep(Duration::from_millis(30)).await;
             println!("  detached task finished while runtime still drove work");
-        });
+        }));
 
         rt.block_on(async {
             // Give the detached task time to complete under this runtime.

@@ -625,9 +625,7 @@ impl KqueueBackend {
     /// after releasing the backend borrow. The payload remains in `op`.
     pub(crate) fn remove_op<T: KqueueOperation + 'static>(&mut self, op: &mut Op<T>) -> Option<Completion> {
         let key = op.key();
-        let Some(slot) = self.ops.get_mut(key) else {
-            return None;
-        };
+        let slot = self.ops.get_mut(key)?;
 
         match &slot.state {
             State::Submitted => {
@@ -795,10 +793,11 @@ impl KqueueBackend {
             // registered write operation so its syscall can observe EPIPE or
             // the platform's terminal result. Its own descriptor/filter is
             // validated before it is transitioned.
-            if event.readable && event.writable {
-                if let Some(&write_key) = self.interests.get(&(event.fd, Direction::Write)) {
-                    self.mark_ready(write_key, event.fd, Direction::Write, &mut deferred);
-                }
+            if event.readable
+                && event.writable
+                && let Some(&write_key) = self.interests.get(&(event.fd, Direction::Write))
+            {
+                self.mark_ready(write_key, event.fd, Direction::Write, &mut deferred);
             }
         }
 

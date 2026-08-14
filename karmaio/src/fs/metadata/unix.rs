@@ -69,7 +69,7 @@ impl MetadataExt for Metadata {
     }
 
     fn ino(&self) -> u64 {
-        self.stat.st_ino as u64
+        self.stat.st_ino
     }
 
     fn mode(&self) -> u32 {
@@ -81,11 +81,11 @@ impl MetadataExt for Metadata {
     }
 
     fn uid(&self) -> u32 {
-        self.stat.st_uid as u32
+        self.stat.st_uid
     }
 
     fn gid(&self) -> u32 {
-        self.stat.st_gid as u32
+        self.stat.st_gid
     }
 
     fn rdev(&self) -> u64 {
@@ -97,7 +97,7 @@ impl MetadataExt for Metadata {
     }
 
     fn atime(&self) -> i64 {
-        self.stat.st_atime as i64
+        self.stat.st_atime
     }
 
     fn atime_nsec(&self) -> i64 {
@@ -105,7 +105,7 @@ impl MetadataExt for Metadata {
     }
 
     fn mtime(&self) -> i64 {
-        self.stat.st_mtime as i64
+        self.stat.st_mtime
     }
 
     fn mtime_nsec(&self) -> i64 {
@@ -113,7 +113,7 @@ impl MetadataExt for Metadata {
     }
 
     fn ctime(&self) -> i64 {
-        self.stat.st_ctime as i64
+        self.stat.st_ctime
     }
 
     fn ctime_nsec(&self) -> i64 {
@@ -227,15 +227,15 @@ impl PermissionsExt for Permissions {
 }
 
 fn stat_atime_nsec(stat: &rustix::fs::Stat) -> i64 {
-    stat.st_atime_nsec as i64
+    stat.st_atime_nsec
 }
 
 fn stat_mtime_nsec(stat: &rustix::fs::Stat) -> i64 {
-    stat.st_mtime_nsec as i64
+    stat.st_mtime_nsec
 }
 
 fn stat_ctime_nsec(stat: &rustix::fs::Stat) -> i64 {
-    stat.st_ctime_nsec as i64
+    stat.st_ctime_nsec
 }
 
 fn timespec(secs: libc::time_t, nsecs: libc::c_long) -> io::Result<SystemTime> {

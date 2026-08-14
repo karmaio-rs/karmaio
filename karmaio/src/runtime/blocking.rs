@@ -776,7 +776,7 @@ mod tests {
         });
 
         let handle = spawn_blocking_task(&pool.handle(), wakeup, || 42usize);
-        assert_eq!(handle.is_finished(), false);
+        assert!(!handle.is_finished());
 
         let start = Instant::now();
         loop {

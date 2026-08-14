@@ -277,7 +277,7 @@ mod tests {
     fn run_ready<F: Future>(future: F) -> F::Output {
         let mut future = std::pin::pin!(future);
         let waker = std::task::Waker::noop();
-        let mut context = std::task::Context::from_waker(&waker);
+        let mut context = std::task::Context::from_waker(waker);
         match future.as_mut().poll(&mut context) {
             Poll::Ready(output) => output,
             Poll::Pending => panic!("test future unexpectedly yielded"),

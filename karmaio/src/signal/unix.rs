@@ -20,7 +20,7 @@ use std::{
     task::{Context, Poll, Waker},
 };
 
-use slab::Slab;
+use crate::slab::Slab;
 
 use crate::signal::half_lock::HalfLock;
 

@@ -26,6 +26,7 @@ pub mod process;
 pub mod signal;
 
 pub(crate) mod driver;
+pub(crate) mod slab;
 pub(crate) mod task;
 
 pub use builder::{RuntimeBuilder, RuntimeConfig};

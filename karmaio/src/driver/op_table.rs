@@ -5,7 +5,7 @@
 
 use std::io;
 
-use slab::Slab;
+use crate::slab::Slab;
 
 /// A generational identity for an operation stored by a backend.
 ///

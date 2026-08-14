@@ -209,6 +209,58 @@ impl Socket {
         op.await
     }
 
+    /// Receive into a runtime pool buffer (Linux only).
+    ///
+    /// See [`crate::buf::PooledBuf`] for lease ownership and pool starvation
+    /// risks. `len == 0` uses the full pool buffer size.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn recv_managed(&self, len: usize) -> Result<Option<crate::buf::PooledBuf>> {
+        let op = Op::recv_managed(&self.handle, len)?;
+        op.await
+    }
+
+    /// Multishot receive stream into runtime pool buffers (Linux only).
+    ///
+    /// See [`crate::buf::PooledBuf`] for lease ownership and pool starvation
+    /// risks. No auto-rearm: when the stream ends (including on `ENOBUFS`),
+    /// call again after recycling leases.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recv_multi(&self) -> Result<MultiOp<crate::driver::ops::recv_multi::RecvMulti>> {
+        MultiOp::recv_multi(&self.handle)
+    }
+
+    /// Managed UDP receive with truncation and message metadata (Linux only).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn recv_datagram_managed(
+        &self,
+        len: usize,
+        capture_peer: bool,
+    ) -> Result<crate::net::udp::RecvDatagram> {
+        let op = Op::recv_datagram_managed(&self.handle, len, capture_peer)?;
+        op.await
+    }
+
+    /// Multishot UDP receive with truncation and message metadata (Linux only).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recv_datagram_multi(
+        &self,
+        capture_peer: bool,
+    ) -> Result<MultiOp<crate::driver::ops::recv_from_multi::RecvFromMulti>> {
+        MultiOp::recv_datagram_multi(&self.handle, capture_peer)
+    }
+
+    /// Managed oneshot recv_from into a pool buffer (Linux only).
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn recv_from_managed(&self, len: usize) -> Result<crate::net::udp::RecvDatagram> {
+        self.recv_datagram_managed(len, true).await
+    }
+
+    /// Multishot recv_from stream into pool buffers (Linux only).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn recv_from_multi(&self) -> Result<MultiOp<crate::driver::ops::recv_from_multi::RecvFromMulti>> {
+        self.recv_datagram_multi(true)
+    }
+
     /// Reads a message from the socket along with the receiver address
     pub(crate) async fn recv_from<B: IoBufMut>(&self, buf: B) -> BufResult<(usize, SocketAddr), B> {
         let op = Op::recv_from(&self.handle, buf).unwrap();

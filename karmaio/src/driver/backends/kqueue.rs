@@ -554,7 +554,8 @@ pub(crate) struct KqueueBackend {
 }
 
 impl KqueueBackend {
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
+    pub(crate) fn new(config: crate::driver::DriverConfig) -> Result<Self> {
+        let capacity = config.capacity;
         Ok(Self {
             kqueue: Kqueue::new(capacity)?,
             ops: OpTable::new(capacity)?,
@@ -1080,7 +1081,13 @@ mod tests {
 
         #[test]
         fn duplicate_descriptor_filter_waiters_are_detected() {
-            let mut backend = KqueueBackend::new(8).expect("create backend");
+            let mut backend = KqueueBackend::new(crate::driver::DriverConfig {
+                capacity: 8,
+                buffer_pool_size: 64,
+                buffer_pool_buffer_len: 8192,
+                multishot_accept_capacity: 128,
+            })
+            .expect("create backend");
             let interest = Interest::new(42, Direction::Read);
             let key = backend
                 .ops
@@ -1104,7 +1111,13 @@ mod tests {
 
         #[test]
         fn read_eof_also_releases_pending_write_interest() {
-            let mut backend = KqueueBackend::new(8).expect("create backend");
+            let mut backend = KqueueBackend::new(crate::driver::DriverConfig {
+                capacity: 8,
+                buffer_pool_size: 64,
+                buffer_pool_buffer_len: 8192,
+                multishot_accept_capacity: 128,
+            })
+            .expect("create backend");
             let read_key = backend
                 .ops
                 .insert(Slot {

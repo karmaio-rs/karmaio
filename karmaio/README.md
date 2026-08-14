@@ -35,3 +35,26 @@ karmaio = { version = "0.1", features = ["macros", "net"] }
 # Filesystem + signals.
 karmaio = { version = "0.1", features = ["fs", "signal"] }
 ```
+
+## Linux multishot I/O (6.12+)
+
+On Linux, karmaio exposes explicit multishot and managed-buffer APIs (io_uring).
+There is **no kernel version probe**; callers must meet the **6.12+** floor.
+
+| API | Purpose |
+|-----|---------|
+| `TcpListener::incoming` / `UnixListener::incoming` | Multishot accept stream |
+| `TcpStream::recv_managed` / `recv_multi` (and Unix) | Pool-buffer oneshot / multishot stream receive |
+| `UdpSocket` managed / multishot receive methods | `RecvDatagram` with payload, peer, flags, and original length |
+
+Classic `read` / `recv` with user-owned buffers and `BufResult` remain unchanged.
+
+### Buffer pool and leases
+
+Managed receives use a **per-runtime** provided buffer pool (defaults: **64 buffers × 8192 bytes**, configured via `RuntimeBuilder::buffer_pool_size` / `buffer_pool_buffer_len`).
+
+- `karmaio::buf::PooledBuf` is a **lease**, not an owned allocation: drop it or call `release()` to return the slot to the pool.
+- Holding many leases without recycling can exhaust the pool; multishot streams then end with **`ENOBUFS`** (surfaced as an error item, then stream end). Multishot requests are **not auto-rearmed** — call `recv_multi` again after recycling if needed.
+- The pool is shared by all sockets on one runtime; retaining leases for one socket can starve unrelated sockets.
+
+See module docs on `karmaio::buf` and the `echo_tcp_recv_multi` example.

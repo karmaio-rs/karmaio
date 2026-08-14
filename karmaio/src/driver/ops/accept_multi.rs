@@ -6,7 +6,7 @@
 use std::io;
 use std::os::fd::{FromRawFd, RawFd};
 
-use crate::driver::backends::iouring::{Submission as UringSubmission, UringMultishotOperation};
+use crate::driver::backends::iouring::{MultishotCleanup, Submission as UringSubmission, UringMultishotOperation};
 use crate::driver::helpers::io_handle::SharedIoHandle;
 use crate::driver::helpers::socket::Socket;
 use crate::driver::ops::{Completion, MultiOp};
@@ -15,6 +15,7 @@ use crate::runtime::local::CURRENT_DRIVER;
 /// Multishot accept payload for a listening stream socket.
 pub(crate) struct AcceptMulti {
     io_handle: SharedIoHandle<socket2::Socket>,
+    pending_completion_limit: usize,
 }
 
 impl MultiOp<AcceptMulti> {
@@ -26,14 +27,13 @@ impl MultiOp<AcceptMulti> {
     ///
     /// Dropping the returned stream cancels the multishot request.
     pub(crate) fn accept_multi(io_handle: &SharedIoHandle<socket2::Socket>) -> io::Result<Self> {
-        let data = AcceptMulti {
-            io_handle: io_handle.clone(),
-        };
         CURRENT_DRIVER.with(|handle| {
-            handle
-                .upgrade()
-                .expect("Not in a runtime context")
-                .submit_multi_op(data)
+            let driver = handle.upgrade().expect("Not in a runtime context");
+            let data = AcceptMulti {
+                io_handle: io_handle.clone(),
+                pending_completion_limit: driver.multishot_accept_capacity(),
+            };
+            driver.submit_multi_op(data)
         })
     }
 }
@@ -51,20 +51,23 @@ unsafe impl UringMultishotOperation for AcceptMulti {
             .build()
     }
 
-    fn complete_item(&mut self, completion: Completion) -> Self::Item {
-        let raw_fd = completion.result? as RawFd;
-        // Safety: a successful multishot accept CQE transfers ownership of one
-        // new socket descriptor to userspace.
-        let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
-        let socket = Socket::from_socket(sock)?;
-        socket.set_async_flags()?;
-        Ok(socket)
+    fn complete_item(&mut self, completion: Completion) -> Option<Self::Item> {
+        Some((|| {
+            let raw_fd = completion.result? as RawFd;
+            // Safety: a successful multishot accept CQE transfers ownership of
+            // one new socket descriptor to userspace.
+            let sock = unsafe { socket2::Socket::from_raw_fd(raw_fd) };
+            let socket = Socket::from_socket(sock)?;
+            socket.set_async_flags()?;
+            Ok(socket)
+        })())
     }
 
-    fn discard_item(&mut self, completion: Completion) {
-        if let Ok(fd) = completion.result {
-            // Safety: undelivered successful accept CQEs still own the fd.
-            drop(unsafe { socket2::Socket::from_raw_fd(fd as RawFd) });
-        }
+    fn completion_cleanup(&self) -> MultishotCleanup {
+        MultishotCleanup::AcceptedFd
+    }
+
+    fn pending_completion_limit(&self) -> Option<usize> {
+        Some(self.pending_completion_limit)
     }
 }

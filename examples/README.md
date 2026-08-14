@@ -25,6 +25,7 @@ cargo run --example <example_name>
 |---------|-------------|
 | **echo_tcp** | TCP echo server; handles each connection with `spawn_local` (detached tasks). |
 | **echo_tcp_multi** | Same as `echo_tcp`, but uses `TcpListener::incoming` (Linux multishot accept under the hood). Requires Linux 6.12+. |
+| **echo_tcp_recv_multi** | TCP echo with `incoming()` + `TcpStream::recv_multi` (pool buffers / multishot recv). Requires Linux 6.12+. Recycle `PooledBuf` leases promptly. |
 | **accept_multi** | Minimal `incoming()` demo on `127.0.0.1:8081`. Requires Linux 6.12+. |
 | **hello_world** | TCP client; pairs with `echo_tcp` / `echo_tcp_multi` on `127.0.0.1:8080`. |
 | **udp_echo** | UDP echo server on `127.0.0.1:8080`. |
@@ -62,6 +63,10 @@ cargo run --example hello_world       # terminal 2
 cargo run --example echo_tcp_multi    # terminal 1
 cargo run --example hello_world       # terminal 2
 
+# TCP multishot accept + multishot managed recv (Linux 6.12+)
+cargo run --example echo_tcp_recv_multi  # terminal 1
+cargo run --example hello_world          # terminal 2
+
 # Minimal incoming() demo (Linux 6.12+)
 cargo run --example accept_multi      # terminal 1
 nc 127.0.0.1 8081                     # terminal 2
@@ -74,7 +79,8 @@ cargo run --example udp_client        # terminal 2
 ## Notes
 
 - All `#[karmaio::main]` examples drive a single-threaded runtime for the async entrypoint.
-- **echo_tcp_multi** and **accept_multi** are Linux-only (`incoming()` / multishot accept, kernel 6.12+). On other platforms they exit with a short message. The multishot SQE is not auto-rearmed after it ends.
+- **echo_tcp_multi**, **echo_tcp_recv_multi**, and **accept_multi** are Linux-only (io_uring multishot accept/recv, kernel 6.12+). On other platforms they exit with a short message. Multishot SQEs are not auto-rearmed after they end.
+- Managed / multishot recv uses a **per-runtime buffer pool**. Each `PooledBuf` is a lease: drop or `release()` it after use. Holding all leases without recycle can end multishot streams with `ENOBUFS`. See `karmaio::buf` pool docs. Pool size defaults to 64 × 8 KiB (`RuntimeBuilder::buffer_pool_size` / `buffer_pool_buffer_len`).
 - Dropping a `JoinHandle` **detaches** the task; use `abort()` to cancel. Await (or drop) handles before dropping a manually created `Runtime` — see **spawn_tasks**.
 - Dropping an in-progress I/O future (e.g. via `timeout`) detaches from the result; kernel work may still complete. See runtime docs for details.
 - The **signal** example may need signals sent from another terminal (or Ctrl-C).

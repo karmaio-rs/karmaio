@@ -69,6 +69,14 @@ pub(crate) mod connect;
 pub(crate) mod recv;
 #[cfg(feature = "net")]
 pub(crate) mod recv_from;
+#[cfg(all(feature = "net", target_os = "linux"))]
+pub(crate) mod recv_from_managed;
+#[cfg(all(feature = "net", target_os = "linux"))]
+pub(crate) mod recv_from_multi;
+#[cfg(all(feature = "net", target_os = "linux"))]
+pub(crate) mod recv_managed;
+#[cfg(all(feature = "net", target_os = "linux"))]
+pub(crate) mod recv_multi;
 #[cfg(feature = "net")]
 pub(crate) mod recvmsg;
 #[cfg(feature = "net")]
@@ -387,7 +395,13 @@ impl<T: Operation + 'static> Drop for Op<T> {
 pub(crate) struct MultiOp<T: UringMultishotOperation + 'static> {
     driver: Handle,
     key: OpKey,
-    data: Option<Box<T>>,
+    state: MultiOpState<T>,
+}
+
+#[cfg(target_os = "linux")]
+enum MultiOpState<T> {
+    Active(Box<T>),
+    Terminated,
 }
 
 #[cfg(target_os = "linux")]
@@ -396,7 +410,7 @@ impl<T: UringMultishotOperation + 'static> MultiOp<T> {
         Self {
             driver,
             key,
-            data: Some(data),
+            state: MultiOpState::Active(data),
         }
     }
 
@@ -405,11 +419,25 @@ impl<T: UringMultishotOperation + 'static> MultiOp<T> {
     }
 
     pub(crate) fn take_data(&mut self) -> Option<Box<T>> {
-        self.data.take()
+        match std::mem::replace(&mut self.state, MultiOpState::Terminated) {
+            MultiOpState::Active(data) => Some(data),
+            MultiOpState::Terminated => None,
+        }
     }
 
     pub(crate) fn data_mut(&mut self) -> Option<&mut T> {
-        self.data.as_deref_mut()
+        match &mut self.state {
+            MultiOpState::Active(data) => Some(data),
+            MultiOpState::Terminated => None,
+        }
+    }
+
+    fn is_terminated(&self) -> bool {
+        matches!(self.state, MultiOpState::Terminated)
+    }
+
+    fn finish(&mut self) {
+        self.state = MultiOpState::Terminated;
     }
 }
 
@@ -434,13 +462,28 @@ impl<T: UringMultishotOperation + 'static> Future for MultiOpNext<'_, T> {
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.get_mut();
-        let driver = this.op.driver.upgrade().expect("Not in runtime context");
+        if this.op.is_terminated() {
+            return Poll::Ready(None);
+        }
+        let Some(driver) = this.op.driver.upgrade() else {
+            this.op.finish();
+            return Poll::Ready(None);
+        };
         match driver.poll_multi_op(this.op, cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                this.op.finish();
+                Poll::Ready(None)
+            }
             Poll::Ready(Some(completion)) => {
                 let data = this.op.data_mut().expect("multishot op data missing while streaming");
-                Poll::Ready(Some(UringMultishotOperation::complete_item(data, completion)))
+                let item = UringMultishotOperation::complete_item(data, completion);
+                if item.is_none() {
+                    // `None` is operation-level termination. Retire or cancel
+                    // the backend slot before making the stream terminal.
+                    driver.remove_multi_op(this.op);
+                }
+                Poll::Ready(item)
             }
         }
     }

@@ -9,6 +9,7 @@ use std::net::SocketAddr;
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::path::PathBuf;
 use std::thread;
+use std::time::Duration;
 
 use karmaio::io::{AsyncReadExt, AsyncWriteExt, Stream};
 use karmaio::net::tcp::{TcpListener, TcpStream};
@@ -140,4 +141,31 @@ async fn tcp_incoming_with_spawned_handlers() {
     }
 
     server.await.expect("server task");
+}
+
+#[karmaio::test(multishot_accept_capacity = 1)]
+async fn tcp_incoming_capacity_closes_overflow_and_ends_stream() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let mut incoming = listener.incoming().expect("incoming");
+
+    let clients = thread::spawn(move || {
+        (0..4)
+            .filter_map(|_| std::net::TcpStream::connect(addr).ok())
+            .collect::<Vec<_>>()
+    });
+
+    // Drive the ring without consuming accepts so the pending limit is hit.
+    karmaio::time::sleep(Duration::from_millis(50)).await;
+
+    let (accepted, _) = incoming.next().await.expect("queued accept").expect("accept ok");
+    drop(accepted);
+    let error = match incoming.next().await.expect("capacity item") {
+        Ok(_) => panic!("capacity must terminate the request"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+    assert!(incoming.next().await.is_none());
+
+    drop(clients.join().expect("client thread"));
 }

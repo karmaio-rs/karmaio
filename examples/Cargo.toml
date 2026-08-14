@@ -77,5 +77,10 @@ name = "runtime_builder"
 path = "runtime_builder.rs"
 
 [[example]]
+name = "echo_tcp_recv_multi"
+path = "echo_tcp_recv_multi.rs"
+required-features = ["macros", "net"]
+
+[[example]]
 name = "spawn_tasks"
 path = "spawn_tasks.rs"

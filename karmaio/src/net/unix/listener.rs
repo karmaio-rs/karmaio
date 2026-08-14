@@ -25,6 +25,8 @@ pub struct UnixListener {
 /// Produced by [`UnixListener::incoming`]. Thin public mapping over the shared
 /// [`Socket`] accept stream. Dropping the stream cancels the underlying accept
 /// request.
+/// Pending accepted sockets are bounded by
+/// [`RuntimeBuilder::multishot_accept_capacity`](crate::RuntimeBuilder::multishot_accept_capacity).
 ///
 /// # Implementation notes
 ///
@@ -99,6 +101,8 @@ impl UnixListener {
     /// does not probe the kernel version. The multishot request is **not**
     /// re-armed after it ends; call this method again to start a new stream.
     /// Dropping the returned stream cancels the in-flight request.
+    /// Reaching its pending-connection capacity closes overflow sockets and
+    /// terminates the stream with a capacity error after queued connections.
     #[cfg(target_os = "linux")]
     #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
     pub fn incoming(&self) -> std::io::Result<UnixIncoming> {

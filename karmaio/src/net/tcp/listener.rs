@@ -39,6 +39,8 @@ pub struct TcpListener {
 /// karmaio does not probe the kernel version at runtime. The multishot SQE is
 /// **not** automatically re-armed after it terminates (error, cancel, or kernel
 /// disarm). Call [`TcpListener::incoming`] again to start a new request.
+/// Pending accepted sockets are bounded by
+/// [`RuntimeBuilder::multishot_accept_capacity`](crate::RuntimeBuilder::multishot_accept_capacity).
 #[cfg(target_os = "linux")]
 #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
 pub struct TcpIncoming {
@@ -114,6 +116,9 @@ impl TcpListener {
     /// does not probe the kernel version. The multishot request is **not**
     /// re-armed after it ends; call this method again to start a new stream.
     /// Dropping the returned stream cancels the in-flight request.
+    /// If its pending-connection capacity is reached, overflow sockets are
+    /// closed and the stream terminates with a capacity error after yielding
+    /// connections that were already queued.
     ///
     /// # Concurrent use
     ///

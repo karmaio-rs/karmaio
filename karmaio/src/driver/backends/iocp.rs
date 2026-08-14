@@ -375,7 +375,8 @@ pub(crate) struct IocpBackend {
 }
 
 impl IocpBackend {
-    pub(crate) fn new(capacity: usize) -> Result<Self> {
+    pub(crate) fn new(config: crate::driver::DriverConfig) -> Result<Self> {
+        let capacity = config.capacity;
         let port = Arc::new(CompletionPort::new()?);
         let registrar = NEXT_REGISTRAR.fetch_add(1, Ordering::Relaxed);
         let association = IocpAssociation {

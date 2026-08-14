@@ -98,8 +98,17 @@ impl Runtime {
 
     /// Build a runtime from an explicit [`RuntimeConfig`].
     pub(crate) fn from_config(config: RuntimeConfig) -> io::Result<Self> {
+        config.validate()?;
         let blocking = BlockingPool::new(config.blocking_threads, config.blocking_keep_alive);
-        let driver = Driver::new(blocking.handle(), config.driver_capacity)?;
+        let driver = Driver::new(
+            blocking.handle(),
+            crate::driver::DriverConfig {
+                capacity: config.driver_capacity,
+                buffer_pool_size: config.buffer_pool_size,
+                buffer_pool_buffer_len: config.buffer_pool_buffer_len,
+                multishot_accept_capacity: config.multishot_accept_capacity,
+            },
+        )?;
         let mut scheduler = Scheduler::default();
         scheduler.set_wakeup(driver.wakeup());
 

@@ -56,7 +56,7 @@ rustix = { version = "1.0.5", default-features = false, features = ["event", "fs
 
 # Linux platform dependencies
 [target.'cfg(target_os = "linux")'.dependencies]
-io-uring = "0.7"
+io-uring = "0.7.13"
 
 # Windows platform dependencies
 # Core IOCP / foundation features always enabled; Storage / Console / Security
@@ -80,6 +80,18 @@ required-features = ["macros", "net"]
 
 [[test]]
 name = "accept_multi"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "recv_managed"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "recv_multi"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "recv_from_managed"
 required-features = ["macros", "net"]
 
 [[test]]

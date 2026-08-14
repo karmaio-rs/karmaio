@@ -17,6 +17,21 @@ pub(super) mod helpers;
 pub(crate) mod op_table;
 pub(crate) mod ops;
 
+/// Platform driver construction parameters (from [`crate::RuntimeConfig`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct DriverConfig {
+    pub capacity: usize,
+    /// Linux io_uring provided buffer pool size (rounded up to a power of two).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub buffer_pool_size: u16,
+    /// Linux io_uring provided buffer length in bytes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub buffer_pool_buffer_len: usize,
+    /// Per-stream pending connection limit for Linux multishot accept.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub multishot_accept_capacity: usize,
+}
+
 #[cfg(target_os = "linux")]
 use crate::driver::backends::iouring::UringMultishotOperation;
 #[cfg(windows)]
@@ -55,8 +70,8 @@ pub(crate) struct Handle {
 }
 
 impl Driver {
-    pub(crate) fn new(blocking: BlockingPoolHandle, capacity: usize) -> io::Result<Self> {
-        let backend = Rc::new(RefCell::new(PlatformBackend::new(capacity)?));
+    pub(crate) fn new(blocking: BlockingPoolHandle, config: DriverConfig) -> io::Result<Self> {
+        let backend = Rc::new(RefCell::new(PlatformBackend::new(config)?));
         // Create the wakeup token while we have access to the (non-Send) backend.
         // The token itself is Send+Sync+Clone and captures only thread-safe poke data.
         let wakeup = {
@@ -72,6 +87,21 @@ impl Driver {
             #[cfg(windows)]
             association,
         })
+    }
+
+    /// Return a handle to this runtime's provided buffer pool (Linux only).
+    ///
+    /// The pool is created lazily on first use. See [`crate::buf::BufferPool`]
+    /// and [`crate::buf::PooledBuf`] for ownership and starvation notes.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn buffer_pool(&self) -> io::Result<crate::buf::BufferPool> {
+        self.backend.borrow_mut().buffer_pool()
+    }
+
+    /// Return the per-stream pending connection limit for multishot accept.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn multishot_accept_capacity(&self) -> usize {
+        self.backend.borrow().multishot_accept_capacity()
     }
 
     pub(crate) fn submit_op<T: Operation + 'static>(&self, data: T) -> io::Result<Op<T>> {
@@ -101,10 +131,11 @@ impl Driver {
     /// Cancel a multishot operation (called from [`MultiOp`] drop).
     #[cfg(target_os = "linux")]
     pub(crate) fn remove_multi_op<T: UringMultishotOperation + 'static>(&self, op: &mut MultiOp<T>) {
+        let key = op.key();
         let Some(data) = op.take_data() else {
             return;
         };
-        self.backend.borrow_mut().remove_multi_op(op.key(), data);
+        self.backend.borrow_mut().remove_multi_op(key, data);
     }
 
     #[cfg(target_os = "linux")]

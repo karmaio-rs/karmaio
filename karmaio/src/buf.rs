@@ -6,6 +6,8 @@ mod io_buf_mut_ext;
 mod io_vec_buf;
 mod io_vec_buf_iter;
 mod io_vec_buf_mut;
+#[cfg(target_os = "linux")]
+mod pool;
 mod slice;
 mod uninit_slice;
 
@@ -17,6 +19,11 @@ pub use io_buf_mut_ext::IoBufMutExt;
 pub use io_vec_buf::IoVectoredBuf;
 pub use io_vec_buf_iter::VectoredBufIterator;
 pub use io_vec_buf_mut::IoVectoredBufMut;
+#[cfg(target_os = "linux")]
+#[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+pub use pool::PooledBuf;
+#[cfg(target_os = "linux")]
+pub(crate) use pool::{BufferPool, BufferPoolRoot, MAX_BUFFER_RING_ENTRIES};
 pub use slice::{Slice, VectoredSlice};
 pub use uninit_slice::UninitSlice;
 

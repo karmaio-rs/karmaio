@@ -5,6 +5,8 @@ use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
 use socket2::SockAddr;
 
+#[cfg(target_os = "linux")]
+use crate::buf::PooledBuf;
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
@@ -30,6 +32,66 @@ use std::os::windows::io::{AsRawSocket, FromRawSocket, RawSocket};
 /// still closes the OS handle synchronously when the last reference is dropped.
 pub struct UdpSocket {
     pub(super) inner: Socket,
+}
+
+/// Message flags returned with a managed UDP datagram (Linux only).
+#[cfg(target_os = "linux")]
+#[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RecvFlags(u32);
+
+#[cfg(target_os = "linux")]
+impl RecvFlags {
+    pub(crate) fn from_bits(bits: u32) -> Self {
+        Self(bits)
+    }
+
+    /// Return the platform `MSG_*` bits reported by the kernel.
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Whether the datagram payload was larger than the returned buffer.
+    pub fn is_truncated(self) -> bool {
+        self.0 & libc::MSG_TRUNC as u32 != 0
+    }
+
+    /// Whether ancillary data was truncated.
+    pub fn is_control_truncated(self) -> bool {
+        self.0 & libc::MSG_CTRUNC as u32 != 0
+    }
+}
+
+/// One datagram received into a runtime-provided buffer (Linux only).
+#[cfg(target_os = "linux")]
+#[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+#[derive(Debug)]
+pub struct RecvDatagram {
+    /// Received payload bytes. This is a lease on the runtime buffer pool.
+    pub buffer: PooledBuf,
+    /// Sending peer when the address-returning API was used.
+    pub peer: Option<SocketAddr>,
+    /// Message flags reported by `recvmsg`.
+    pub flags: RecvFlags,
+    /// Original datagram payload length before any truncation.
+    pub original_len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl RecvDatagram {
+    pub(crate) fn new(buffer: PooledBuf, peer: Option<SocketAddr>, flags: u32, original_len: usize) -> Self {
+        Self {
+            buffer,
+            peer,
+            flags: RecvFlags::from_bits(flags),
+            original_len,
+        }
+    }
+
+    /// Whether the original datagram did not fit in the returned buffer.
+    pub fn is_truncated(&self) -> bool {
+        self.flags.is_truncated() || self.original_len > self.buffer.len()
+    }
 }
 
 impl UdpSocket {
@@ -95,8 +157,6 @@ impl UdpSocket {
     /// * Result containing bytes written on success
     /// * The original `io_slices` `Vec<B>`
     /// * The original `msg_contol` `Option<C>`
-    ///
-    /// Consider using [`Self::sendmsg_zc`] for a zero-copy alternative.
     pub async fn sendmsg<V: IoVectoredBuf, C: IoBuf>(
         &self,
         io_slices: V,
@@ -111,6 +171,68 @@ impl UdpSocket {
     /// Returns the original buffer and quantity of data read.
     pub async fn recv<B: IoBufMut>(&self, buf: B) -> BufResult<usize, B> {
         self.inner.recv(buf).await
+    }
+
+    /// Receive into a runtime-provided buffer (Linux only).
+    ///
+    /// Intended for **connected** UDP sockets (no peer address is returned).
+    /// For unconnected sockets that need the sender address, use
+    /// classic [`recv_from`](Self::recv_from) or a managed `recv_from` API
+    /// when available.
+    ///
+    /// The returned [`RecvDatagram::buffer`] is a **lease**: drop or release it
+    /// promptly. Holding many leases without
+    /// recycling can exhaust the pool and fail later receives with `ENOBUFS`.
+    ///
+    /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub async fn recv_managed(&self, len: usize) -> std::io::Result<RecvDatagram> {
+        self.inner.recv_datagram_managed(len, false).await
+    }
+
+    /// Multishot receive stream of runtime-provided buffers (Linux only).
+    ///
+    /// Intended for **connected** UDP. See
+    /// [`TcpStream::recv_multi`](crate::net::tcp::TcpStream::recv_multi) for end
+    /// conditions and buffer lease / `ENOBUFS` guidance.
+    ///
+    /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub fn recv_multi(&self) -> std::io::Result<impl crate::io::Stream<Item = std::io::Result<RecvDatagram>> + use<>> {
+        self.inner.recv_datagram_multi(false)
+    }
+
+    /// Receive a datagram into a runtime-provided buffer with peer address
+    /// (Linux only).
+    ///
+    /// Zero-length datagrams have an empty [`RecvDatagram::buffer`].
+    /// `len == 0` uses the full pool buffer size.
+    ///
+    /// The returned payload buffer is a lease; release it promptly to avoid
+    /// pool exhaustion (`ENOBUFS`).
+    ///
+    /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub async fn recv_from_managed(&self, len: usize) -> std::io::Result<RecvDatagram> {
+        self.inner.recv_from_managed(len).await
+    }
+
+    /// Multishot datagram stream with peer addresses (Linux only).
+    ///
+    /// Each item is a [`RecvDatagram`]. Same end conditions as
+    /// [`recv_multi`](Self::recv_multi): no auto-rearm; recycle leases to
+    /// avoid `ENOBUFS`.
+    ///
+    /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub fn recv_from_multi(
+        &self,
+    ) -> std::io::Result<impl crate::io::Stream<Item = std::io::Result<RecvDatagram>> + use<>> {
+        self.inner.recv_from_multi()
     }
 
     /// Receives a single datagram message on the socket.

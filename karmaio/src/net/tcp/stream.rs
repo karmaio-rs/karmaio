@@ -2,6 +2,11 @@ use std::net::SocketAddr;
 #[cfg(unix)]
 use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 
+#[cfg(target_os = "linux")]
+use crate::{
+    buf::PooledBuf,
+    io::{AsyncReadManaged, AsyncReadMulti, Stream},
+};
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
@@ -104,6 +109,39 @@ impl TcpStream {
     pub fn split(&self) -> (ReadHalf<'_, Self>, WriteHalf<'_, Self>) {
         split(self)
     }
+
+    /// Receive into a runtime-provided buffer (Linux only).
+    ///
+    /// Returns `Ok(None)` on EOF. `len == 0` uses the full pool buffer size.
+    ///
+    /// The returned [`PooledBuf`] is a **lease**: drop or
+    /// [`PooledBuf::release`] it promptly. Holding many leases without
+    /// recycling can exhaust the pool and fail later receives with `ENOBUFS`.
+    ///
+    /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub async fn recv_managed(&self, len: usize) -> std::io::Result<Option<PooledBuf>> {
+        self.inner.recv_managed(len).await
+    }
+
+    /// Multishot receive stream of runtime-provided buffers (Linux only).
+    ///
+    /// One submission produces many completions until the kernel ends the
+    /// request (final CQE without `MORE`), including on `ENOBUFS` when the
+    /// pool is empty. There is **no auto-rearm**: call again after recycling
+    /// outstanding [`PooledBuf`] leases if you need more data.
+    ///
+    /// Each item is a pool **lease**. Drop or [`PooledBuf::release`] promptly;
+    /// holding every buffer without recycle is the usual cause of `ENOBUFS`.
+    /// Each completion may use the full configured pool-buffer capacity.
+    ///
+    /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
+    #[cfg(target_os = "linux")]
+    #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
+    pub fn recv_multi(&self) -> std::io::Result<impl Stream<Item = std::io::Result<PooledBuf>> + use<>> {
+        self.inner.recv_multi()
+    }
 }
 
 impl AsyncRead for &TcpStream {
@@ -125,6 +163,38 @@ impl AsyncRead for TcpStream {
     async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
         let (result, bufs) = self.inner.recvmsg(bufs).await.into_parts();
         BufResult(result.map(|(n, _)| n), bufs)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncReadManaged for TcpStream {
+    type Buffer = PooledBuf;
+
+    async fn read_managed(&mut self, len: usize) -> std::io::Result<Option<Self::Buffer>> {
+        self.recv_managed(len).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncReadManaged for &TcpStream {
+    type Buffer = PooledBuf;
+
+    async fn read_managed(&mut self, len: usize) -> std::io::Result<Option<Self::Buffer>> {
+        self.recv_managed(len).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncReadMulti for TcpStream {
+    fn read_multi(&mut self) -> std::io::Result<impl Stream<Item = std::io::Result<Self::Buffer>>> {
+        self.recv_multi()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl AsyncReadMulti for &TcpStream {
+    fn read_multi(&mut self) -> std::io::Result<impl Stream<Item = std::io::Result<Self::Buffer>>> {
+        self.recv_multi()
     }
 }
 

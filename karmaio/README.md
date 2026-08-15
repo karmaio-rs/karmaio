@@ -1,8 +1,9 @@
 # karmaio
 
-A modern fast multi-threaded share-nothing asynchronous runtime for Rust.
+A modern, fast, share-nothing asynchronous runtime for Rust, using io_uring on Linux, IOCP on Windows, and kqueue on macOS and BSDs.
 
-### Currently in progress.
+> **Alpha status:** This is an early release intended for evaluation and experimentation.
+> APIs and runtime behavior may change between alpha releases.
 
 ## Feature flags
 
@@ -24,16 +25,16 @@ The core runtime (`Runtime`, tasks, timers, `io` traits, buffers, and the platfo
 
 ```toml
 # Full public API (apps / demos).
-karmaio = { version = "0.1", features = ["full"] }
+karmaio = { version = "0.1.0-alpha.1", features = ["full"] }
 
 # Core runtime only.
-karmaio = "0.1"
+karmaio = "0.1.0-alpha.1"
 
 # Networking + attribute macros.
-karmaio = { version = "0.1", features = ["macros", "net"] }
+karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net"] }
 
 # Filesystem + signals.
-karmaio = { version = "0.1", features = ["fs", "signal"] }
+karmaio = { version = "0.1.0-alpha.1", features = ["fs", "signal"] }
 ```
 
 ## Linux multishot I/O (6.12+)
@@ -57,4 +58,8 @@ Managed receives use a **per-runtime** provided buffer pool (defaults: **64 buff
 - Holding many leases without recycling can exhaust the pool; multishot streams then end with **`ENOBUFS`** (surfaced as an error item, then stream end). Multishot requests are **not auto-rearmed** — call `recv_multi` again after recycling if needed.
 - The pool is shared by all sockets on one runtime; retaining leases for one socket can starve unrelated sockets.
 
-See module docs on `karmaio::buf` and the `echo_tcp_recv_multi` example.
+See the module docs on `karmaio::buf` and the [`echo_tcp_recv_multi` example](https://github.com/karmaio-rs/karmaio/blob/main/examples/echo_tcp_recv_multi.rs).
+
+## License
+
+Licensed under either the Apache License, Version 2.0 or the MIT License, at your option.

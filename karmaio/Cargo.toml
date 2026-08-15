@@ -1,19 +1,20 @@
 [package]
 name = "karmaio"
-description = "A modern fast multi-threaded share-nothing asynchronous runtime for Rust"
-repository = "https://github.com/octavezero/karmaio"
-homepage = "https://github.com/octavezero/karmaio"
+description = "A modern, fast, share-nothing asynchronous runtime for Rust"
+repository.workspace = true
+documentation = "https://docs.rs/karmaio"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
-authors = ["Tarak Sharma <tarak@taraksharma.com>"]
+authors.workspace = true
+license.workspace = true
 
-version = "0.1.0"
+version.workspace = true
+publish = ["crates-io"]
 
 categories = ["asynchronous", "network-programming"]
-keywords = ["io", "thread-per-core", "iouring", "async", "futures"]
+keywords = ["io", "thread-per-core", "io-uring", "async", "futures"]
 
-rust-version = "1.90"
-edition = "2024"
+edition.workspace = true
+rust-version.workspace = true
 
 [features]
 # Include nothing by default. Opt into subsystems you need, or enable `full` for the complete public API.
@@ -46,7 +47,7 @@ signal = ["windows-sys/Win32_System_Console"]
 socket2 = { version = "0.6", features = ["all"], optional = true }
 
 # Internal package dependeices for redistribution
-karmaio-macros = { path = "../karmaio-macros", version = "0.1.0", optional = true }
+karmaio-macros = { path = "../karmaio-macros", version = "=0.1.0-alpha.1", optional = true }
 
 # Unix platform dependencies
 [target.'cfg(unix)'.dependencies]

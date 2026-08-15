@@ -1,11 +1,15 @@
 [package]
 name = "karmaio-macros"
-version = "0.1.0"
-edition = "2024"
-rust-version = "1.90"
 description = "Attribute macros for the karmaio runtime (proc-macro crate)"
-license = "MIT OR Apache-2.0"
-authors = ["Tarak Sharma <tarak@taraksharma.com>"]
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+documentation = "https://docs.rs/karmaio"
+readme = "README.md"
+publish = ["crates-io"]
 
 [lib]
 proc-macro = true

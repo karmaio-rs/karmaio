@@ -7,12 +7,14 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["full"]
-full = ["fs", "macros", "net", "process", "signal"]
+full = ["fs", "macros", "net", "process", "signal", "bytes", "memmap2"]
 fs = ["karmaio/fs"]
 macros = ["karmaio/macros"]
 net = ["karmaio/net"]
 process = ["karmaio/process"]
 signal = ["karmaio/signal"]
+bytes = ["karmaio/bytes"]
+memmap2 =["karmaio/memmap2"]
 
 [dependencies]
 karmaio = { path = "../karmaio", default-features = false }

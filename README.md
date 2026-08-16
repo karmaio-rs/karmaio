@@ -16,6 +16,8 @@ Heavy subsystems are feature-gated so consumers can trim compile time and binary
 | `net`     | TCP / UDP / Unix sockets (`socket2`)                 |
 | `process` | Child processes and async stdio                      |
 | `signal`  | Ctrl-C and Unix signal handling                      |
+| `bytes`   | `IoBuf` / `IoBufMut` for `bytes::{Bytes, BytesMut}`  |
+| `memmap2` | `IoBuf` / `IoBufMut` for `memmap2::{Mmap, MmapMut}`  |
 | `full`    | All of the above                                     |
 | `default` | Empty                                                |
 

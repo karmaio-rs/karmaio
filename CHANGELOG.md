@@ -7,6 +7,11 @@ During the `0.1.0` alpha series, APIs and behavior may change between prerelease
 
 ## [Unreleased]
 
+### Added
+
+- Optional `bytes` feature with `IoBuf` impls for `bytes::Bytes` / `bytes::BytesMut` and `IoBufMut` / `SetLen` for `bytes::BytesMut`.
+- Optional `memmap2` feature with `IoBuf` impls for `memmap2::Mmap` / `memmap2::MmapMut` and `IoBufMut` / `SetLen` for `memmap2::MmapMut`.
+
 ## [0.1.0-alpha.1] - 2026-08-15
 
 ### Added

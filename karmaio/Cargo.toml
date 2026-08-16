@@ -21,7 +21,7 @@ rust-version.workspace = true
 default = []
 
 # Enable every optional subsystem.
-full = ["fs", "macros", "net", "process", "signal"]
+full = ["fs", "macros", "net", "process", "signal", "bytes", "memmap2"]
 
 # Asynchronous filesystem APIs (`karmaio::fs`) and path/file driver ops.
 # On Windows, pulls in file-system Win32 APIs used by open/stat/path ops.
@@ -42,8 +42,16 @@ process = ["windows-sys/Win32_Storage_FileSystem"]
 # On Windows, enables console control handler APIs.
 signal = ["windows-sys/Win32_System_Console"]
 
+# `IoBuf` / `IoBufMut` impls for `bytes::{Bytes, BytesMut}`.
+bytes = ["dep:bytes"]
+
+# `IoBuf` / `IoBufMut` impls for `memmap2::{Mmap, MmapMut}`.
+memmap2 = ["dep:memmap2"]
+
 # Core dependencies. Cross Platform
 [dependencies]
+bytes = { version = "1", optional = true }
+memmap2 = { version = "0.9.11", optional = true }
 socket2 = { version = "0.6", features = ["all"], optional = true }
 
 # Internal package dependeices for redistribution

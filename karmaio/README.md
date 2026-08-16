@@ -18,6 +18,8 @@ The core runtime (`Runtime`, tasks, timers, `io` traits, buffers, and the platfo
 | `net`     | `karmaio::net` (TCP/UDP/Unix), socket ops, and the `socket2` dependency |
 | `process` | `karmaio::process`, child stdio pipe I/O, and process-wait ops          |
 | `signal`  | `karmaio::signal` (Ctrl-C and Unix signals)                             |
+| `bytes`   | `IoBuf` / `IoBufMut` impls for `bytes::{Bytes, BytesMut}`               |
+| `memmap2` | `IoBuf` / `IoBufMut` impls for `memmap2::{Mmap, MmapMut}`               |
 | `full`    | All of the above                                                        |
 | `default` | Empty (nothing enabled)                                                 |
 

@@ -23,7 +23,7 @@ use crate::io::Stream;
 //
 // The owned resource is a `socket2::Socket` so control-plane APIs (listen, nodelay,
 // etc.) go through `AttachedHandle`/`Deref` without reconverting through raw FDs.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Socket {
     pub(crate) handle: AttachedHandle<socket2::Socket>,
 }
@@ -48,7 +48,15 @@ fn configure_async_socket(socket: &socket2::Socket) -> Result<()> {
     #[cfg(target_vendor = "apple")]
     {
         // Avoid SIGPIPE killing the process when writing to a closed socket.
-        socket.set_nosigpipe(true)?;
+        // macOS can reject SO_NOSIGPIPE on Unix domain sockets (and accepted
+        // sockets inherit it from the listener anyway), so skip unix sockets.
+        let is_unix = socket
+            .local_addr()
+            .map(|a| i32::from(a.family()) == libc::AF_UNIX)
+            .unwrap_or(false);
+        if !is_unix {
+            socket.set_nosigpipe(true)?;
+        }
     }
     Ok(())
 }

@@ -122,6 +122,16 @@ impl<T> Deref for AttachedHandle<T> {
 }
 
 impl<T> AttachedHandle<T> {
+    /// Whether both handles refer to the same underlying resource.
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        self.source.ptr_eq(&other.source)
+    }
+
+    /// Number of strong references to the underlying resource.
+    pub(crate) fn strong_count(&self) -> usize {
+        self.source.strong_count()
+    }
+
     /// Consume the associated handle and return the inner [`SharedIoHandle`].
     ///
     /// This is useful when you need to call methods that take `self` by value,

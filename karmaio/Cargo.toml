@@ -67,12 +67,14 @@ rustix = { version = "1.0.5", default-features = false, features = ["event", "fs
 io-uring = "0.7.13"
 
 # Windows platform dependencies
-# Core IOCP / foundation features always enabled; Storage / Console / Security
-# are activated by the `fs`, `process`, and `signal` crate features above.
+# Core IOCP / foundation features are always enabled. File-system completion
+# configuration is also required by the IOCP driver itself; Console and Security
+# remain activated by their respective crate features.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
     "Win32_System_IO",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
@@ -84,6 +86,18 @@ required-features = ["macros"]
 
 [[test]]
 name = "framed_tcp"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "owned_split_contract"
+required-features = ["net"]
+
+[[test]]
+name = "tcp_owned_split"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "unix_owned_split"
 required-features = ["macros", "net"]
 
 [[test]]

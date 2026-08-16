@@ -11,7 +11,9 @@ use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
     io::{AsyncRead, AsyncWrite},
-    net::split::{ReadHalf, WriteHalf, split},
+    net::split::{
+        IntoOwnedSplit, OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, ReuniteOwned, WriteHalf, split,
+    },
 };
 
 #[cfg(windows)]
@@ -108,6 +110,16 @@ impl TcpStream {
     /// independently spawned tasks.
     pub fn split(&self) -> (ReadHalf<'_, Self>, WriteHalf<'_, Self>) {
         split(self)
+    }
+
+    /// Splits a [`TcpStream`] into an owned read half and an owned write half,
+    /// which can be used to read and write the stream concurrently.
+    ///
+    /// Unlike [`split`](Self::split), each half owns the socket and can be
+    /// moved into a separately spawned local task. Reunite matching halves
+    /// with [`OwnedReadHalf::reunite`].
+    pub fn into_split(self) -> (OwnedReadHalf<Self>, OwnedWriteHalf<Self>) {
+        <Self as IntoOwnedSplit>::into_split(self)
     }
 
     /// Receive into a runtime-provided buffer (Linux only).
@@ -269,6 +281,32 @@ impl AsRawSocket for TcpStream {
 impl From<Socket> for TcpStream {
     fn from(inner: Socket) -> Self {
         Self { inner }
+    }
+}
+
+impl IntoOwnedSplit for TcpStream {
+    type ReadHalf = OwnedReadHalf<Self>;
+    type WriteHalf = OwnedWriteHalf<Self>;
+
+    fn into_split(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        let read = OwnedReadHalf {
+            inner: self.inner.clone(),
+            _stream: std::marker::PhantomData,
+        };
+        let write = OwnedWriteHalf {
+            inner: self.inner,
+            shutdown_on_drop: true,
+            _stream: std::marker::PhantomData,
+        };
+        (read, write)
+    }
+}
+
+impl ReuniteOwned for TcpStream {
+    type ReuniteError = ReuniteError<OwnedReadHalf<Self>, OwnedWriteHalf<Self>>;
+
+    fn reunite(read: Self::ReadHalf, write: Self::WriteHalf) -> Result<Self, Self::ReuniteError> {
+        read.reunite(write)
     }
 }
 

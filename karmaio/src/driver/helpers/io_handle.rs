@@ -69,6 +69,19 @@ impl<T> SharedIoHandle<T> {
             .expect("SharedIoHandle used after close transferred ownership"))
     }
 
+    /// Whether both handles refer to the same underlying resource.
+    pub(crate) fn ptr_eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    /// Number of strong references to the underlying resource.
+    ///
+    /// Clones held by in-flight operations and by application owners each
+    /// increment this count. A count of 1 means this handle is exclusive.
+    pub(crate) fn strong_count(&self) -> usize {
+        Rc::strong_count(&self.inner)
+    }
+
     /// Try to unwrap the owned resource if this is the unique strong reference.
     /// Does not close the resource.
     #[allow(dead_code)]

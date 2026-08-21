@@ -72,9 +72,15 @@ pub(crate) struct RecvFrom<B: IoBufMut> {
 }
 
 impl<B: IoBufMut> Op<RecvFrom<B>> {
-    pub(crate) fn recv_from(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> io::Result<Op<RecvFrom<B>>> {
+    // On failure the buffer is returned with the error; the kernel never
+    // observed the operation.
+    pub(crate) fn recv_from(
+        io_handle: &SharedIoHandle<socket2::Socket>,
+        buf: B,
+    ) -> std::result::Result<Op<RecvFrom<B>>, (io::Error, B)> {
         #[cfg(any(target_os = "linux", windows))]
-        let socket_addr = Box::new(unsafe { SockAddr::try_init(|_, _| Ok(()))?.1 });
+        // Infallible: the initializer closure always returns `Ok`.
+        let socket_addr = Box::new(unsafe { SockAddr::try_init(|_, _| Ok(())).expect("sockaddr init cannot fail").1 });
 
         let data = RecvFrom {
             io_handle: io_handle.clone(),
@@ -99,7 +105,13 @@ impl<B: IoBufMut> Op<RecvFrom<B>> {
             received_address: None,
         };
 
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        CURRENT_DRIVER.with(|handle| {
+            handle
+                .upgrade()
+                .expect("Not in a runtime context")
+                .try_submit_op(data)
+                .map_err(|(error, data)| (error, data.buf))
+        })
     }
 }
 

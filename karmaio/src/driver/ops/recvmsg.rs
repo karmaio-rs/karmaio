@@ -40,10 +40,13 @@ pub(crate) struct RecvMsg<V: IoVectoredBufMut> {
 }
 
 impl<V: IoVectoredBufMut> Op<RecvMsg<V>> {
-    pub(crate) fn recvmsg(io_handle: &SharedIoHandle<socket2::Socket>, bufs: V) -> std::io::Result<Op<RecvMsg<V>>> {
+    // On failure the buffers are returned with the error; the kernel never
+    // observed the operation.
+    pub(crate) fn recvmsg(io_handle: &SharedIoHandle<socket2::Socket>, bufs: V) -> Result<Op<RecvMsg<V>>, (std::io::Error, V)> {
         let data = RecvMsg {
             io_handle: io_handle.clone(),
-            socket_addr: Box::new(unsafe { SockAddr::try_init(|_, _| Ok(()))?.1 }),
+            // Infallible: the initializer closure always returns `Ok`.
+            socket_addr: Box::new(unsafe { SockAddr::try_init(|_, _| Ok(())).expect("sockaddr init cannot fail").1 }),
             bufs,
             #[cfg(unix)]
             iovs: Vec::new(),
@@ -55,7 +58,13 @@ impl<V: IoVectoredBufMut> Op<RecvMsg<V>> {
             socket_addr_len: Box::new(0),
         };
 
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        CURRENT_DRIVER.with(|handle| {
+            handle
+                .upgrade()
+                .expect("Not in a runtime context")
+                .try_submit_op(data)
+                .map_err(|(error, data)| (error, data.bufs))
+        })
     }
 }
 

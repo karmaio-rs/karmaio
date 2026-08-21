@@ -113,7 +113,17 @@ enum State {
     Ready,
     Waiting(Waker),
     Completed(Completion),
-    Ignored(Box<dyn IgnoredOp>),
+    /// Future dropped. Payload retained only for in-flight blocking work.
+    Detached(Box<dyn IgnoredOp>),
+    /// Cancel requested while the future may still be observed.
+    Canceling {
+        observer: CancelObserver,
+    },
+}
+
+enum CancelObserver {
+    Waiting(Waker),
+    Detached(Box<dyn IgnoredOp>),
 }
 
 trait IgnoredOp: 'static {
@@ -146,12 +156,30 @@ impl State {
                     (false, None, None)
                 }
             }
-            State::Ignored(_) => {
-                if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
+            State::Detached(_) => {
+                if let State::Detached(payload) = std::mem::replace(self, State::Submitted) {
                     let action = DeferredAction::new(move || payload.cleanup(completion));
                     return (true, None, Some(action));
                 }
                 (true, None, None)
+            }
+            State::Canceling { .. } => {
+                let old = std::mem::replace(self, State::Submitted);
+                match old {
+                    State::Canceling {
+                        observer: CancelObserver::Waiting(waker),
+                    } => {
+                        *self = State::Completed(completion);
+                        (false, Some(waker), None)
+                    }
+                    State::Canceling {
+                        observer: CancelObserver::Detached(payload),
+                    } => {
+                        let action = DeferredAction::new(move || payload.cleanup(completion));
+                        (true, None, Some(action))
+                    }
+                    _ => unreachable!("canceling replace mismatch"),
+                }
             }
             // Ignore duplicate readiness/completion notifications. The first
             // terminal result remains available for the future to consume.
@@ -173,10 +201,17 @@ impl State {
                     (false, None)
                 }
             }
-            State::Ignored(..) => (true, None),
-            State::Ready | State::Completed(..) => (false, None),
+            State::Detached(..)
+            | State::Canceling {
+                observer: CancelObserver::Detached(..),
+            } => (true, None),
+            State::Canceling { .. } | State::Ready | State::Completed(..) => (false, None),
         }
     }
+}
+
+fn canceled_completion() -> Completion {
+    Completion::new(Err(Error::from_raw_os_error(libc::ECANCELED)))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -603,15 +638,29 @@ impl KqueueBackend {
         }))
     }
 
-    pub(crate) fn submit_op<T: KqueueOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+    /// Submit a oneshot operation.
+    ///
+    /// On failure the error is paired with the operation payload so callers
+    /// that own buffers can recover them; the kernel never observed the op.
+    pub(crate) fn submit_op<T: KqueueOperation + 'static>(
+        &mut self,
+        data: T,
+        handle: Handle,
+    ) -> std::result::Result<Op<T>, (io::Error, T)> {
         if self.shutting_down {
-            return Err(Error::new(io::ErrorKind::BrokenPipe, "kqueue backend is shutting down"));
+            return Err((
+                Error::new(io::ErrorKind::BrokenPipe, "kqueue backend is shutting down"),
+                data,
+            ));
         }
 
-        let key = self.ops.insert(Slot {
+        let key = match self.ops.insert(Slot {
             state: State::Submitted,
             registration: None,
-        })?;
+        }) {
+            Ok(key) => key,
+            Err(error) => return Err((error, data)),
+        };
 
         // Keep the operation at a stable address before it can be attempted.
         // Readiness retries and blocking completion may outlive the future.
@@ -628,7 +677,7 @@ impl KqueueBackend {
         let slot = self.ops.get_mut(key)?;
 
         match &slot.state {
-            State::Submitted => {
+            State::Submitted | State::Ready => {
                 self.ops.remove(key);
                 let _ = op.take_data();
                 None
@@ -644,8 +693,23 @@ impl KqueueBackend {
                     // A blocking-pool job still owns the operation payload so
                     // late completion can clean up resources it produces.
                     let data = op.take_data().expect("op data missing on detach");
-                    self.ops.get_mut(key).expect("waiting op missing").state = State::Ignored(data);
+                    self.ops.get_mut(key).expect("waiting op missing").state = State::Detached(data);
                 }
+                None
+            }
+            State::Canceling {
+                observer: CancelObserver::Waiting(_),
+            } => {
+                if let Some(registration) = self.take_registration(key) {
+                    let _ = self.kqueue.delete(registration.interest, key);
+                    self.ops.remove(key);
+                    let _ = op.take_data();
+                    return None;
+                }
+                let data = op.take_data().expect("op data missing on cancel detach");
+                self.ops.get_mut(key).expect("canceling op missing").state = State::Canceling {
+                    observer: CancelObserver::Detached(data),
+                };
                 None
             }
             State::Completed(_) => {
@@ -655,12 +719,55 @@ impl KqueueBackend {
                     _ => None,
                 }
             }
-            State::Ready => {
-                self.ops.remove(key);
-                let _ = op.take_data();
-                None
+            State::Detached(..)
+            | State::Canceling {
+                observer: CancelObserver::Detached(..),
+            } => unreachable!("invalid operation state"),
+        }
+    }
+
+    /// Request eager cancellation of a submitted oneshot operation.
+    ///
+    /// Readiness ops complete immediately after `EV_DELETE`. Blocking-pool
+    /// jobs stay until the pool posts a completion.
+    pub(crate) fn cancel_op(&mut self, key: OpKey) {
+        let previous = {
+            let Some(slot) = self.ops.get_mut(key) else {
+                return;
+            };
+            std::mem::replace(&mut slot.state, State::Submitted)
+        };
+        match previous {
+            State::Submitted | State::Ready => {
+                if let Some(slot) = self.ops.get_mut(key) {
+                    slot.state = State::Completed(canceled_completion());
+                }
             }
-            State::Ignored(..) => unreachable!("invalid operation state"),
+            State::Waiting(waker) => {
+                if let Some(registration) = self.take_registration(key) {
+                    let _ = self.kqueue.delete(registration.interest, key);
+                    if let Some(slot) = self.ops.get_mut(key) {
+                        slot.state = State::Completed(canceled_completion());
+                    }
+                    waker.wake();
+                } else if let Some(slot) = self.ops.get_mut(key) {
+                    slot.state = State::Canceling {
+                        observer: CancelObserver::Waiting(waker),
+                    };
+                }
+            }
+            State::Detached(payload) => {
+                if let Some(slot) = self.ops.get_mut(key) {
+                    slot.state = State::Canceling {
+                        observer: CancelObserver::Detached(payload),
+                    };
+                }
+            }
+            other @ (State::Canceling { .. } | State::Completed(_)) => {
+                if let Some(slot) = self.ops.get_mut(key) {
+                    slot.state = other;
+                }
+            }
         }
     }
 
@@ -738,7 +845,21 @@ impl KqueueBackend {
                 self.ops.get_mut(key).expect("operation removed while waiting").state = State::Waiting(waker);
                 Poll::Pending
             }
-            State::Ignored(..) => unreachable!("invalid operation state"),
+            State::Canceling {
+                observer: CancelObserver::Waiting(mut waker),
+            } => {
+                if !waker.will_wake(cx.waker()) {
+                    waker.clone_from(cx.waker());
+                }
+                self.ops.get_mut(key).expect("operation removed while canceling").state = State::Canceling {
+                    observer: CancelObserver::Waiting(waker),
+                };
+                Poll::Pending
+            }
+            State::Detached(..)
+            | State::Canceling {
+                observer: CancelObserver::Detached(..),
+            } => unreachable!("invalid operation state"),
         }
     }
 
@@ -917,7 +1038,11 @@ impl KqueueBackend {
             let Some(slot) = self.ops.remove(key) else {
                 continue;
             };
-            if let State::Ignored(payload) = slot.state {
+            if let State::Detached(payload)
+            | State::Canceling {
+                observer: CancelObserver::Detached(payload),
+            } = slot.state
+            {
                 deferred.push(DeferredAction::new(move || {
                     payload.cleanup(Completion::new(Err(Error::other(
                         "kqueue backend shut down before operation completion",
@@ -976,7 +1101,7 @@ mod tests {
     #[test]
     fn detached_completion_runs_typed_cleanup() {
         let cleaned = Arc::new(AtomicBool::new(false));
-        let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
+        let mut state = State::Detached(Box::new(CleanupMarker(cleaned.clone())));
 
         let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
         assert!(remove);

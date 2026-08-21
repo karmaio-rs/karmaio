@@ -1,8 +1,9 @@
 //! Async timers: `sleep`, `interval`, and `timeout`.
 //!
 //! Note on `timeout`: when the deadline fires, the inner future is **dropped**.
-//! For I/O that means the op is *detached* (buffers stay alive until the kernel
-//! finishes); it is not always an immediate kernel cancel. See the runtime
+//! For ordinary I/O that means the op is *detached* (buffers stay alive until
+//! the kernel finishes). Use [`karmaio::io::Canceller`] with Cancellable read/write
+//! to request eager cancellation and await the buffer back. See the runtime
 //! docs on I/O cancellation.
 //!
 //! ```text

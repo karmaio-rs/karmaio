@@ -36,12 +36,14 @@ pub(crate) struct SendMsg<V: IoVectoredBuf, C: IoBuf> {
 }
 
 impl<V: IoVectoredBuf, C: IoBuf> Op<SendMsg<V, C>> {
+    // On failure the buffers are returned with the error; the kernel never
+    // observed the operation.
     pub(crate) fn sendmsg(
         io_handle: &SharedIoHandle<socket2::Socket>,
         bufs: V,
         control: Option<C>,
         socket_addr: Option<SocketAddr>,
-    ) -> std::io::Result<Op<SendMsg<V, C>>> {
+    ) -> Result<Op<SendMsg<V, C>>, (std::io::Error, V)> {
         let data = SendMsg {
             io_handle: io_handle.clone(),
             socket_addr: socket_addr.map(|addr| Box::new(SockAddr::from(addr))),
@@ -55,7 +57,13 @@ impl<V: IoVectoredBuf, C: IoBuf> Op<SendMsg<V, C>> {
             wsa_bufs: Vec::new(),
         };
 
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        CURRENT_DRIVER.with(|handle| {
+            handle
+                .upgrade()
+                .expect("Not in a runtime context")
+                .try_submit_op(data)
+                .map_err(|(error, data)| (error, data.bufs))
+        })
     }
 }
 

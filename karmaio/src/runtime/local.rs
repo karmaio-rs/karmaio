@@ -48,13 +48,19 @@ scoped_thread_local!(pub(crate) static CURRENT_TIMER: Rc<RefCell<Timer>>);
 ///
 /// # I/O cancellation
 ///
-/// Dropping an in-progress I/O future (for example via `select!` or a timeout)
-/// **detaches** from the result; it does not always cancel the kernel
-/// operation. On Linux (io_uring) the submission stays in flight until
-/// completion and buffers remain alive until then. IOCP requests cancel; kqueue
-/// removes readiness interest. Buffers and other op state are kept alive until
-/// the kernel (or blocking pool) finishes, so this is memory-safe, but it is
-/// not the same as eager cancellation.
+/// There are two verbs:
+///
+/// - **Detach** — dropping an in-progress I/O future (for example via `select!`
+///   or a timeout) detaches from the result. It does not always cancel the
+///   kernel operation. On Linux (io_uring) the submission stays in flight until
+///   completion and buffers remain alive until then. IOCP requests cancel;
+///   kqueue removes readiness interest. This is memory-safe, but a silent peer
+///   can hold the buffer and socket reference indefinitely.
+/// - **Cancel** — [`crate::io::Canceller::cancel`] requests platform
+///   cancellation of a [`crate::io::AsyncReadCancellable`] /
+///   [`crate::io::AsyncWriteCancellable`] operation. Await the same future to
+///   observe a terminal outcome and recover the buffer. A completion that races
+///   cancellation may still return `Ok`. See [`crate::io::is_operation_canceled`].
 pub struct Runtime {
     pub(crate) scheduler: Scheduler,
     pub(crate) timer: Rc<RefCell<Timer>>,

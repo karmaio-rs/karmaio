@@ -12,7 +12,9 @@ use std::{
 };
 
 use windows_sys::Win32::{
-    Foundation::{ERROR_NOT_FOUND, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, WAIT_TIMEOUT},
+    Foundation::{
+        ERROR_NOT_FOUND, ERROR_OPERATION_ABORTED, HANDLE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError, WAIT_TIMEOUT,
+    },
     Storage::FileSystem::SetFileCompletionNotificationModes,
     System::IO::{
         CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx, OVERLAPPED, OVERLAPPED_ENTRY,
@@ -168,7 +170,18 @@ enum State {
     Submitted,
     Waiting(Waker),
     Completed(Completion),
-    Ignored(Box<dyn IgnoredOp>),
+    /// Future dropped. Payload retained until the completion packet.
+    Detached(Box<dyn IgnoredOp>),
+    /// Cancel requested while the future may still be observed.
+    Canceling {
+        observer: CancelObserver,
+    },
+}
+
+enum CancelObserver {
+    Pending,
+    Waiting(Waker),
+    Detached(Box<dyn IgnoredOp>),
 }
 
 trait IgnoredOp: 'static {
@@ -206,12 +219,36 @@ impl State {
                 }
                 (false, None, None)
             }
-            State::Ignored(_) => {
-                if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
+            State::Detached(_) => {
+                if let State::Detached(payload) = std::mem::replace(self, State::Submitted) {
                     let action = DeferredAction::new(move || payload.cleanup(completion));
                     return (true, None, Some(action));
                 }
                 (true, None, None)
+            }
+            State::Canceling { .. } => {
+                let old = std::mem::replace(self, State::Submitted);
+                match old {
+                    State::Canceling {
+                        observer: CancelObserver::Pending,
+                    } => {
+                        *self = State::Completed(completion);
+                        (false, None, None)
+                    }
+                    State::Canceling {
+                        observer: CancelObserver::Waiting(waker),
+                    } => {
+                        *self = State::Completed(completion);
+                        (false, Some(waker), None)
+                    }
+                    State::Canceling {
+                        observer: CancelObserver::Detached(payload),
+                    } => {
+                        let action = DeferredAction::new(move || payload.cleanup(completion));
+                        (true, None, Some(action))
+                    }
+                    _ => unreachable!("canceling replace mismatch"),
+                }
             }
             // Ignore duplicate terminal packets. The first completion remains
             // available for the future to consume.
@@ -226,7 +263,7 @@ impl State {
 // `Interest`, whose boxed OVERLAPPED stores this same index so completions can
 // find the slot without looking at the completion key.
 //
-// After detach, the typed op payload lives in `State::Ignored` so a late
+// After detach, the typed op payload lives in `State::Detached` so a late
 // completion packet can cleanup produced resources (accept sockets, open handles).
 struct Slot {
     state: State,
@@ -413,11 +450,22 @@ impl IocpBackend {
 }
 
 impl IocpBackend {
-    pub(crate) fn submit_op<T: IocpOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+    /// Submit a oneshot operation.
+    ///
+    /// On failure the error is paired with the operation payload so callers
+    /// that own buffers can recover them; the kernel never observed the op.
+    pub(crate) fn submit_op<T: IocpOperation + 'static>(
+        &mut self,
+        data: T,
+        handle: Handle,
+    ) -> std::result::Result<Op<T>, (Error, T)> {
         if self.shutting_down {
-            return Err(Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "IOCP backend is shutting down",
+            return Err((
+                Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "IOCP backend is shutting down",
+                ),
+                data,
             ));
         }
 
@@ -425,11 +473,14 @@ impl IocpBackend {
         // pointers. Moving the returned future only moves this box.
         let mut data = Box::new(data);
 
-        let key = self.ops.insert(Slot {
+        let key = match self.ops.insert(Slot {
             state: State::Submitted,
             interest: None,
             blocking_job: None,
-        })?;
+        }) {
+            Ok(key) => key,
+            Err(error) => return Err((error, *data)),
+        };
 
         match IocpOperation::submit(&mut *data) {
             IocpSubmission::Ready(completion) => {
@@ -444,9 +495,12 @@ impl IocpBackend {
                 let address = interest.as_ptr() as usize;
                 if self.pending_by_overlapped.insert(address, key).is_some() {
                     let _ = self.ops.remove(key);
-                    return Err(Error::new(
-                        std::io::ErrorKind::Other,
-                        "duplicate IOCP OVERLAPPED address",
+                    return Err((
+                        Error::new(
+                            std::io::ErrorKind::Other,
+                            "duplicate IOCP OVERLAPPED address",
+                        ),
+                        *data,
                     ));
                 }
                 self.ops.get_mut(key).expect("inserted IOCP operation missing").interest = Some(interest);
@@ -485,7 +539,16 @@ impl IocpBackend {
                 if let Some(interest) = slot.interest.as_ref() {
                     IocpOperation::cancel(&mut *data, interest);
                 }
-                slot.state = State::Ignored(data);
+                slot.state = State::Detached(data);
+                None
+            }
+            State::Canceling {
+                observer: CancelObserver::Pending | CancelObserver::Waiting(_),
+            } => {
+                let data = op.take_data().expect("op data missing on cancel detach");
+                slot.state = State::Canceling {
+                    observer: CancelObserver::Detached(data),
+                };
                 None
             }
             State::Completed(_) => {
@@ -497,7 +560,55 @@ impl IocpBackend {
                     _ => None,
                 }
             }
-            State::Ignored(..) => unreachable!("invalid operation state"),
+            State::Detached(..)
+            | State::Canceling {
+                observer: CancelObserver::Detached(..),
+            } => unreachable!("invalid operation state"),
+        }
+    }
+
+    /// Request eager cancellation of a submitted oneshot operation.
+    ///
+    /// Uses `CancelIoEx` on the exact overlapped structure. The observing
+    /// future stays pending until the completion packet arrives.
+    pub(crate) fn cancel_op(&mut self, key: OpKey) {
+        let Some(slot) = self.ops.get_mut(key) else {
+            return;
+        };
+        match std::mem::replace(&mut slot.state, State::Submitted) {
+            State::Submitted => {
+                if slot.blocking_job.take().is_some() {
+                    slot.state = State::Completed(Completion::new(Err(Error::from_raw_os_error(
+                        ERROR_OPERATION_ABORTED as i32,
+                    ))));
+                    return;
+                }
+                if let Some(interest) = slot.interest.as_ref() {
+                    cancel_pending(interest);
+                }
+                slot.state = State::Canceling {
+                    observer: CancelObserver::Pending,
+                };
+            }
+            State::Waiting(waker) => {
+                if let Some(interest) = slot.interest.as_ref() {
+                    cancel_pending(interest);
+                }
+                slot.state = State::Canceling {
+                    observer: CancelObserver::Waiting(waker),
+                };
+            }
+            State::Detached(payload) => {
+                if let Some(interest) = slot.interest.as_ref() {
+                    cancel_pending(interest);
+                }
+                slot.state = State::Canceling {
+                    observer: CancelObserver::Detached(payload),
+                };
+            }
+            other @ (State::Canceling { .. } | State::Completed(_)) => {
+                slot.state = other;
+            }
         }
     }
 
@@ -538,6 +649,21 @@ impl IocpBackend {
                 }
                 Poll::Pending
             }
+            State::Canceling {
+                observer: observer @ CancelObserver::Pending,
+            } => {
+                *observer = CancelObserver::Waiting(cx.waker().clone());
+                Poll::Pending
+            }
+            State::Canceling {
+                observer: CancelObserver::Waiting(waker),
+                ..
+            } => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+                Poll::Pending
+            }
             State::Completed(_) => match self
                 .ops
                 .remove(op.key())
@@ -547,8 +673,10 @@ impl IocpBackend {
                 State::Completed(completion) => Poll::Ready(completion),
                 _ => unreachable!("invalid operation"),
             },
-            // The op has been ignored/cancelled by the caller. It should not be polled again
-            State::Ignored(..) => {
+            State::Detached(..)
+            | State::Canceling {
+                observer: CancelObserver::Detached(..),
+            } => {
                 unreachable!("invalid operation")
             }
         }
@@ -670,35 +798,42 @@ impl IocpBackend {
         self.shutting_down = true;
         self.wakeup.close();
         for (_, slot) in self.ops.iter_mut() {
-            match slot.state {
+            match std::mem::replace(&mut slot.state, State::Submitted) {
                 State::Submitted | State::Waiting(..) => {
-                    // In-flight ops must be canceled and then drained from the
-                    // completion port before their OVERLAPPED memory can go.
-                    // Preserve an existing Ignored cleanup when present; otherwise
-                    // install Detached (Op::drop should already have moved data).
                     if let Some(interest) = slot.interest.as_ref() {
                         cancel_pending(interest);
                     }
-                    if !matches!(slot.state, State::Ignored(..)) {
-                        slot.state = State::Ignored(Box::new(Detached));
+                    slot.state = State::Detached(Box::new(Detached));
+                }
+                State::Canceling {
+                    observer: CancelObserver::Pending | CancelObserver::Waiting(_),
+                } => {
+                    if let Some(interest) = slot.interest.as_ref() {
+                        cancel_pending(interest);
                     }
+                    slot.state = State::Canceling {
+                        observer: CancelObserver::Detached(Box::new(Detached)),
+                    };
                 }
-                State::Ignored(..) => {
-                    // Already canceled by the future drop path; the drain loop
-                    // below will wait for its completion packet.
+                other @ (State::Detached(..)
+                | State::Canceling {
+                    observer: CancelObserver::Detached(..),
                 }
-                State::Completed(..) => {
-                    // Completion has already been dispatched, so no kernel
-                    // reference remains.
+                | State::Completed(..)) => {
+                    slot.state = other;
                 }
             }
         }
 
-        while self
-            .ops
-            .iter()
-            .any(|(_, slot)| matches!(slot.state, State::Ignored(..)))
-        {
+        while self.ops.iter().any(|(_, slot)| {
+            matches!(
+                slot.state,
+                State::Detached(..)
+                    | State::Canceling {
+                        observer: CancelObserver::Detached(..),
+                    }
+            )
+        }) {
             if self.wait().is_err() {
                 continue;
             }
@@ -780,7 +915,7 @@ mod tests {
     #[test]
     fn detached_completion_runs_typed_cleanup() {
         let cleaned = Arc::new(AtomicBool::new(false));
-        let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
+        let mut state = State::Detached(Box::new(CleanupMarker(cleaned.clone())));
 
         let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
         assert!(remove);

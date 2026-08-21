@@ -105,7 +105,29 @@ impl Driver {
     }
 
     pub(crate) fn submit_op<T: Operation + 'static>(&self, data: T) -> io::Result<Op<T>> {
+        match self.try_submit_op(data) {
+            Ok(op) => Ok(op),
+            // The payload is dropped here; callers that own buffers should use
+            // `try_submit_op` to recover it.
+            Err((error, _data)) => Err(error),
+        }
+    }
+
+    /// Submit an operation, returning the payload back on failure.
+    ///
+    /// Failure means the kernel never observed the operation (runtime shutting
+    /// down or driver table exhaustion), so the payload is safe to reuse. The
+    /// payload carries buffers and must be returned to the caller.
+    pub(crate) fn try_submit_op<T: Operation + 'static>(&self, data: T) -> std::result::Result<Op<T>, (io::Error, T)> {
         self.backend.borrow_mut().submit_op(data, self.into())
+    }
+
+    /// Request eager cancellation of a submitted oneshot operation.
+    ///
+    /// Generation-checked and idempotent. Does not complete the observing
+    /// future; the target completion is the ownership boundary.
+    pub(crate) fn cancel_op(&self, key: crate::driver::ops::OpKey) {
+        self.backend.borrow_mut().cancel_op(key);
     }
 
     /// Submit a multishot operation and return a stream of completions.
@@ -243,6 +265,12 @@ impl AsRawFd for Driver {
 }
 
 impl Handle {
+    pub(crate) fn cancel_op(&self, key: crate::driver::ops::OpKey) {
+        if let Some(driver) = self.upgrade() {
+            driver.cancel_op(key);
+        }
+    }
+
     pub(crate) fn upgrade(&self) -> Option<Driver> {
         let backend = self.backend.upgrade()?;
         Some(Driver {

@@ -97,7 +97,19 @@ name = "tcp_owned_split"
 required-features = ["macros", "net"]
 
 [[test]]
+name = "tcp_cancel"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "udp_cancel"
+required-features = ["macros", "net"]
+
+[[test]]
 name = "unix_owned_split"
+required-features = ["macros", "net"]
+
+[[test]]
+name = "unix_cancel"
 required-features = ["macros", "net"]
 
 [[test]]

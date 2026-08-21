@@ -126,31 +126,57 @@ impl MultishotCleanup {
 }
 
 enum State {
+    Oneshot(OneshotState),
+    Multishot(MultishotState),
+}
+
+enum OneshotState {
     Submitted,
     Waiting(Waker),
     Completed(Completion),
-    Ignored(Box<dyn IgnoredOp>),
+    /// Future dropped without cancel. Payload retained until the target CQE.
+    Detached(Box<dyn IgnoredOp>),
+    /// Cancel requested. Slot is not recyclable until the target CQE.
+    Canceling {
+        observer: CancelObserver,
+        sqe: CancelSqe,
+    },
+}
 
+enum CancelObserver {
+    /// Cancel requested before the future registered a waker.
+    Pending,
+    Waiting(Waker),
+    Detached(Box<dyn IgnoredOp>),
+}
+
+#[derive(Clone, Copy)]
+enum CancelSqe {
+    NeedPush,
+    InFlight,
+}
+
+enum MultishotState {
     /// Multishot request still armed in the kernel.
-    MultishotActive {
+    Active {
         waker: Option<Waker>,
         pending: VecDeque<Completion>,
         cleanup: MultishotCleanup,
         pending_limit: Option<usize>,
     },
     /// Capacity was exceeded; discard new CQEs until cancellation terminates.
-    MultishotStopping {
+    Stopping {
         waker: Option<Waker>,
         pending: VecDeque<Completion>,
         cleanup: MultishotCleanup,
     },
     /// Final CQE received (`!MORE`); drain remaining items then free the slot.
-    MultishotFinished {
+    Finished {
         pending: VecDeque<Completion>,
         cleanup: MultishotCleanup,
     },
     /// Stream dropped; cancel in flight. Discard late CQEs with typed cleanup.
-    MultishotCancelled {
+    Cancelled {
         pending: VecDeque<Completion>,
         cleanup: MultishotCleanup,
         /// Pointer-bearing SQE storage retained until the terminal CQE.
@@ -182,33 +208,8 @@ impl State {
     /// release its backend borrow first.
     fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>, Option<DeferredAction>) {
         match self {
-            State::Submitted => {
-                *self = State::Completed(completion);
-                (false, None, None)
-            }
-            State::Waiting(_) => {
-                let old = std::mem::replace(self, State::Completed(completion));
-                if let State::Waiting(waker) = old {
-                    return (false, Some(waker), None);
-                }
-                (false, None, None)
-            }
-            State::Ignored(_) => {
-                if let State::Ignored(payload) = std::mem::replace(self, State::Submitted) {
-                    let action = DeferredAction::new(move || payload.cleanup(completion));
-                    return (true, None, Some(action));
-                }
-                (true, None, None)
-            }
-            // A duplicate CQE is stale input. Keep the first terminal result
-            // and let the future consume it normally.
-            State::Completed(..) => (false, None, None),
-            State::MultishotActive { .. }
-            | State::MultishotStopping { .. }
-            | State::MultishotFinished { .. }
-            | State::MultishotCancelled { .. } => {
-                unreachable!("oneshot complete on multishot state")
-            }
+            State::Oneshot(oneshot) => oneshot.complete(completion),
+            State::Multishot(_) => unreachable!("oneshot complete on multishot state"),
         }
     }
 
@@ -221,7 +222,134 @@ impl State {
         more: bool,
     ) -> (bool, Option<Waker>, Option<DeferredAction>, bool) {
         match self {
-            State::MultishotActive {
+            State::Multishot(multishot) => multishot.push(completion, more),
+            State::Oneshot(_) => unreachable!("multishot CQE on oneshot state"),
+        }
+    }
+
+    fn is_multishot(&self) -> bool {
+        matches!(self, State::Multishot(_))
+    }
+
+    fn needs_cancel_push(&self) -> bool {
+        match self {
+            State::Oneshot(OneshotState::Canceling {
+                sqe: CancelSqe::NeedPush,
+                ..
+            }) => true,
+            State::Multishot(MultishotState::Cancelled { .. }) => false,
+            _ => false,
+        }
+    }
+}
+
+impl OneshotState {
+    fn complete(&mut self, completion: Completion) -> (bool, Option<Waker>, Option<DeferredAction>) {
+        match self {
+            OneshotState::Submitted => {
+                *self = OneshotState::Completed(completion);
+                (false, None, None)
+            }
+            OneshotState::Waiting(_) => {
+                let old = std::mem::replace(self, OneshotState::Completed(completion));
+                if let OneshotState::Waiting(waker) = old {
+                    return (false, Some(waker), None);
+                }
+                (false, None, None)
+            }
+            OneshotState::Detached(_) => {
+                if let OneshotState::Detached(payload) = std::mem::replace(self, OneshotState::Submitted) {
+                    let action = DeferredAction::new(move || payload.cleanup(completion));
+                    return (true, None, Some(action));
+                }
+                (true, None, None)
+            }
+            OneshotState::Canceling { .. } => {
+                let old = std::mem::replace(self, OneshotState::Submitted);
+                match old {
+                    OneshotState::Canceling {
+                        observer: CancelObserver::Pending,
+                        ..
+                    } => {
+                        *self = OneshotState::Completed(completion);
+                        (false, None, None)
+                    }
+                    OneshotState::Canceling {
+                        observer: CancelObserver::Waiting(waker),
+                        ..
+                    } => {
+                        *self = OneshotState::Completed(completion);
+                        (false, Some(waker), None)
+                    }
+                    OneshotState::Canceling {
+                        observer: CancelObserver::Detached(payload),
+                        ..
+                    } => {
+                        let action = DeferredAction::new(move || payload.cleanup(completion));
+                        (true, None, Some(action))
+                    }
+                    _ => unreachable!("canceling replace mismatch"),
+                }
+            }
+            // A duplicate CQE is stale input. Keep the first terminal result
+            // and let the future consume it normally.
+            OneshotState::Completed(..) => (false, None, None),
+        }
+    }
+
+    /// Request cancellation. Returns whether an `AsyncCancel` SQE should be pushed.
+    fn request_cancel(&mut self) -> bool {
+        match self {
+            OneshotState::Submitted => {
+                *self = OneshotState::Canceling {
+                    observer: CancelObserver::Pending,
+                    sqe: CancelSqe::NeedPush,
+                };
+                true
+            }
+            OneshotState::Waiting(_) => {
+                let OneshotState::Waiting(waker) = std::mem::replace(self, OneshotState::Submitted) else {
+                    unreachable!("waiting replace mismatch")
+                };
+                *self = OneshotState::Canceling {
+                    observer: CancelObserver::Waiting(waker),
+                    sqe: CancelSqe::NeedPush,
+                };
+                true
+            }
+            OneshotState::Detached(_) => {
+                let OneshotState::Detached(payload) = std::mem::replace(self, OneshotState::Submitted) else {
+                    unreachable!("detached replace mismatch")
+                };
+                *self = OneshotState::Canceling {
+                    observer: CancelObserver::Detached(payload),
+                    sqe: CancelSqe::NeedPush,
+                };
+                true
+            }
+            OneshotState::Canceling {
+                sqe: CancelSqe::NeedPush,
+                ..
+            } => true,
+            OneshotState::Canceling {
+                sqe: CancelSqe::InFlight,
+                ..
+            }
+            | OneshotState::Completed(_) => false,
+        }
+    }
+
+    fn mark_cancel_in_flight(&mut self) {
+        if let OneshotState::Canceling { sqe, .. } = self {
+            *sqe = CancelSqe::InFlight;
+        }
+    }
+}
+
+impl MultishotState {
+    fn push(&mut self, completion: Completion, more: bool) -> (bool, Option<Waker>, Option<DeferredAction>, bool) {
+        match self {
+            MultishotState::Active {
                 waker,
                 pending,
                 cleanup,
@@ -239,7 +367,7 @@ impl State {
                     if more {
                         let pending = std::mem::take(pending);
                         let cleanup = std::mem::replace(cleanup, MultishotCleanup::None);
-                        *self = State::MultishotStopping {
+                        *self = MultishotState::Stopping {
                             waker: None,
                             pending,
                             cleanup,
@@ -247,7 +375,7 @@ impl State {
                     } else {
                         let pending = std::mem::take(pending);
                         let cleanup = std::mem::replace(cleanup, MultishotCleanup::None);
-                        *self = State::MultishotFinished { pending, cleanup };
+                        *self = MultishotState::Finished { pending, cleanup };
                     }
                     return (false, wake, None, more);
                 }
@@ -257,11 +385,11 @@ impl State {
                 if !more {
                     let pending = std::mem::take(pending);
                     let cleanup = std::mem::replace(cleanup, MultishotCleanup::None);
-                    *self = State::MultishotFinished { pending, cleanup };
+                    *self = MultishotState::Finished { pending, cleanup };
                 }
                 (false, wake, None, false)
             }
-            State::MultishotStopping {
+            MultishotState::Stopping {
                 waker,
                 pending,
                 cleanup,
@@ -271,11 +399,11 @@ impl State {
                 if !more {
                     let pending = std::mem::take(pending);
                     let cleanup = std::mem::replace(cleanup, MultishotCleanup::None);
-                    *self = State::MultishotFinished { pending, cleanup };
+                    *self = MultishotState::Finished { pending, cleanup };
                 }
                 (false, wake, None, false)
             }
-            State::MultishotCancelled { pending, cleanup, .. } => {
+            MultishotState::Cancelled { pending, cleanup, .. } => {
                 if more {
                     cleanup.discard(completion);
                     (false, None, None, false)
@@ -289,21 +417,8 @@ impl State {
                 }
             }
             // Finished should not receive further CQEs; ignore stale input.
-            State::MultishotFinished { .. } => (false, None, None, false),
-            State::Submitted | State::Waiting(_) | State::Completed(_) | State::Ignored(_) => {
-                unreachable!("multishot CQE on oneshot state")
-            }
+            MultishotState::Finished { .. } => (false, None, None, false),
         }
-    }
-
-    fn is_multishot(&self) -> bool {
-        matches!(
-            self,
-            State::MultishotActive { .. }
-                | State::MultishotStopping { .. }
-                | State::MultishotFinished { .. }
-                | State::MultishotCancelled { .. }
-        )
     }
 }
 
@@ -455,11 +570,22 @@ impl IoUringBackend {
 }
 
 impl IoUringBackend {
-    pub(crate) fn submit_op<T: UringOperation + 'static>(&mut self, data: T, handle: Handle) -> Result<Op<T>> {
+    /// Submit a oneshot operation.
+    ///
+    /// On failure the error is paired with the operation payload so callers
+    /// that own buffers can recover them; the kernel never observed the op.
+    pub(crate) fn submit_op<T: UringOperation + 'static>(
+        &mut self,
+        data: T,
+        handle: Handle,
+    ) -> std::result::Result<Op<T>, (std::io::Error, T)> {
         if self.shutting_down {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::BrokenPipe,
-                "io_uring backend is shutting down",
+            return Err((
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "io_uring backend is shutting down",
+                ),
+                data,
             ));
         }
         // Stabilize the operation before deriving any pointer that may be
@@ -467,7 +593,10 @@ impl IoUringBackend {
         let mut data = Box::new(data);
 
         // Allocate a new entry in the driver
-        let key = self.ops.insert(State::Submitted)?;
+        let key = match self.ops.insert(State::Oneshot(OneshotState::Submitted)) {
+            Ok(key) => key,
+            Err(error) => return Err((error, *data)),
+        };
 
         // Submit the new operation to the kernel
         let entry = UringOperation::submit(&mut *data).user_data(key.as_u64());
@@ -476,7 +605,7 @@ impl IoUringBackend {
             // If the submission queue is full, flush it to the kernel
             if let Err(error) = self.submit() {
                 let _ = self.ops.remove(key);
-                return Err(error);
+                return Err((error, *data));
             }
         }
 
@@ -499,12 +628,12 @@ impl IoUringBackend {
         }
         let cleanup = data.completion_cleanup();
         let pending_limit = data.pending_completion_limit();
-        let key = self.ops.insert(State::MultishotActive {
+        let key = self.ops.insert(State::Multishot(MultishotState::Active {
             waker: None,
             pending: VecDeque::new(),
             cleanup,
             pending_limit,
-        })?;
+        }))?;
 
         let entry = UringMultishotOperation::submit(&mut data).user_data(key.as_u64());
 
@@ -518,44 +647,64 @@ impl IoUringBackend {
         Ok((key, Box::new(data)))
     }
 
-    /// Detach or cancel an oneshot operation.
+    /// Detach an oneshot operation.
     ///
-    /// When the operation already has a terminal completion that was never
-    /// polled, returns that completion so the driver can run typed `complete`
-    /// after releasing the backend borrow. The payload remains in `op`.
+    /// Drop without cancel keeps the payload until the CQE. Drop after cancel
+    /// keeps the payload in `Canceling` until the target CQE. When the
+    /// operation already has a terminal completion that was never polled,
+    /// returns that completion so the driver can run typed `complete` after
+    /// releasing the backend borrow.
     pub(crate) fn remove_op<T: UringOperation + 'static>(&mut self, op: &mut Op<T>) -> Option<Completion> {
         let key = op.key();
-        // Get the op state from the driver
         let state = match self.ops.get_mut(key) {
             Some(val) => val,
-            None => {
-                // Op already dropped or removed
-                return None;
-            }
+            None => return None,
         };
 
         match state {
-            // Detach only: keep payload alive until the CQE so buffers stay valid
-            // and so a late completion can cleanup produced FDs (accept/open).
-            // We do not submit AsyncCancel here; cancellation is reserved for driver Drop.
-            State::Submitted | State::Waiting(..) => {
+            State::Oneshot(OneshotState::Submitted | OneshotState::Waiting(..)) => {
                 let data = op.take_data().expect("op data missing on detach");
-                *state = State::Ignored(data);
+                *state = State::Oneshot(OneshotState::Detached(data));
                 None
             }
-            State::Completed(_) => {
-                // Completion already arrived but the future never polled it.
-                match self.ops.remove(key) {
-                    Some(State::Completed(completion)) => Some(completion),
-                    _ => None,
+            State::Oneshot(OneshotState::Canceling {
+                observer: CancelObserver::Pending | CancelObserver::Waiting(_),
+                ..
+            }) => {
+                let data = op.take_data().expect("op data missing on cancel detach");
+                if let State::Oneshot(OneshotState::Canceling { observer, .. }) = state {
+                    *observer = CancelObserver::Detached(data);
                 }
+                None
             }
-            State::Ignored(..) => unreachable!("invalid operation state"),
-            State::MultishotActive { .. }
-            | State::MultishotStopping { .. }
-            | State::MultishotFinished { .. }
-            | State::MultishotCancelled { .. } => {
-                unreachable!("oneshot remove on multishot operation")
+            State::Oneshot(OneshotState::Completed(_)) => match self.ops.remove(key) {
+                Some(State::Oneshot(OneshotState::Completed(completion))) => Some(completion),
+                _ => None,
+            },
+            State::Oneshot(OneshotState::Detached(..) | OneshotState::Canceling { .. }) => {
+                unreachable!("invalid operation state")
+            }
+            State::Multishot(_) => unreachable!("oneshot remove on multishot operation"),
+        }
+    }
+
+    /// Request eager cancellation of a submitted oneshot operation.
+    ///
+    /// Idempotent. Generation-checked: a stale key is a no-op. Does not
+    /// complete the observing future; the target CQE is the ownership boundary.
+    pub(crate) fn cancel_op(&mut self, key: OpKey) {
+        let Some(state) = self.ops.get_mut(key) else {
+            return;
+        };
+        let State::Oneshot(oneshot) = state else {
+            return;
+        };
+        if !oneshot.request_cancel() {
+            return;
+        }
+        if self.push_cancel(key).is_ok() {
+            if let Some(State::Oneshot(oneshot)) = self.ops.get_mut(key) {
+                oneshot.mark_cancel_in_flight();
             }
         }
     }
@@ -571,45 +720,45 @@ impl IoUringBackend {
         let mut payload = Some(data as Box<dyn Any>);
 
         match state {
-            State::MultishotActive { pending, cleanup, .. } => {
+            State::Multishot(MultishotState::Active { pending, cleanup, .. }) => {
                 for completion in std::mem::take(pending) {
                     cleanup.discard(completion);
                 }
                 let cleanup = std::mem::replace(cleanup, MultishotCleanup::None);
-                *state = State::MultishotCancelled {
+                *state = State::Multishot(MultishotState::Cancelled {
                     pending: VecDeque::new(),
                     cleanup,
                     payload: payload.take(),
-                };
+                });
                 // If cancellation cannot be submitted, retain the payload and
                 // rely on the ring-close teardown backstop.
                 let _ = self.push_cancel(key);
             }
-            State::MultishotStopping { pending, cleanup, .. } => {
+            State::Multishot(MultishotState::Stopping { pending, cleanup, .. }) => {
                 for completion in std::mem::take(pending) {
                     cleanup.discard(completion);
                 }
                 let cleanup = std::mem::replace(cleanup, MultishotCleanup::None);
-                *state = State::MultishotCancelled {
+                *state = State::Multishot(MultishotState::Cancelled {
                     pending: VecDeque::new(),
                     cleanup,
                     payload: payload.take(),
-                };
+                });
                 // The overflow-triggered cancellation may have failed to
                 // submit. Retrying is harmless if it was already queued.
                 let _ = self.push_cancel(key);
             }
-            State::MultishotFinished { pending, cleanup } => {
+            State::Multishot(MultishotState::Finished { pending, cleanup }) => {
                 for completion in std::mem::take(pending) {
                     cleanup.discard(completion);
                 }
                 let _ = self.ops.remove(key);
             }
-            State::MultishotCancelled {
+            State::Multishot(MultishotState::Cancelled {
                 pending,
                 cleanup,
                 payload: retained,
-            } => {
+            }) => {
                 for completion in std::mem::take(pending) {
                     cleanup.discard(completion);
                 }
@@ -617,9 +766,7 @@ impl IoUringBackend {
                     *retained = payload.take();
                 }
             }
-            State::Submitted | State::Waiting(_) | State::Completed(_) | State::Ignored(_) => {
-                unreachable!("multishot remove on oneshot operation")
-            }
+            State::Oneshot(_) => unreachable!("multishot remove on oneshot operation"),
         }
     }
 
@@ -633,38 +780,47 @@ impl IoUringBackend {
         op: &mut Op<T>,
         cx: &mut Context<'_>,
     ) -> Poll<Completion> {
-        // Get the op state from the driver
         let state = self.ops.get_mut(op.key()).expect("invalid internal state");
 
         match state {
-            // Op has been submitted to the kernel. Assign the waker for completion
-            State::Submitted => {
-                *state = State::Waiting(cx.waker().clone());
+            State::Oneshot(OneshotState::Submitted) => {
+                *state = State::Oneshot(OneshotState::Waiting(cx.waker().clone()));
                 Poll::Pending
             }
-            // Kernel has not yet completed the op. Continue waiting
-            State::Waiting(waker) => {
+            State::Oneshot(OneshotState::Waiting(waker)) => {
                 if !waker.will_wake(cx.waker()) {
-                    // A different waker has been received. Update the state with the new waker
-                    *state = State::Waiting(cx.waker().clone());
+                    *state = State::Oneshot(OneshotState::Waiting(cx.waker().clone()));
                 }
                 Poll::Pending
             }
-            // The kernel has completed the op. Resolve the future with the result
-            State::Completed(_) => match self.ops.remove(op.key()) {
-                Some(State::Completed(completion)) => Poll::Ready(completion),
+            State::Oneshot(OneshotState::Canceling {
+                observer: observer @ CancelObserver::Pending,
+                ..
+            }) => {
+                *observer = CancelObserver::Waiting(cx.waker().clone());
+                Poll::Pending
+            }
+            State::Oneshot(OneshotState::Canceling {
+                observer: CancelObserver::Waiting(waker),
+                ..
+            }) => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+                Poll::Pending
+            }
+            State::Oneshot(OneshotState::Completed(_)) => match self.ops.remove(op.key()) {
+                Some(State::Oneshot(OneshotState::Completed(completion))) => Poll::Ready(completion),
                 _ => unreachable!("invalid operation"),
             },
-            // The op has been ignored/cancelled by the caller. It should not be polled again
-            State::Ignored(..) => {
-                unreachable!("invalid operation")
-            }
-            State::MultishotActive { .. }
-            | State::MultishotStopping { .. }
-            | State::MultishotFinished { .. }
-            | State::MultishotCancelled { .. } => {
-                unreachable!("oneshot poll on multishot operation")
-            }
+            State::Oneshot(
+                OneshotState::Detached(..)
+                | OneshotState::Canceling {
+                    observer: CancelObserver::Detached(..),
+                    ..
+                },
+            ) => unreachable!("invalid operation"),
+            State::Multishot(_) => unreachable!("oneshot poll on multishot operation"),
         }
     }
 
@@ -677,27 +833,26 @@ impl IoUringBackend {
         let state = self.ops.get_mut(key).expect("invalid multishot op state");
 
         match state {
-            State::MultishotActive { waker, pending, .. } | State::MultishotStopping { waker, pending, .. } => {
+            State::Multishot(MultishotState::Active { waker, pending, .. })
+            | State::Multishot(MultishotState::Stopping { waker, pending, .. }) => {
                 if let Some(completion) = pending.pop_front() {
                     return Poll::Ready(Some(completion));
                 }
                 *waker = Some(cx.waker().clone());
                 Poll::Pending
             }
-            State::MultishotFinished { pending, .. } => {
+            State::Multishot(MultishotState::Finished { pending, .. }) => {
                 if let Some(completion) = pending.pop_front() {
                     return Poll::Ready(Some(completion));
                 }
                 let _ = self.ops.remove(key);
                 Poll::Ready(None)
             }
-            State::MultishotCancelled { .. } => {
+            State::Multishot(MultishotState::Cancelled { .. }) => {
                 // Stream was dropped; further polls see end-of-stream.
                 Poll::Ready(None)
             }
-            State::Submitted | State::Waiting(_) | State::Completed(_) | State::Ignored(_) => {
-                unreachable!("multishot poll on oneshot operation")
-            }
+            State::Oneshot(_) => unreachable!("multishot poll on oneshot operation"),
         }
     }
 
@@ -817,6 +972,19 @@ impl IoUringBackend {
             self.push_cancel(key)?;
         }
 
+        let retry: Vec<OpKey> = self
+            .ops
+            .iter()
+            .filter_map(|(key, state)| state.needs_cancel_push().then_some(key))
+            .collect();
+        for key in retry {
+            if self.push_cancel(key).is_ok() {
+                if let Some(State::Oneshot(oneshot)) = self.ops.get_mut(key) {
+                    oneshot.mark_cancel_in_flight();
+                }
+            }
+        }
+
         if rearm_wakeup {
             self.arm_wakeup_read()?;
         }
@@ -874,76 +1042,81 @@ impl IoUringBackend {
         }
 
         // Pre-determine what to cancel.
-        // After this pass, ops are Completed, Finished, Ignored, or MultishotCancelled.
-        // Preserve existing Ignored / MultishotCancelled payloads for late CQEs.
+        // After this pass, ops are Completed, Finished, Detached, Canceling, or Multishot Cancelled.
+        // Preserve existing Detached / Cancelled payloads for late CQEs.
         for (_, state) in self.ops.iter_mut() {
-            match std::mem::replace(state, State::Ignored(Box::new(Detached))) {
-                old_state @ State::Completed(_) => {
+            match std::mem::replace(state, State::Oneshot(OneshotState::Detached(Box::new(Detached)))) {
+                old_state @ State::Oneshot(OneshotState::Completed(_)) => {
                     *state = old_state;
                 }
-                State::MultishotFinished { pending, mut cleanup } => {
-                    // Kernel already finished; reclaim every undelivered
-                    // operation-specific resource.
+                State::Multishot(MultishotState::Finished { pending, mut cleanup }) => {
                     for completion in pending {
                         cleanup.discard(completion);
                     }
-                    // Leave a placeholder; the drain loop removes non-Ignored slots.
-                    *state = State::Completed(Completion::new(Ok(0)));
+                    // Leave a placeholder; the drain loop removes non-Detached slots.
+                    *state = State::Oneshot(OneshotState::Completed(Completion::new(Ok(0))));
                 }
-                State::Ignored(payload) => {
-                    *state = State::Ignored(payload);
+                State::Oneshot(OneshotState::Detached(payload)) => {
+                    *state = State::Oneshot(OneshotState::Detached(payload));
                 }
-                State::MultishotCancelled {
+                State::Oneshot(OneshotState::Canceling { observer, sqe }) => {
+                    let observer = match observer {
+                        CancelObserver::Detached(payload) => CancelObserver::Detached(payload),
+                        CancelObserver::Pending | CancelObserver::Waiting(_) => {
+                            CancelObserver::Detached(Box::new(Detached))
+                        }
+                    };
+                    *state = State::Oneshot(OneshotState::Canceling { observer, sqe });
+                }
+                State::Multishot(MultishotState::Cancelled {
                     mut pending,
                     mut cleanup,
                     payload,
-                } => {
+                }) => {
                     for completion in pending.drain(..) {
                         cleanup.discard(completion);
                     }
-                    *state = State::MultishotCancelled {
+                    *state = State::Multishot(MultishotState::Cancelled {
                         pending: VecDeque::new(),
                         cleanup,
                         payload,
-                    };
+                    });
                 }
-                State::MultishotActive {
+                State::Multishot(MultishotState::Active {
                     pending, mut cleanup, ..
-                }
-                | State::MultishotStopping {
+                })
+                | State::Multishot(MultishotState::Stopping {
                     pending, mut cleanup, ..
-                } => {
+                }) => {
                     for completion in pending {
                         cleanup.discard(completion);
                     }
-                    // Preserve typed cleanup for successful CQEs that race
-                    // with cancellation during shutdown.
-                    *state = State::MultishotCancelled {
+                    *state = State::Multishot(MultishotState::Cancelled {
                         pending: VecDeque::new(),
                         cleanup,
-                        // A live stream still owns its typed payload. If it is
-                        // dropped before shutdown finishes, remove_multi_op
-                        // moves that payload into this state.
                         payload: None,
-                    };
+                    });
                 }
-                State::Submitted | State::Waiting(_) => {
+                State::Oneshot(OneshotState::Submitted | OneshotState::Waiting(_)) => {
                     // Oneshot in flight without detached payload.
                 }
             }
         }
 
-        // Re-process MultishotCancelled entries that still have pending (none after above),
-        // and ensure cancelled multishot ops get AsyncCancel.
         let to_cancel: Vec<OpKey> = self
             .ops
             .iter()
-            .filter_map(|(key, state)| {
-                matches!(state, State::Ignored(..) | State::MultishotCancelled { .. }).then_some(key)
+            .filter_map(|(key, state)| match state {
+                State::Oneshot(OneshotState::Detached(..) | OneshotState::Canceling { .. })
+                | State::Multishot(MultishotState::Cancelled { .. }) => Some(key),
+                _ => None,
             })
             .collect();
         for key in to_cancel {
             self.push_cancel(key)?;
+            if let Some(State::Oneshot(oneshot)) = self.ops.get_mut(key) {
+                oneshot.mark_cancel_in_flight();
+            }
         }
 
         // The wakeup read owns the pinned buffer until its CQE arrives. Cancel
@@ -980,7 +1153,8 @@ impl IoUringBackend {
                 break;
             };
             match state {
-                State::Ignored(..) | State::MultishotCancelled { .. } => {
+                State::Oneshot(OneshotState::Detached(..) | OneshotState::Canceling { .. })
+                | State::Multishot(MultishotState::Cancelled { .. }) => {
                     self.wait()?;
                     DeferredAction::run_all(self.dispatch_completions()?);
                 }
@@ -1045,18 +1219,18 @@ mod tests {
 
     #[test]
     fn completion_before_first_poll_is_retained() {
-        let mut state = State::Submitted;
+        let mut state = State::Oneshot(OneshotState::Submitted);
         let (remove, wake, cleanup) = state.complete(Completion::new(Ok(7)));
         assert!(!remove);
         assert!(wake.is_none());
         assert!(cleanup.is_none());
-        assert!(matches!(state, State::Completed(..)));
+        assert!(matches!(state, State::Oneshot(OneshotState::Completed(..))));
     }
 
     #[test]
     fn detached_completion_runs_typed_cleanup() {
         let cleaned = Arc::new(AtomicBool::new(false));
-        let mut state = State::Ignored(Box::new(CleanupMarker(cleaned.clone())));
+        let mut state = State::Oneshot(OneshotState::Detached(Box::new(CleanupMarker(cleaned.clone()))));
 
         let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
         assert!(remove);
@@ -1069,7 +1243,7 @@ mod tests {
     fn completion_wakes_the_current_waiter() {
         let woken = Arc::new(AtomicBool::new(false));
         let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
-        let mut state = State::Waiting(waker);
+        let mut state = State::Oneshot(OneshotState::Waiting(waker));
 
         let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
         assert!(!remove);
@@ -1079,54 +1253,113 @@ mod tests {
     }
 
     #[test]
+    fn canceling_waiting_wakes_on_target_cqe() {
+        let woken = Arc::new(AtomicBool::new(false));
+        let waker = std::task::Waker::from(Arc::new(WakeMarker(woken.clone())));
+        let mut state = State::Oneshot(OneshotState::Canceling {
+            observer: CancelObserver::Waiting(waker),
+            sqe: CancelSqe::InFlight,
+        });
+
+        let (remove, wake, cleanup) =
+            state.complete(Completion::new(Err(std::io::Error::from_raw_os_error(libc::ECANCELED))));
+        assert!(!remove);
+        assert!(cleanup.is_none());
+        wake.expect("canceling waiter should wake").wake();
+        assert!(woken.load(Ordering::SeqCst));
+        assert!(matches!(state, State::Oneshot(OneshotState::Completed(..))));
+    }
+
+    #[test]
+    fn canceling_detached_retains_payload_until_target_cqe() {
+        let cleaned = Arc::new(AtomicBool::new(false));
+        let mut state = State::Oneshot(OneshotState::Canceling {
+            observer: CancelObserver::Detached(Box::new(CleanupMarker(cleaned.clone()))),
+            sqe: CancelSqe::InFlight,
+        });
+
+        let (remove, wake, cleanup) = state.complete(Completion::new(Ok(0)));
+        assert!(remove);
+        assert!(wake.is_none());
+        assert!(!cleaned.load(Ordering::SeqCst));
+        cleanup.expect("detached cancel cleanup should be deferred").run();
+        assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn request_cancel_is_idempotent_once_in_flight() {
+        let mut state = OneshotState::Submitted;
+        assert!(state.request_cancel());
+        state.mark_cancel_in_flight();
+        assert!(!state.request_cancel());
+        assert!(matches!(
+            state,
+            OneshotState::Canceling {
+                observer: CancelObserver::Pending,
+                sqe: CancelSqe::InFlight,
+            }
+        ));
+    }
+
+    #[test]
+    fn stale_generation_cannot_observe_replaced_slot() {
+        let mut table = OpTable::new(1).unwrap();
+        let first = table.insert(State::Oneshot(OneshotState::Submitted)).unwrap();
+        assert!(table.remove(first).is_some());
+        let second = table.insert(State::Oneshot(OneshotState::Submitted)).unwrap();
+        assert_ne!(first, second);
+        assert!(table.get_mut(first).is_none());
+    }
+
+    #[test]
     fn multishot_more_keeps_active_and_queues() {
-        let mut state = State::MultishotActive {
+        let mut state = State::Multishot(MultishotState::Active {
             waker: None,
             pending: VecDeque::new(),
             cleanup: MultishotCleanup::None,
             pending_limit: None,
-        };
+        });
         let (remove, wake, cleanup, cancel) = state.push_multishot(Completion::new(Ok(3)), true);
         assert!(!remove);
         assert!(wake.is_none());
         assert!(cleanup.is_none());
         assert!(!cancel);
         match &state {
-            State::MultishotActive { pending, .. } => {
+            State::Multishot(MultishotState::Active { pending, .. }) => {
                 assert_eq!(pending.len(), 1);
                 assert_eq!(pending[0].result.as_ref().unwrap(), &3);
             }
-            _ => panic!("expected MultishotActive"),
+            _ => panic!("expected Multishot Active"),
         }
     }
 
     #[test]
     fn multishot_final_transitions_to_finished() {
-        let mut state = State::MultishotActive {
+        let mut state = State::Multishot(MultishotState::Active {
             waker: None,
             pending: VecDeque::new(),
             cleanup: MultishotCleanup::None,
             pending_limit: None,
-        };
+        });
         let _ = state.push_multishot(Completion::new(Ok(1)), true);
         let (remove, _, _, _) = state.push_multishot(Completion::new(Ok(2)), false);
         assert!(!remove);
         match &state {
-            State::MultishotFinished { pending, .. } => {
+            State::Multishot(MultishotState::Finished { pending, .. }) => {
                 assert_eq!(pending.len(), 2);
             }
-            _ => panic!("expected MultishotFinished"),
+            _ => panic!("expected Multishot Finished"),
         }
     }
 
     #[test]
     fn cancelled_multishot_retains_payload_until_terminal_cqe() {
         let dropped = Arc::new(AtomicBool::new(false));
-        let mut state = State::MultishotCancelled {
+        let mut state = State::Multishot(MultishotState::Cancelled {
             pending: VecDeque::new(),
             cleanup: MultishotCleanup::None,
             payload: Some(Box::new(PayloadDropMarker(dropped.clone()))),
-        };
+        });
 
         let (remove, wake, cleanup, cancel) = state.push_multishot(Completion::new(Ok(0)), false);
         assert!(remove);
@@ -1142,12 +1375,12 @@ mod tests {
     #[test]
     fn multishot_pending_limit_discards_overflow_and_requests_cancel() {
         let discarded = Arc::new(AtomicBool::new(false));
-        let mut state = State::MultishotActive {
+        let mut state = State::Multishot(MultishotState::Active {
             waker: None,
             pending: VecDeque::new(),
             cleanup: MultishotCleanup::Marker(discarded.clone()),
             pending_limit: Some(1),
-        };
+        });
 
         let (_, _, _, cancel) = state.push_multishot(Completion::new(Ok(10)), true);
         assert!(!cancel);
@@ -1157,14 +1390,14 @@ mod tests {
         assert!(discarded.load(Ordering::SeqCst));
 
         match &state {
-            State::MultishotStopping { pending, .. } => {
+            State::Multishot(MultishotState::Stopping { pending, .. }) => {
                 assert_eq!(pending.len(), 2);
                 assert_eq!(
                     pending[1].result.as_ref().expect_err("capacity error").kind(),
                     std::io::ErrorKind::ResourceBusy
                 );
             }
-            _ => panic!("expected MultishotStopping"),
+            _ => panic!("expected Multishot Stopping"),
         }
 
         discarded.store(false, Ordering::SeqCst);
@@ -1173,7 +1406,7 @@ mod tests {
         assert!(discarded.load(Ordering::SeqCst));
         assert!(matches!(
             state,
-            State::MultishotFinished { ref pending, .. } if pending.len() == 2
+            State::Multishot(MultishotState::Finished { ref pending, .. }) if pending.len() == 2
         ));
     }
 }

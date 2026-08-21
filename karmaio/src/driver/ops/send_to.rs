@@ -55,11 +55,13 @@ pub(crate) struct SendTo<B: IoBuf> {
 }
 
 impl<B: IoBuf> Op<SendTo<B>> {
+    // On failure the buffer is returned with the error; the kernel never
+    // observed the operation.
     pub(crate) fn send_to(
         io_handle: &SharedIoHandle<socket2::Socket>,
         buf: B,
         socket_addr: SocketAddr,
-    ) -> std::io::Result<Op<SendTo<B>>> {
+    ) -> std::result::Result<Op<SendTo<B>>, (std::io::Error, B)> {
         let socket_addr = Box::new(SockAddr::from(socket_addr));
 
         let data = SendTo {
@@ -74,7 +76,13 @@ impl<B: IoBuf> Op<SendTo<B>> {
             wsa_buf: Box::new(unsafe { std::mem::zeroed() }),
         };
 
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        CURRENT_DRIVER.with(|handle| {
+            handle
+                .upgrade()
+                .expect("Not in a runtime context")
+                .try_submit_op(data)
+                .map_err(|(error, data)| (error, data.buf))
+        })
     }
 }
 

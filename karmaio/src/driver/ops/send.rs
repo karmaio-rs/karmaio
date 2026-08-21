@@ -31,7 +31,9 @@ pub(crate) struct Send<B: IoBuf> {
 }
 
 impl<B: IoBuf> Op<Send<B>> {
-    pub(crate) fn send(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> std::io::Result<Op<Send<B>>> {
+    // On failure the buffer is returned with the error; the kernel never
+    // observed the operation.
+    pub(crate) fn send(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> Result<Op<Send<B>>, (std::io::Error, B)> {
         let data = Send {
             io_handle: io_handle.clone(),
             buf,
@@ -39,7 +41,13 @@ impl<B: IoBuf> Op<Send<B>> {
             wsa_buf: Box::new(unsafe { std::mem::zeroed() }),
         };
 
-        CURRENT_DRIVER.with(|handle| handle.upgrade().expect("Not in a runtime context").submit_op(data))
+        CURRENT_DRIVER.with(|handle| {
+            handle
+                .upgrade()
+                .expect("Not in a runtime context")
+                .try_submit_op(data)
+                .map_err(|(error, data)| (error, data.buf))
+        })
     }
 }
 

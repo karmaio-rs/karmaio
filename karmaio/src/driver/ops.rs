@@ -382,6 +382,11 @@ impl<T: Operation + 'static> Future for Op<T> {
 impl<T: Operation + 'static> Drop for Op<T> {
     fn drop(&mut self) {
         if let Some(driver) = self.driver.upgrade() {
+            // Request platform cancellation first. `cancel_op` is idempotent
+            // and a no-op if the target is already terminal. `remove_op` then
+            // detaches the observer; the payload stays until the target
+            // completion so drop never claims the kernel is done.
+            driver.cancel_op(self.key);
             driver.remove_op(self);
         }
     }
@@ -391,7 +396,8 @@ impl<T: Operation + 'static> Drop for Op<T> {
 ///
 /// Multishot ops submit one SQE that may produce many CQEs. Intermediate CQEs
 /// carry `IORING_CQE_F_MORE`; the final CQE does not. Dropping the stream
-/// cancels the in-flight request (unlike oneshot [`Op`], which detaches).
+/// cancels the in-flight request. Oneshot [`Op`] drop also requests
+/// cancellation, then detaches the observer.
 ///
 /// Multishot APIs require Linux 6.12+. karmaio does not probe the kernel
 /// version at runtime; callers must meet that floor.
@@ -401,42 +407,67 @@ impl<T: Operation + 'static> Drop for Op<T> {
 #[cfg(target_os = "linux")]
 pub(crate) struct MultiOp<T: UringMultishotOperation + 'static> {
     driver: Handle,
-    key: OpKey,
     state: MultiOpState<T>,
 }
 
 #[cfg(target_os = "linux")]
 enum MultiOpState<T> {
-    Active(Box<T>),
+    Pending(Box<T>),
+    Active { key: OpKey, data: Box<T> },
     Terminated,
 }
 
 #[cfg(target_os = "linux")]
 impl<T: UringMultishotOperation + 'static> MultiOp<T> {
-    pub(crate) fn new(key: OpKey, data: Box<T>, driver: Handle) -> Self {
+    pub(crate) fn new(data: T, driver: Handle) -> Self {
         Self {
             driver,
-            key,
-            state: MultiOpState::Active(data),
+            state: MultiOpState::Pending(Box::new(data)),
         }
     }
 
     pub(crate) fn key(&self) -> OpKey {
-        self.key
+        match &self.state {
+            MultiOpState::Active { key, .. } => *key,
+            MultiOpState::Pending(..) => panic!("multishot op has not been submitted"),
+            MultiOpState::Terminated => panic!("multishot op has terminated"),
+        }
+    }
+
+    fn take_pending(&mut self) -> Option<Box<T>> {
+        match std::mem::replace(&mut self.state, MultiOpState::Terminated) {
+            MultiOpState::Pending(data) => Some(data),
+            state => {
+                self.state = state;
+                None
+            }
+        }
+    }
+
+    fn activate(&mut self, key: OpKey, data: Box<T>) {
+        debug_assert!(self.is_terminated());
+        self.state = MultiOpState::Active { key, data };
     }
 
     pub(crate) fn take_data(&mut self) -> Option<Box<T>> {
         match std::mem::replace(&mut self.state, MultiOpState::Terminated) {
-            MultiOpState::Active(data) => Some(data),
-            MultiOpState::Terminated => None,
+            MultiOpState::Active { data, .. } => Some(data),
+            state => {
+                self.state = state;
+                None
+            }
         }
     }
 
     pub(crate) fn data_mut(&mut self) -> Option<&mut T> {
         match &mut self.state {
-            MultiOpState::Active(data) => Some(data),
-            MultiOpState::Terminated => None,
+            MultiOpState::Active { data, .. } => Some(data),
+            MultiOpState::Pending(..) | MultiOpState::Terminated => None,
         }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self.state, MultiOpState::Pending(..))
     }
 
     fn is_terminated(&self) -> bool {
@@ -476,6 +507,13 @@ impl<T: UringMultishotOperation + 'static> Future for MultiOpNext<'_, T> {
             this.op.finish();
             return Poll::Ready(None);
         };
+        if this.op.is_pending() {
+            let data = this.op.take_pending().expect("pending multishot op missing data");
+            match driver.start_multi_op(data) {
+                Ok((key, data)) => this.op.activate(key, data),
+                Err(error) => return Poll::Ready(Some(T::submission_error(error))),
+            }
+        }
         match driver.poll_multi_op(this.op, cx) {
             Poll::Pending => Poll::Pending,
             Poll::Ready(None) => {
@@ -499,7 +537,10 @@ impl<T: UringMultishotOperation + 'static> Future for MultiOpNext<'_, T> {
 #[cfg(target_os = "linux")]
 impl<T: UringMultishotOperation + 'static> Drop for MultiOp<T> {
     fn drop(&mut self) {
-        if let Some(driver) = self.driver.upgrade() {
+        if !self.is_pending()
+            && !self.is_terminated()
+            && let Some(driver) = self.driver.upgrade()
+        {
             driver.remove_multi_op(self);
         }
     }

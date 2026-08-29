@@ -33,7 +33,10 @@ pub(crate) struct Send<B: IoBuf> {
 impl<B: IoBuf> Op<Send<B>> {
     // On failure the buffer is returned with the error; the kernel never
     // observed the operation.
-    pub(crate) fn send(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> Result<Op<Send<B>>, (std::io::Error, B)> {
+    pub(crate) fn send(
+        io_handle: &SharedIoHandle<socket2::Socket>,
+        buf: B,
+    ) -> Result<Op<Send<B>>, (std::io::Error, B)> {
         let data = Send {
             io_handle: io_handle.clone(),
             buf,

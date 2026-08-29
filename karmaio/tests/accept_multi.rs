@@ -14,7 +14,7 @@ use std::time::Duration;
 use karmaio::io::{AsyncReadExt, AsyncWriteExt, Stream};
 use karmaio::net::tcp::{TcpListener, TcpStream};
 use karmaio::net::unix::UnixListener;
-use karmaio::runtime::spawn_local;
+use karmaio::runtime::{CancellationSource, StreamExt, is_operation_canceled, spawn_local};
 
 #[karmaio::test]
 async fn tcp_incoming_accepts_multiple_clients() {
@@ -114,6 +114,40 @@ async fn tcp_incoming_drop_cancels_and_oneshot_still_works() {
     res.expect("read");
     assert_eq!(buf[0], b'x');
     let _ = connector.join().expect("connector");
+}
+
+#[karmaio::test]
+async fn tcp_incoming_cancelled_before_first_poll_does_not_submit() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+    let source = CancellationSource::new();
+    source.cancel();
+
+    let mut incoming = listener.incoming().expect("incoming").with_cancellation(source.token());
+    let error = match incoming.next().await.expect("cancellation item") {
+        Ok(_) => panic!("cancelled stream submitted an accept"),
+        Err(error) => error,
+    };
+    assert!(is_operation_canceled(&error), "{error:?}");
+    assert!(incoming.next().await.is_none());
+}
+
+#[karmaio::test]
+async fn tcp_incoming_pending_next_observes_token_cancellation() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+    let source = CancellationSource::new();
+    let token = source.token();
+    let mut incoming = listener.incoming().expect("incoming").with_cancellation(token);
+    spawn_local(async move {
+        karmaio::time::sleep(Duration::from_millis(20)).await;
+        source.cancel();
+    });
+
+    let error = match incoming.next().await.expect("cancellation item") {
+        Ok(_) => panic!("pending stream accepted without a client"),
+        Err(error) => error,
+    };
+    assert!(is_operation_canceled(&error), "{error:?}");
+    assert!(incoming.next().await.is_none());
 }
 
 #[karmaio::test]

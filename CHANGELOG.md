@@ -7,6 +7,19 @@ During the `0.1.0` alpha series, APIs and behavior may change between prerelease
 
 ## [Unreleased]
 
+### Added
+
+- Added `runtime::{CancellationSource, CancellationToken, FutureExt}` for fail-slow eager cancellation of ordinary I/O futures and helpers. Tokens are copyable and observation-only, one source can cover many operations, nested tokens compose, and lazily submitted multishot streams can be wrapped through `runtime::StreamExt`.
+
+### Changed
+
+- Dropping a submitted one-shot I/O future now requests best-effort platform cancellation before detaching. The runtime retains kernel-owned payloads until terminal completion.
+- Platform cancellation errors are normalized to `OperationCanceled` at the operation boundary and remain classifiable with `is_operation_canceled`.
+
+### Removed
+
+- Breaking alpha API change: removed `Canceller`, `CancelHandle`, `AsyncReadCancellable`, `AsyncWriteCancellable`, and the parallel `*_cancellable` socket and vectored-I/O methods. Wrap the ordinary operation with `with_cancellation(token)` instead.
+
 ## [0.1.0-alpha.3] - 2026-08-21
 
 ### Added

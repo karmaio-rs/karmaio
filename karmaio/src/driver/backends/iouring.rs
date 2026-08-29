@@ -72,7 +72,7 @@ pub(crate) unsafe trait UringMultishotOperation: 'static {
     /// One stream item produced from a single CQE.
     type Item;
 
-    /// Build the multishot SQE (invoked during `submit_multi_op`).
+    /// Build the multishot SQE when the stream is first polled.
     fn submit(&mut self) -> Submission;
 
     /// Convert one CQE into an optional stream item.
@@ -80,6 +80,10 @@ pub(crate) unsafe trait UringMultishotOperation: 'static {
     /// Returning `None` is reserved for a terminal CQE that ends the stream
     /// without an item, such as an orderly stream-socket EOF.
     fn complete_item(&mut self, completion: Completion) -> Option<Self::Item>;
+
+    /// Convert a failure that occurs while lazily submitting the request into
+    /// the stream's item type.
+    fn submission_error(error: std::io::Error) -> Self::Item;
 
     /// Create cleanup state for CQEs that will never be delivered.
     ///
@@ -134,7 +138,9 @@ enum OneshotState {
     Submitted,
     Waiting(Waker),
     Completed(Completion),
-    /// Future dropped without cancel. Payload retained until the target CQE.
+    /// Observer detached without an in-flight cancel request. Payload retained
+    /// until the target CQE. Oneshot `Op` drop requests cancel first, so this
+    /// state is the shutdown / leftover path rather than the normal drop path.
     Detached(Box<dyn IgnoredOp>),
     /// Cancel requested. Slot is not recyclable until the target CQE.
     Canceling {
@@ -581,10 +587,7 @@ impl IoUringBackend {
     ) -> std::result::Result<Op<T>, (std::io::Error, T)> {
         if self.shutting_down {
             return Err((
-                std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "io_uring backend is shutting down",
-                ),
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "io_uring backend is shutting down"),
                 data,
             ));
         }
@@ -618,7 +621,7 @@ impl IoUringBackend {
     /// The caller wraps these in [`crate::driver::ops::MultiOp`].
     pub(crate) fn submit_multi_op<T: UringMultishotOperation + 'static>(
         &mut self,
-        mut data: T,
+        mut data: Box<T>,
     ) -> Result<(OpKey, Box<T>)> {
         if self.shutting_down {
             return Err(std::io::Error::new(
@@ -635,7 +638,7 @@ impl IoUringBackend {
             pending_limit,
         }))?;
 
-        let entry = UringMultishotOperation::submit(&mut data).user_data(key.as_u64());
+        let entry = UringMultishotOperation::submit(&mut *data).user_data(key.as_u64());
 
         while unsafe { self.uring.submission().push(&entry).is_err() } {
             if let Err(error) = self.submit() {
@@ -644,13 +647,14 @@ impl IoUringBackend {
             }
         }
 
-        Ok((key, Box::new(data)))
+        Ok((key, data))
     }
 
-    /// Detach an oneshot operation.
+    /// Detach a oneshot operation's observer.
     ///
-    /// Drop without cancel keeps the payload until the CQE. Drop after cancel
-    /// keeps the payload in `Canceling` until the target CQE. When the
+    /// [`crate::driver::ops::Op`] drop calls [`Self::cancel_op`] first, so the
+    /// usual path is `Canceling` until the target CQE. If cancel was not
+    /// requested, the payload is kept in `Detached` until the CQE. When the
     /// operation already has a terminal completion that was never polled,
     /// returns that completion so the driver can run typed `complete` after
     /// releasing the backend borrow.
@@ -688,7 +692,7 @@ impl IoUringBackend {
         }
     }
 
-    /// Request eager cancellation of a submitted oneshot operation.
+    /// Request eager cancellation of a submitted operation.
     ///
     /// Idempotent. Generation-checked: a stale key is a no-op. Does not
     /// complete the observing future; the target CQE is the ownership boundary.
@@ -696,16 +700,19 @@ impl IoUringBackend {
         let Some(state) = self.ops.get_mut(key) else {
             return;
         };
-        let State::Oneshot(oneshot) = state else {
-            return;
-        };
-        if !oneshot.request_cancel() {
-            return;
-        }
-        if self.push_cancel(key).is_ok() {
-            if let Some(State::Oneshot(oneshot)) = self.ops.get_mut(key) {
-                oneshot.mark_cancel_in_flight();
+        match state {
+            State::Oneshot(oneshot) => {
+                if !oneshot.request_cancel() {
+                    return;
+                }
             }
+            State::Multishot(MultishotState::Active { .. } | MultishotState::Stopping { .. }) => {}
+            State::Multishot(_) => return,
+        }
+        if self.push_cancel(key).is_ok()
+            && let Some(State::Oneshot(oneshot)) = self.ops.get_mut(key)
+        {
+            oneshot.mark_cancel_in_flight();
         }
     }
 
@@ -1284,6 +1291,33 @@ mod tests {
         assert!(!cleaned.load(Ordering::SeqCst));
         cleanup.expect("detached cancel cleanup should be deferred").run();
         assert!(cleaned.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn drop_of_submitted_op_requests_cancel_instead_of_silent_detach() {
+        // `Op::drop` runs `cancel_op` then `remove_op`. `cancel_op` must put a
+        // submitted oneshot into `Canceling`, not leave it for silent `Detached`.
+        let mut backend = IoUringBackend::new(DriverConfig {
+            capacity: 8,
+            buffer_pool_size: 8,
+            buffer_pool_buffer_len: 4096,
+            multishot_accept_capacity: 8,
+        })
+        .expect("create io_uring backend");
+        let key = backend.ops.insert(State::Oneshot(OneshotState::Submitted)).unwrap();
+
+        backend.cancel_op(key);
+
+        match backend.ops.get_mut(key) {
+            Some(State::Oneshot(OneshotState::Canceling {
+                observer: CancelObserver::Pending,
+                ..
+            })) => {}
+            Some(State::Oneshot(OneshotState::Detached(..))) => {
+                panic!("cancel_op left the op silently detached")
+            }
+            _ => panic!("expected Canceling with pending observer"),
+        }
     }
 
     #[test]

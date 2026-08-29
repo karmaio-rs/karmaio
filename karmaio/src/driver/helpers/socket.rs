@@ -16,7 +16,6 @@ use crate::driver::ops::Op;
 use crate::driver::ops::accept_multi::AcceptMulti;
 #[cfg(target_os = "linux")]
 use crate::io::Stream;
-use crate::io::{CancelHandle, Register, TerminalGuard, map_cancel_result, operation_canceled};
 
 // This is an internal wrapper around socket operations for the runtime.
 // This wrapper abstracts and handles all the driver operations and os compatiblity,
@@ -165,9 +164,11 @@ impl Socket {
     /// [`Socket`] and optional peer IP address. Peer addresses are resolved
     /// with `getpeername` after each successful accept.
     ///
-    /// Uses multishot accept under the hood (Linux 6.12+). Dropping the stream
-    /// cancels the request. The multishot SQE is **not** re-armed after it
-    /// terminates; call [`incoming`](Self::incoming) again to start a new one.
+    /// Uses multishot accept under the hood (Linux 6.12+). The request is
+    /// submitted when the stream is first polled, which lets a cancellation
+    /// token wrap it first. Dropping the stream cancels a submitted request.
+    /// The multishot SQE is **not** re-armed after it terminates; call
+    /// [`incoming`](Self::incoming) again to start a new one.
     #[cfg(target_os = "linux")]
     pub(crate) fn incoming(&self) -> Result<Incoming> {
         Ok(Incoming {
@@ -219,15 +220,6 @@ impl Socket {
             Err((error, buf)) => return BufResult(Err(error), buf),
         };
         op.await
-    }
-
-    pub(crate) async fn recv_cancellable<B: IoBufMut>(
-        &self,
-        buf: B,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, B> {
-        self.run_cancellable(buf, cancellation, |buf| Op::recv(&self.handle, buf))
-            .await
     }
 
     /// Receive into a runtime pool buffer (Linux only).
@@ -291,15 +283,6 @@ impl Socket {
         op.await
     }
 
-    pub(crate) async fn recv_from_cancellable<B: IoBufMut>(
-        &self,
-        buf: B,
-        cancellation: &CancelHandle,
-    ) -> BufResult<(usize, SocketAddr), B> {
-        self.run_cancellable(buf, cancellation, |buf| Op::recv_from(&self.handle, buf))
-            .await
-    }
-
     /// Performs a scattered read into the supplied buffers along with the receiver address
     pub(crate) async fn recvmsg<V: IoVectoredBufMut>(&self, buf: V) -> BufResult<(usize, SocketAddr), V> {
         let op = match Op::recvmsg(&self.handle, buf) {
@@ -307,15 +290,6 @@ impl Socket {
             Err((error, buf)) => return BufResult(Err(error), buf),
         };
         op.await
-    }
-
-    pub(crate) async fn recvmsg_cancellable<V: IoVectoredBufMut>(
-        &self,
-        buf: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<(usize, SocketAddr), V> {
-        self.run_cancellable(buf, cancellation, |buf| Op::recvmsg(&self.handle, buf))
-            .await
     }
 
     // ================================
@@ -331,11 +305,6 @@ impl Socket {
         op.await
     }
 
-    pub(crate) async fn send_cancellable<B: IoBuf>(&self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.run_cancellable(buf, cancellation, |buf| Op::send(&self.handle, buf))
-            .await
-    }
-
     /// Writes the buffer to the specified address on the socket
     pub(crate) async fn send_to<B: IoBuf>(&self, buf: B, socket_addr: SocketAddr) -> BufResult<usize, B> {
         let op = match Op::send_to(&self.handle, buf, socket_addr) {
@@ -343,16 +312,6 @@ impl Socket {
             Err((error, buf)) => return BufResult(Err(error), buf),
         };
         op.await
-    }
-
-    pub(crate) async fn send_to_cancellable<B: IoBuf>(
-        &self,
-        buf: B,
-        socket_addr: SocketAddr,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, B> {
-        self.run_cancellable(buf, cancellation, |buf| Op::send_to(&self.handle, buf, socket_addr))
-            .await
     }
 
     /// Performes a gather write on the socket with data from the specified buffers
@@ -368,46 +327,6 @@ impl Socket {
             Err((error, io_slices)) => return BufResult(Err(error), io_slices),
         };
         op.await
-    }
-
-    pub(crate) async fn sendmsg_cancellable<V: IoVectoredBuf, C: IoBuf>(
-        &self,
-        io_slices: V,
-        socket_addr: Option<SocketAddr>,
-        control: Option<C>,
-        cancellation: &CancelHandle,
-    ) -> BufResult<(usize, Option<C>), V> {
-        self.run_cancellable(io_slices, cancellation, |io_slices| {
-            Op::sendmsg(&self.handle, io_slices, control, socket_addr)
-        })
-        .await
-    }
-
-    async fn run_cancellable<T, R, B>(
-        &self,
-        buf: B,
-        cancellation: &CancelHandle,
-        submit: impl FnOnce(B) -> std::result::Result<Op<T>, (std::io::Error, B)>,
-    ) -> BufResult<R, B>
-    where
-        T: crate::driver::backends::Operation<Output = BufResult<R, B>> + 'static,
-    {
-        match cancellation.register() {
-            Register::Canceled => BufResult(Err(operation_canceled()), buf),
-            Register::Pending(registration) => {
-                // On submit failure the registration guard rolls the handle
-                // back to idle and the buffer is returned with the error; the
-                // kernel never observed the operation.
-                let op = match submit(buf) {
-                    Ok(op) => op,
-                    Err((error, buf)) => return BufResult(Err(error), buf),
-                };
-                registration.bind(op.key());
-                let _terminal = TerminalGuard::new(cancellation);
-                let BufResult(result, buf) = op.await;
-                BufResult(map_cancel_result(result), buf)
-            }
-        }
     }
 }
 

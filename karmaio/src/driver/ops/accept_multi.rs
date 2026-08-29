@@ -33,7 +33,7 @@ impl MultiOp<AcceptMulti> {
                 io_handle: io_handle.clone(),
                 pending_completion_limit: driver.multishot_accept_capacity(),
             };
-            driver.submit_multi_op(data)
+            Ok(driver.defer_multi_op(data))
         })
     }
 }
@@ -61,6 +61,10 @@ unsafe impl UringMultishotOperation for AcceptMulti {
             socket.set_async_flags()?;
             Ok(socket)
         })())
+    }
+
+    fn submission_error(error: io::Error) -> Self::Item {
+        Err(error)
     }
 
     fn completion_cleanup(&self) -> MultishotCleanup {

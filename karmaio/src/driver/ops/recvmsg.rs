@@ -42,7 +42,10 @@ pub(crate) struct RecvMsg<V: IoVectoredBufMut> {
 impl<V: IoVectoredBufMut> Op<RecvMsg<V>> {
     // On failure the buffers are returned with the error; the kernel never
     // observed the operation.
-    pub(crate) fn recvmsg(io_handle: &SharedIoHandle<socket2::Socket>, bufs: V) -> Result<Op<RecvMsg<V>>, (std::io::Error, V)> {
+    pub(crate) fn recvmsg(
+        io_handle: &SharedIoHandle<socket2::Socket>,
+        bufs: V,
+    ) -> Result<Op<RecvMsg<V>>, (std::io::Error, V)> {
         let data = RecvMsg {
             io_handle: io_handle.clone(),
             // Infallible: the initializer closure always returns `Ok`.

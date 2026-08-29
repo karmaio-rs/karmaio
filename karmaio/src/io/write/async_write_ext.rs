@@ -46,7 +46,7 @@ pub trait AsyncWriteExt: AsyncWrite {
     ///
     /// A successful zero-byte write with input remaining is reported as
     /// [`io::ErrorKind::WriteZero`]. Ordinary `Interrupted` errors are retried;
-    /// explicit cancellation (see `AsyncWriteCancellable`) never surfaces as
+    /// explicit cancellation (see [`crate::runtime::is_operation_canceled`]) never surfaces as
     /// `Interrupted`, so a canceled operation propagates immediately instead
     /// of being retried. A writer that reports more bytes than remain is a
     /// contract violation reported as [`io::ErrorKind::InvalidData`].

@@ -41,6 +41,7 @@ pub struct TcpListener {
 /// disarm). Call [`TcpListener::incoming`] again to start a new request.
 /// Pending accepted sockets are bounded by
 /// [`RuntimeBuilder::multishot_accept_capacity`](crate::RuntimeBuilder::multishot_accept_capacity).
+/// Kernel submission is deferred until the first [`Stream::next`] poll.
 #[cfg(target_os = "linux")]
 #[cfg_attr(docsrs, doc(cfg(target_os = "linux")))]
 pub struct TcpIncoming {
@@ -113,8 +114,13 @@ impl TcpListener {
     /// # Implementation notes
     ///
     /// Backed by **io_uring multishot accept** (Linux **6.12+**). The runtime
-    /// does not probe the kernel version. The multishot request is **not**
-    /// re-armed after it ends; call this method again to start a new stream.
+    /// does not probe the kernel version. Submission occurs on the first
+    /// [`Stream::next`] poll so [`crate::io::StreamExt::with_cancellation`] can
+    /// wrap the stream before it reaches the kernel. Wrap it before that first
+    /// poll; wrapping after submission does not attach the existing request.
+    /// Submission failures are yielded as the first error item. The multishot
+    /// request is **not** re-armed after it ends; call this method again to
+    /// start a new stream.
     /// Dropping the returned stream cancels the in-flight request.
     /// If its pending-connection capacity is reached, overflow sockets are
     /// closed and the stream terminates with a capacity error after yielding

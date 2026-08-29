@@ -10,7 +10,6 @@ use crate::buf::PooledBuf;
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
-    io::CancelHandle,
 };
 
 #[cfg(windows)]
@@ -196,7 +195,8 @@ impl UdpSocket {
     ///
     /// Intended for **connected** UDP. See
     /// [`TcpStream::recv_multi`](crate::net::tcp::TcpStream::recv_multi) for end
-    /// conditions and buffer lease / `ENOBUFS` guidance.
+    /// conditions, lazy submission, cancellation, and buffer lease / `ENOBUFS`
+    /// guidance.
     ///
     /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
     #[cfg(target_os = "linux")]
@@ -224,8 +224,8 @@ impl UdpSocket {
     /// Multishot datagram stream with peer addresses (Linux only).
     ///
     /// Each item is a [`RecvDatagram`]. Same end conditions as
-    /// [`recv_multi`](Self::recv_multi): no auto-rearm; recycle leases to
-    /// avoid `ENOBUFS`.
+    /// [`recv_multi`](Self::recv_multi): lazy submission, no auto-rearm;
+    /// recycle leases to avoid `ENOBUFS`.
     ///
     /// Requires Linux 6.12+ (karmaio does not probe the kernel version).
     #[cfg(target_os = "linux")]
@@ -248,65 +248,6 @@ impl UdpSocket {
     /// On success, returns the number of bytes read and the origin.
     pub async fn recvmsg<V: IoVectoredBufMut>(&self, buf: V) -> BufResult<(usize, SocketAddr), V> {
         self.inner.recvmsg(buf).await
-    }
-
-    // ================================
-    //  Cancellable Operations
-    // ================================
-
-    /// Cancellable counterpart of [`recv_from`](Self::recv_from).
-    ///
-    /// See [`Canceller`](crate::io::Canceller) for the cancellation contract:
-    /// cancel then await this same future to reclaim the buffer without
-    /// waiting for a datagram that may never arrive. A completion that races
-    /// cancellation may still return `Ok`.
-    pub async fn recv_from_cancellable<B: IoBufMut>(
-        &self,
-        buf: B,
-        cancellation: &CancelHandle,
-    ) -> BufResult<(usize, SocketAddr), B> {
-        self.inner.recv_from_cancellable(buf, cancellation).await
-    }
-
-    /// Cancellable counterpart of [`recvmsg`](Self::recvmsg).
-    ///
-    /// See [`recv_from_cancellable`](Self::recv_from_cancellable) for the
-    /// cancellation contract.
-    pub async fn recvmsg_cancellable<V: IoVectoredBufMut>(
-        &self,
-        buf: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<(usize, SocketAddr), V> {
-        self.inner.recvmsg_cancellable(buf, cancellation).await
-    }
-
-    /// Cancellable counterpart of [`send_to`](Self::send_to).
-    ///
-    /// See [`Canceller`](crate::io::Canceller) for the cancellation contract.
-    /// A send only stays pending when the socket send buffer is full.
-    pub async fn send_to_cancellable<B: IoBuf>(
-        &self,
-        buf: B,
-        socket_addr: SocketAddr,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, B> {
-        self.inner.send_to_cancellable(buf, socket_addr, cancellation).await
-    }
-
-    /// Cancellable counterpart of [`sendmsg`](Self::sendmsg).
-    ///
-    /// See [`send_to_cancellable`](Self::send_to_cancellable) for the
-    /// cancellation contract.
-    pub async fn sendmsg_cancellable<V: IoVectoredBuf, C: IoBuf>(
-        &self,
-        io_slices: V,
-        socket_addr: Option<SocketAddr>,
-        msg_control: Option<C>,
-        cancellation: &CancelHandle,
-    ) -> BufResult<(usize, Option<C>), V> {
-        self.inner
-            .sendmsg_cancellable(io_slices, socket_addr, msg_control, cancellation)
-            .await
     }
 
     /// Shuts down the read, write, or both halves of this connection.

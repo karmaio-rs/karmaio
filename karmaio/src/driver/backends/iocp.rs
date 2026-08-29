@@ -461,10 +461,7 @@ impl IocpBackend {
     ) -> std::result::Result<Op<T>, (Error, T)> {
         if self.shutting_down {
             return Err((
-                Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "IOCP backend is shutting down",
-                ),
+                Error::new(std::io::ErrorKind::BrokenPipe, "IOCP backend is shutting down"),
                 data,
             ));
         }
@@ -496,10 +493,7 @@ impl IocpBackend {
                 if self.pending_by_overlapped.insert(address, key).is_some() {
                     let _ = self.ops.remove(key);
                     return Err((
-                        Error::new(
-                            std::io::ErrorKind::Other,
-                            "duplicate IOCP OVERLAPPED address",
-                        ),
+                        Error::new(std::io::ErrorKind::Other, "duplicate IOCP OVERLAPPED address"),
                         *data,
                     ));
                 }

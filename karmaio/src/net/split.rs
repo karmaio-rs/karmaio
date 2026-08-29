@@ -3,7 +3,7 @@ use std::{fmt, marker::PhantomData, net::Shutdown, ops::Deref};
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
-    io::{AsyncRead, AsyncReadCancellable, AsyncWrite, AsyncWriteCancellable, CancelHandle},
+    io::{AsyncRead, AsyncWrite},
 };
 
 pub(super) fn split<'a, T>(stream: &'a T) -> (ReadHalf<'a, T>, WriteHalf<'a, T>)
@@ -68,40 +68,6 @@ impl<T> Deref for WriteHalf<'_, T> {
 
     fn deref(&self) -> &Self::Target {
         self.0
-    }
-}
-
-impl<'a, T> AsyncReadCancellable for ReadHalf<'a, T>
-where
-    &'a T: AsyncReadCancellable,
-{
-    async fn read_cancellable<B: IoBufMut>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.0.read_cancellable(buf, cancellation).await
-    }
-
-    async fn read_vectored_cancellable<V: IoVectoredBufMut>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        self.0.read_vectored_cancellable(bufs, cancellation).await
-    }
-}
-
-impl<'a, T> AsyncWriteCancellable for WriteHalf<'a, T>
-where
-    &'a T: AsyncWriteCancellable,
-{
-    async fn write_cancellable<B: IoBuf>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.0.write_cancellable(buf, cancellation).await
-    }
-
-    async fn write_vectored_cancellable<V: IoVectoredBuf>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        self.0.write_vectored_cancellable(bufs, cancellation).await
     }
 }
 
@@ -177,21 +143,6 @@ impl<T> AsyncRead for OwnedReadHalf<T> {
     }
 }
 
-impl<T> AsyncReadCancellable for OwnedReadHalf<T> {
-    async fn read_cancellable<B: IoBufMut>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.inner.recv_cancellable(buf, cancellation).await
-    }
-
-    async fn read_vectored_cancellable<V: IoVectoredBufMut>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        let (result, bufs) = self.inner.recvmsg_cancellable(bufs, cancellation).await.into_parts();
-        BufResult(result.map(|(n, _)| n), bufs)
-    }
-}
-
 /// Owned write half of a stream, created by [`IntoOwnedSplit::into_split`].
 ///
 /// The half owns the socket and can be moved into its own local task.
@@ -226,25 +177,6 @@ impl<T> AsyncWrite for OwnedWriteHalf<T> {
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         self.inner.shutdown(Shutdown::Write)
-    }
-}
-
-impl<T> AsyncWriteCancellable for OwnedWriteHalf<T> {
-    async fn write_cancellable<B: IoBuf>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.inner.send_cancellable(buf, cancellation).await
-    }
-
-    async fn write_vectored_cancellable<V: IoVectoredBuf>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        let (res, bufs) = self
-            .inner
-            .sendmsg_cancellable(bufs, None, None::<Vec<u8>>, cancellation)
-            .await
-            .into_parts();
-        BufResult(res.map(|(n, _)| n), bufs)
     }
 }
 

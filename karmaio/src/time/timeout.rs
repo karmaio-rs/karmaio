@@ -25,7 +25,9 @@ impl Error for Elapsed {}
 ///
 /// If the future completes before the duration has elapsed, then the completed
 /// value is returned. Otherwise, an error is returned and the future is
-/// cancelled.
+/// dropped. Dropping submitted completion I/O requests platform cancellation,
+/// but forfeits the owned buffer; use [`crate::runtime::FutureExt::with_cancellation`]
+/// and await the original future when the buffer must be recovered.
 pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Output, Elapsed> {
     let mut future = pin!(future);
     let mut delay = pin!(sleep(duration));
@@ -48,7 +50,9 @@ pub async fn timeout<F: Future>(duration: Duration, future: F) -> Result<F::Outp
 ///
 /// If the future completes before the instant is reached, then the completed
 /// value is returned. Otherwise, an error is returned and the future is
-/// cancelled.
+/// dropped. Dropping submitted completion I/O requests platform cancellation,
+/// but forfeits the owned buffer; use [`crate::runtime::FutureExt::with_cancellation`]
+/// and await the original future when the buffer must be recovered.
 ///
 /// If `deadline` is in the past, the future is still polled once before  returning [`Elapsed`],
 /// giving it a chance to complete synchronously.

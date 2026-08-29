@@ -1,10 +1,10 @@
 //! Async timers: `sleep`, `interval`, and `timeout`.
 //!
 //! Note on `timeout`: when the deadline fires, the inner future is **dropped**.
-//! For ordinary I/O that means the op is *detached* (buffers stay alive until
-//! the kernel finishes). Use [`karmaio::io::Canceller`] with Cancellable read/write
-//! to request eager cancellation and await the buffer back. See the runtime
-//! docs on I/O cancellation.
+//! For ordinary I/O that means the op is cancelled and the buffer is forfeited.
+//! To recover it, keep a pinned [`karmaio::runtime::FutureExt::with_cancellation`]
+//! future, request [`karmaio::runtime::CancellationSource::cancel`] when the timer
+//! fires, then await that same future. See the runtime docs on I/O cancellation.
 //!
 //! ```text
 //! cargo run --example timer

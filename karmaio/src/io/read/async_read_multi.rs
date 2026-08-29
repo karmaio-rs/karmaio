@@ -19,11 +19,16 @@ use std::io;
 ///
 /// Each item is a pool lease. Drop or release buffers promptly. Exhausting the
 /// pool without recycle is a common cause of `ENOBUFS` and a short stream.
+/// Implementations may defer kernel submission until the first
+/// [`Stream::next`] poll so the stream can be wrapped in a cancellation scope.
+/// Wrap before that first poll; wrapping after submission does not attach the
+/// existing request retroactively.
 #[allow(async_fn_in_trait)]
 pub trait AsyncReadMulti: AsyncReadManaged {
     /// Start a multishot managed read stream.
     ///
     /// Each completion may use the full configured pool-buffer capacity.
-    /// Construction failures are returned before a stream is created.
+    /// Setup failures are returned before a stream is created. A deferred
+    /// kernel-submission failure is yielded as an error item.
     fn read_multi(&mut self) -> io::Result<impl Stream<Item = io::Result<Self::Buffer>>>;
 }

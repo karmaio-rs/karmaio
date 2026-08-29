@@ -10,7 +10,7 @@ use crate::{
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
-    io::{AsyncRead, AsyncReadCancellable, AsyncWrite, AsyncWriteCancellable, CancelHandle},
+    io::{AsyncRead, AsyncWrite},
     net::split::{
         IntoOwnedSplit, OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, ReuniteOwned, WriteHalf, split,
     },
@@ -143,6 +143,10 @@ impl TcpStream {
     /// request (final CQE without `MORE`), including on `ENOBUFS` when the
     /// pool is empty. There is **no auto-rearm**: call again after recycling
     /// outstanding [`PooledBuf`] leases if you need more data.
+    /// Submission is deferred until the first [`Stream::next`] poll, allowing
+    /// the stream to be wrapped with [`crate::io::StreamExt::with_cancellation`].
+    /// Wrap before that first poll; wrapping later does not attach the existing
+    /// request retroactively.
     ///
     /// Each item is a pool **lease**. Drop or [`PooledBuf::release`] promptly;
     /// holding every buffer without recycle is the usual cause of `ENOBUFS`.
@@ -245,74 +249,6 @@ impl AsyncWrite for TcpStream {
 
     async fn shutdown(&mut self) -> std::io::Result<()> {
         self.inner.shutdown(std::net::Shutdown::Write)
-    }
-}
-
-impl AsyncReadCancellable for TcpStream {
-    async fn read_cancellable<B: IoBufMut>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.inner.recv_cancellable(buf, cancellation).await
-    }
-
-    async fn read_vectored_cancellable<V: IoVectoredBufMut>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        let (result, bufs) = self.inner.recvmsg_cancellable(bufs, cancellation).await.into_parts();
-        BufResult(result.map(|(n, _)| n), bufs)
-    }
-}
-
-impl AsyncReadCancellable for &TcpStream {
-    async fn read_cancellable<B: IoBufMut>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.inner.recv_cancellable(buf, cancellation).await
-    }
-
-    async fn read_vectored_cancellable<V: IoVectoredBufMut>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        let (result, bufs) = self.inner.recvmsg_cancellable(bufs, cancellation).await.into_parts();
-        BufResult(result.map(|(n, _)| n), bufs)
-    }
-}
-
-impl AsyncWriteCancellable for TcpStream {
-    async fn write_cancellable<B: IoBuf>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.inner.send_cancellable(buf, cancellation).await
-    }
-
-    async fn write_vectored_cancellable<V: IoVectoredBuf>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        let (res, bufs) = self
-            .inner
-            .sendmsg_cancellable(bufs, None, None::<Vec<u8>>, cancellation)
-            .await
-            .into_parts();
-        BufResult(res.map(|(n, _)| n), bufs)
-    }
-}
-
-impl AsyncWriteCancellable for &TcpStream {
-    async fn write_cancellable<B: IoBuf>(&mut self, buf: B, cancellation: &CancelHandle) -> BufResult<usize, B> {
-        self.inner.send_cancellable(buf, cancellation).await
-    }
-
-    async fn write_vectored_cancellable<V: IoVectoredBuf>(
-        &mut self,
-        bufs: V,
-        cancellation: &CancelHandle,
-    ) -> BufResult<usize, V> {
-        let (res, bufs) = self
-            .inner
-            .sendmsg_cancellable(bufs, None, None::<Vec<u8>>, cancellation)
-            .await
-            .into_parts();
-        BufResult(res.map(|(n, _)| n), bufs)
     }
 }
 

@@ -33,7 +33,10 @@ pub(crate) struct Recv<B: IoBufMut> {
 impl<B: IoBufMut> Op<Recv<B>> {
     // On failure the buffer is returned with the error; the kernel never
     // observed the operation.
-    pub(crate) fn recv(io_handle: &SharedIoHandle<socket2::Socket>, buf: B) -> Result<Op<Recv<B>>, (std::io::Error, B)> {
+    pub(crate) fn recv(
+        io_handle: &SharedIoHandle<socket2::Socket>,
+        buf: B,
+    ) -> Result<Op<Recv<B>>, (std::io::Error, B)> {
         let data = Recv {
             io_handle: io_handle.clone(),
             buf,

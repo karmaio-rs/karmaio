@@ -4,9 +4,9 @@
 
 use std::{os::unix::net::SocketAddr as UnixSocketAddr, path::PathBuf, time::Duration};
 
-use karmaio::io::{AsyncReadCancellable, AsyncReadExt, AsyncWriteExt, Canceller, is_operation_canceled};
+use karmaio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use karmaio::net::unix::{UnixListener, UnixStream};
-use karmaio::runtime::spawn_local;
+use karmaio::runtime::{CancellationSource, FutureExt, is_operation_canceled, spawn_local};
 use karmaio::time::sleep;
 
 fn bind() -> (UnixListener, UnixSocketAddr) {
@@ -31,16 +31,16 @@ async fn cancel_pending_unix_read_on_silent_peer() {
     });
 
     let mut client = UnixStream::connect(&path).await.unwrap();
-    let canceller = Canceller::new();
-    let handle = canceller.handle();
+    let source = CancellationSource::new();
+    let token = source.token();
     spawn_local(async move {
         sleep(Duration::from_millis(20)).await;
-        canceller.cancel();
+        source.cancel();
     });
 
     let buf = vec![0u8; 16];
     let original = buf.as_ptr();
-    let (res, buf) = client.read_cancellable(buf, &handle).await.into_parts();
+    let (res, buf) = client.read(buf).with_cancellation(token).await.into_parts();
     assert!(is_operation_canceled(res.as_ref().unwrap_err()), "{res:?}");
     assert_eq!(buf.as_ptr(), original);
 }
@@ -58,13 +58,13 @@ async fn canceled_unix_read_leaves_write_half_usable() {
 
     let stream = UnixStream::connect(&path).await.unwrap();
     let (mut read_half, mut write_half) = stream.into_split();
-    let canceller = Canceller::new();
-    let handle = canceller.handle();
+    let source = CancellationSource::new();
+    let token = source.token();
     spawn_local(async move {
         sleep(Duration::from_millis(20)).await;
-        canceller.cancel();
+        source.cancel();
     });
-    let (res, _) = read_half.read_cancellable(vec![0u8; 8], &handle).await.into_parts();
+    let (res, _) = read_half.read(vec![0u8; 8]).with_cancellation(token).await.into_parts();
     assert!(is_operation_canceled(res.as_ref().unwrap_err()), "{res:?}");
     write_half.write_all(b"pong".to_vec()).await.unwrap();
     server.await.unwrap();

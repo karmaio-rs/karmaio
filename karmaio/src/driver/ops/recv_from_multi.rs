@@ -49,12 +49,7 @@ impl MultiOp<RecvFromMulti> {
             buffer_group,
             msghdr,
         };
-        CURRENT_DRIVER.with(|handle| {
-            handle
-                .upgrade()
-                .expect("Not in a runtime context")
-                .submit_multi_op(data)
-        })
+        CURRENT_DRIVER.with(|handle| Ok(handle.upgrade().expect("Not in a runtime context").defer_multi_op(data)))
     }
 }
 
@@ -142,6 +137,10 @@ unsafe impl UringMultishotOperation for RecvFromMulti {
                 Err(err)
             }
         })
+    }
+
+    fn submission_error(error: io::Error) -> Self::Item {
+        Err(error)
     }
 
     fn completion_cleanup(&self) -> MultishotCleanup {

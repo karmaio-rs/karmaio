@@ -50,6 +50,7 @@ use crate::driver::ops::{DeferredAction, Op};
 #[derive(Clone)]
 pub(crate) struct Driver {
     pub(super) backend: Rc<RefCell<PlatformBackend>>,
+    scopes: Rc<RefCell<helpers::scopes::ScopeTable>>,
     /// Wakeup token for cross thread notifications. Cloned into scheduler handles.
     wakeup: Wakeup,
     /// Handle to the runtime's blocking thread pool for offloading sync work.
@@ -63,6 +64,7 @@ pub(crate) struct Driver {
 #[derive(Clone)]
 pub(crate) struct Handle {
     backend: Weak<RefCell<PlatformBackend>>,
+    scopes: Weak<RefCell<helpers::scopes::ScopeTable>>,
     wakeup: Wakeup,
     blocking: BlockingPoolHandle,
     #[cfg(windows)]
@@ -82,6 +84,7 @@ impl Driver {
         let association = backend.borrow().association();
         Ok(Self {
             backend,
+            scopes: Rc::new(RefCell::new(helpers::scopes::ScopeTable::new())),
             wakeup,
             blocking,
             #[cfg(windows)]
@@ -119,7 +122,12 @@ impl Driver {
     /// down or driver table exhaustion), so the payload is safe to reuse. The
     /// payload carries buffers and must be returned to the caller.
     pub(crate) fn try_submit_op<T: Operation + 'static>(&self, data: T) -> std::result::Result<Op<T>, (io::Error, T)> {
-        self.backend.borrow_mut().submit_op(data, self.into())
+        if self.current_scopes_block_submit() {
+            return Err((crate::runtime::operation_canceled(), data));
+        }
+        let op = self.backend.borrow_mut().submit_op(data, self.into())?;
+        self.bind_key_to_current_scopes(op.key());
+        Ok(op)
     }
 
     /// Request eager cancellation of a submitted oneshot operation.
@@ -130,16 +138,104 @@ impl Driver {
         self.backend.borrow_mut().cancel_op(key);
     }
 
-    /// Submit a multishot operation and return a stream of completions.
+    pub(crate) fn insert_scope(&self) -> helpers::scopes::ScopeId {
+        self.scopes.borrow_mut().insert()
+    }
+
+    pub(crate) fn remove_scope(&self, id: helpers::scopes::ScopeId) {
+        let cancelled = { self.scopes.borrow_mut().remove(id) };
+        self.apply_scope_cancel(cancelled);
+    }
+
+    pub(crate) fn cancel_scope(&self, id: helpers::scopes::ScopeId) {
+        let cancelled = { self.scopes.borrow_mut().cancel(id) };
+        self.apply_scope_cancel(cancelled);
+    }
+
+    pub(crate) fn scope_is_cancelled(&self, id: helpers::scopes::ScopeId) -> bool {
+        self.scopes.borrow().is_cancelled(id)
+    }
+
+    pub(crate) fn subscribe_scope(
+        &self,
+        id: helpers::scopes::ScopeId,
+        registration: Option<helpers::scopes::WaiterId>,
+        waker: std::task::Waker,
+    ) -> helpers::scopes::SubscribeResult {
+        let subscribed = { self.scopes.borrow_mut().subscribe(id, registration, waker) };
+        drop(subscribed.deferred_drop);
+        subscribed.result
+    }
+
+    pub(crate) fn unsubscribe_scope(&self, id: helpers::scopes::ScopeId, registration: helpers::scopes::WaiterId) {
+        let waker = { self.scopes.borrow_mut().unsubscribe(id, registration) };
+        drop(waker);
+    }
+
+    pub(crate) fn attach_scope(
+        &self,
+        id: helpers::scopes::ScopeId,
+        key: crate::driver::ops::OpKey,
+    ) -> helpers::scopes::AttachResult {
+        self.scopes.borrow_mut().attach(id, key)
+    }
+
+    pub(crate) fn detach_scope_op(&self, key: crate::driver::ops::OpKey) {
+        self.scopes.borrow_mut().detach(key);
+    }
+
+    fn current_scopes_block_submit(&self) -> bool {
+        let mut cancelled = false;
+        helpers::scopes::for_each_current_scope(|id| {
+            if self.scope_is_cancelled(id) {
+                cancelled = true;
+            }
+        });
+        cancelled
+    }
+
+    fn bind_key_to_current_scopes(&self, key: crate::driver::ops::OpKey) {
+        helpers::scopes::for_each_current_scope(|id| {
+            if self.attach_scope(id, key) == helpers::scopes::AttachResult::Cancelled {
+                self.cancel_op(key);
+            }
+        });
+    }
+
+    fn apply_scope_cancel(&self, cancelled: helpers::scopes::ScopeCancel) {
+        for waker in cancelled.waiters {
+            waker.wake();
+        }
+        for key in cancelled.ops {
+            self.cancel_op(key);
+        }
+    }
+
+    /// Create a multishot stream whose request is submitted on its first poll.
     ///
-    /// Requires Linux 6.12+. See multishot method docs on public types.
+    /// Deferring submission lets [`crate::io::StreamExt::with_cancellation`]
+    /// install its scope before the operation reaches the kernel.
     #[cfg(target_os = "linux")]
-    pub(crate) fn submit_multi_op<T: UringMultishotOperation + 'static>(&self, data: T) -> io::Result<MultiOp<T>> {
+    pub(crate) fn defer_multi_op<T: UringMultishotOperation + 'static>(&self, data: T) -> MultiOp<T> {
+        MultiOp::new(data, self.into())
+    }
+
+    /// Submit a deferred multishot operation.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_multi_op<T: UringMultishotOperation + 'static>(
+        &self,
+        data: Box<T>,
+    ) -> io::Result<(crate::driver::ops::OpKey, Box<T>)> {
+        if self.current_scopes_block_submit() {
+            return Err(crate::runtime::operation_canceled());
+        }
         let (key, data) = self.backend.borrow_mut().submit_multi_op(data)?;
-        Ok(MultiOp::new(key, data, self.into()))
+        self.bind_key_to_current_scopes(key);
+        Ok((key, data))
     }
 
     pub(crate) fn remove_op<T: Operation + 'static>(&self, op: &mut Op<T>) {
+        self.detach_scope_op(op.key());
         // Run typed complete outside the backend borrow: `complete` may drop
         // user buffers or construct resources that re-enter the driver.
         let completion = self.backend.borrow_mut().remove_op(op);
@@ -154,6 +250,7 @@ impl Driver {
     #[cfg(target_os = "linux")]
     pub(crate) fn remove_multi_op<T: UringMultishotOperation + 'static>(&self, op: &mut MultiOp<T>) {
         let key = op.key();
+        self.detach_scope_op(key);
         let Some(data) = op.take_data() else {
             return;
         };
@@ -164,7 +261,9 @@ impl Driver {
     pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
         match self.backend.borrow_mut().poll_op(op, cx) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(completion) => {
+            Poll::Ready(mut completion) => {
+                self.detach_scope_op(op.key());
+                completion.result = crate::runtime::map_cancel_result(completion.result);
                 let data = op.take_data().expect("op data missing at completion");
                 Poll::Ready(Operation::complete(*data, completion))
             }
@@ -178,7 +277,11 @@ impl Driver {
         op: &mut MultiOp<T>,
         cx: &mut Context<'_>,
     ) -> Poll<Option<Completion>> {
-        self.backend.borrow_mut().poll_multi_op(op.key(), cx)
+        let poll = self.backend.borrow_mut().poll_multi_op(op.key(), cx);
+        if matches!(poll, Poll::Ready(None)) {
+            self.detach_scope_op(op.key());
+        }
+        poll
     }
 
     #[cfg(any(
@@ -192,7 +295,9 @@ impl Driver {
     pub(crate) fn poll_op<T: Operation + 'static>(&self, op: &mut Op<T>, cx: &mut Context<'_>) -> Poll<T::Output> {
         match self.backend.borrow_mut().poll_op(op, cx, &self.blocking, &self.wakeup) {
             Poll::Pending => Poll::Pending,
-            Poll::Ready(completion) => {
+            Poll::Ready(mut completion) => {
+                self.detach_scope_op(op.key());
+                completion.result = crate::runtime::map_cancel_result(completion.result);
                 let data = op.take_data().expect("op data missing at completion");
                 Poll::Ready(Operation::complete(*data, completion))
             }
@@ -265,16 +370,58 @@ impl AsRawFd for Driver {
 }
 
 impl Handle {
-    pub(crate) fn cancel_op(&self, key: crate::driver::ops::OpKey) {
+    pub(crate) fn insert_scope(&self) -> helpers::scopes::ScopeId {
+        self.upgrade().expect("Not in runtime context").insert_scope()
+    }
+
+    pub(crate) fn remove_scope(&self, id: helpers::scopes::ScopeId) {
         if let Some(driver) = self.upgrade() {
-            driver.cancel_op(key);
+            driver.remove_scope(id);
         }
+    }
+
+    pub(crate) fn cancel_scope(&self, id: helpers::scopes::ScopeId) {
+        if let Some(driver) = self.upgrade() {
+            driver.cancel_scope(id);
+        }
+    }
+
+    pub(crate) fn scope_is_cancelled(&self, id: helpers::scopes::ScopeId) -> bool {
+        self.upgrade()
+            .map(|driver| driver.scope_is_cancelled(id))
+            .unwrap_or(true)
+    }
+
+    pub(crate) fn subscribe_scope(
+        &self,
+        id: helpers::scopes::ScopeId,
+        registration: Option<helpers::scopes::WaiterId>,
+        waker: std::task::Waker,
+    ) -> helpers::scopes::SubscribeResult {
+        self.upgrade()
+            .map(|driver| driver.subscribe_scope(id, registration, waker))
+            .unwrap_or(helpers::scopes::SubscribeResult::Ready)
+    }
+
+    pub(crate) fn unsubscribe_scope(&self, id: helpers::scopes::ScopeId, registration: helpers::scopes::WaiterId) {
+        if let Some(driver) = self.upgrade() {
+            driver.unsubscribe_scope(id, registration);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scope_waiter_count(&self, id: helpers::scopes::ScopeId) -> usize {
+        self.upgrade()
+            .map(|driver| driver.scopes.borrow().waiter_count(id))
+            .unwrap_or(0)
     }
 
     pub(crate) fn upgrade(&self) -> Option<Driver> {
         let backend = self.backend.upgrade()?;
+        let scopes = self.scopes.upgrade()?;
         Some(Driver {
             backend,
+            scopes,
             wakeup: self.wakeup.clone(),
             blocking: self.blocking.clone(),
             #[cfg(windows)]
@@ -298,6 +445,7 @@ where
     fn from(driver: T) -> Self {
         Self {
             backend: Rc::downgrade(&driver.backend),
+            scopes: Rc::downgrade(&driver.scopes),
             wakeup: driver.wakeup.clone(),
             blocking: driver.blocking.clone(),
             #[cfg(windows)]

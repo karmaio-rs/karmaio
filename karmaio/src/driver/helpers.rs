@@ -11,3 +11,6 @@ pub(crate) mod io_handle;
 // Low-level socket wrapper used by `net`.
 #[cfg(feature = "net")]
 pub(crate) mod socket;
+
+// Generational cancellation scopes owned by the driver.
+pub(crate) mod scopes;

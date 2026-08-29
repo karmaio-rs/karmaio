@@ -1,10 +1,10 @@
-//! Integration coverage for `write_vectored_all` and its Cancellable variant.
+//! Integration coverage for `write_vectored_all`.
 
 use std::{net::SocketAddr, time::Duration};
 
-use karmaio::io::{AsyncReadExt, AsyncWriteCancellable, AsyncWriteExt, Canceller, is_operation_canceled};
+use karmaio::io::{AsyncReadExt, AsyncWriteExt};
 use karmaio::net::tcp::{TcpListener, TcpStream};
-use karmaio::runtime::spawn_local;
+use karmaio::runtime::{CancellationSource, FutureExt, is_operation_canceled, spawn_local};
 use karmaio::time::sleep;
 
 fn bind() -> (TcpListener, SocketAddr) {
@@ -33,7 +33,7 @@ async fn tcp_write_vectored_all_delivers_every_component() {
 }
 
 #[karmaio::test]
-async fn tcp_write_vectored_all_cancellable_on_silent_peer() {
+async fn tcp_write_vectored_all_cancels_on_silent_peer() {
     let (listener, addr) = bind();
     let _server = spawn_local(async move {
         let _accepted = listener.accept().await.unwrap();
@@ -41,18 +41,22 @@ async fn tcp_write_vectored_all_cancellable_on_silent_peer() {
     });
 
     let mut client = TcpStream::connect(addr).await.unwrap();
-    let canceller = Canceller::new();
-    let handle = canceller.handle();
+    let source = CancellationSource::new();
+    let token = source.token();
     spawn_local(async move {
         sleep(Duration::from_millis(20)).await;
-        canceller.cancel();
+        source.cancel();
     });
 
     // Fill the socket buffer so a vectored write can remain pending.
     let chunk = vec![0u8; 256 * 1024];
     let bufs = vec![chunk.clone(), chunk.clone(), chunk.clone(), chunk];
     let total = 1024 * 1024;
-    let (res, buf) = client.write_vectored_all_cancellable(bufs, &handle).await.into_parts();
+    let (res, buf) = client
+        .write_vectored_all(bufs)
+        .with_cancellation(token)
+        .await
+        .into_parts();
     match res {
         Ok(written) => assert_eq!(written, total),
         Err(err) => {

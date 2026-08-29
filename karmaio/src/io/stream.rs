@@ -3,6 +3,8 @@
 //! These are intentionally independent of framed I/O so any producer of async
 //! sequences can implement them (network framed readers, channels, generators, …).
 
+use crate::runtime::{CancellationToken, FutureExt, WithCancellation};
+
 /// A stream of values produced asynchronously in pure async/await.
 ///
 /// Futures are `!Send` by design in this share-nothing runtime.
@@ -42,6 +44,20 @@ impl<S: ?Sized + Stream> Stream for &mut S {
 /// Futures are `!Send` by design in this share-nothing runtime.
 #[allow(async_fn_in_trait)]
 pub trait StreamExt: Stream {
+    /// Register each karmaio I/O submission made by `next()` with `token`.
+    ///
+    /// Wrap a lazily submitted I/O stream before its first `next()` call.
+    /// Wrapping an already-submitted stream does not attach its existing
+    /// operation retroactively. The scope does not propagate into tasks
+    /// spawned while `next()` is being polled; pass those tasks a token and
+    /// wrap their karmaio I/O explicitly.
+    fn with_cancellation(self, token: CancellationToken) -> WithCancellation<Self>
+    where
+        Self: Sized,
+    {
+        WithCancellation::new(self, token)
+    }
+
     /// Counts the remaining items, consuming the stream.
     async fn count(mut self) -> usize
     where
@@ -89,3 +105,42 @@ pub trait StreamExt: Stream {
 }
 
 impl<S: Stream + ?Sized> StreamExt for S {}
+
+impl<S: Stream> Stream for WithCancellation<S> {
+    type Item = S::Item;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        self.future.next().with_cancellation(self.token).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::task::Poll;
+
+    use super::*;
+    use crate::runtime::CancellationSource;
+
+    struct ScopeCheckingStream;
+
+    impl Stream for ScopeCheckingStream {
+        type Item = ();
+
+        async fn next(&mut self) -> Option<Self::Item> {
+            std::future::poll_fn(|_cx| {
+                assert_eq!(crate::driver::helpers::scopes::current_scope_ids().len(), 1);
+                Poll::Ready(Some(()))
+            })
+            .await
+        }
+    }
+
+    #[test]
+    fn with_cancellation_installs_scope_while_polling_next() {
+        crate::Runtime::new().unwrap().block_on(async {
+            let source = CancellationSource::new();
+            let mut stream = ScopeCheckingStream.with_cancellation(source.token());
+            assert_eq!(stream.next().await, Some(()));
+        });
+    }
+}

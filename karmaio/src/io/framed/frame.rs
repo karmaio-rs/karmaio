@@ -54,11 +54,24 @@ impl Frame {
         self.suffix
     }
 
+    pub(super) fn checked_bounds(&self, available: usize) -> io::Result<(std::ops::Range<usize>, usize)> {
+        let payload_end = self.prefix.checked_add(self.payload).ok_or_else(invalid_frame)?;
+        let frame_end = payload_end.checked_add(self.suffix).ok_or_else(invalid_frame)?;
+        if frame_end == 0 || frame_end > available {
+            return Err(invalid_frame());
+        }
+        Ok((self.prefix..payload_end, frame_end))
+    }
+
     /// Slice the payload out of an owned buffer as an owned [`Slice`] view.
     #[inline]
     pub fn slice<B: IoBuf>(&self, buf: B) -> Slice<B> {
         buf.slice(self.prefix..self.prefix + self.payload)
     }
+}
+
+fn invalid_frame() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "framer returned invalid frame bounds")
 }
 
 /// Enclosing and extracting frames in an owned buffer.
@@ -68,7 +81,12 @@ pub trait Framer<B: IoBufMut> {
     /// All initialized bytes (`0..bytes_init`) are valid payload that must be
     /// enclosed. Implementations may reserve, shift data with
     /// [`IoBufMutExt::copy_within`], or append a delimiter.
-    fn enclose(&mut self, buf: &mut B);
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the payload cannot be represented or the buffer
+    /// cannot grow to hold the enclosing bytes.
+    fn enclose(&mut self, buf: &mut B) -> io::Result<()>;
 
     /// Extract a frame from the given buffer view.
     ///
@@ -150,20 +168,37 @@ impl LengthDelimited {
 }
 
 impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
-    fn enclose(&mut self, buf: &mut B) {
+    fn enclose(&mut self, buf: &mut B) -> io::Result<()> {
         let len = IoBuf::as_init(buf).len();
         let lfl = self.length_field_len;
 
-        buf.reserve(lfl).expect("failed to reserve frame prefix");
+        let len_u64 = u64::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame payload length exceeds u64"))?;
+        let max_payload = if lfl == Self::MAX_LFL {
+            u64::MAX
+        } else {
+            (1_u64 << (lfl * 8)) - 1
+        };
+        if len_u64 > max_payload {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame payload length does not fit the configured length field",
+            ));
+        }
+        let enclosed_len = (lfl as u64)
+            .checked_add(len_u64)
+            .and_then(|v| usize::try_from(v).ok())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "enclosed frame length overflow"))?;
+
+        buf.reserve(lfl)?;
         // Shift payload right to make room for the length prefix.
         buf.copy_within(0..len, lfl);
         // Safety: copy_within initialized the shifted payload and the prefix is
         // written immediately below before the enlarged length is observed.
-        unsafe { buf.set_len(lfl + len) };
-        debug_assert!(IoBuf::as_init(buf).len() >= lfl + len);
+        unsafe { buf.set_len(enclosed_len) };
+        debug_assert!(IoBuf::as_init(buf).len() >= enclosed_len);
 
         let mut len_bytes = [0u8; Self::MAX_LFL];
-        let len_u64 = len as u64;
         if self.length_field_is_big_endian {
             len_bytes[Self::MAX_LFL - lfl..].copy_from_slice(&len_u64.to_be_bytes()[Self::MAX_LFL - lfl..]);
             buf.as_mut_slice()[..lfl].copy_from_slice(&len_bytes[Self::MAX_LFL - lfl..]);
@@ -171,6 +206,7 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
             len_bytes[..lfl].copy_from_slice(&len_u64.to_le_bytes()[..lfl]);
             buf.as_mut_slice()[..lfl].copy_from_slice(&len_bytes[..lfl]);
         }
+        Ok(())
     }
 
     fn extract(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
@@ -191,7 +227,10 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
             u64::from_le_bytes(len_bytes) as usize
         };
 
-        if data.len() < lfl + payload_len {
+        let frame_len = lfl
+            .checked_add(payload_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "decoded frame length overflow"))?;
+        if data.len() < frame_len {
             return Ok(None);
         }
 
@@ -237,7 +276,7 @@ impl<const C: char> CharDelimited<C> {
 }
 
 impl<B: IoBufMut + IoBufMutExt, const C: char> Framer<B> for CharDelimited<C> {
-    fn enclose(&mut self, buf: &mut B) {
+    fn enclose(&mut self, buf: &mut B) -> io::Result<()> {
         let delim = {
             let bytes = C.encode_utf8(&mut self.char_buf).as_bytes();
             // Copy to stack so we can release the borrow on self.char_buf.
@@ -246,7 +285,9 @@ impl<B: IoBufMut + IoBufMutExt, const C: char> Framer<B> for CharDelimited<C> {
             tmp[..n].copy_from_slice(bytes);
             (tmp, n)
         };
+        buf.reserve(delim.1)?;
         buf.extend_from_slice(&delim.0[..delim.1]);
+        Ok(())
     }
 
     fn extract(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
@@ -292,8 +333,10 @@ impl<'a> AnyDelimited<'a> {
 }
 
 impl<B: IoBufMut + IoBufMutExt> Framer<B> for AnyDelimited<'_> {
-    fn enclose(&mut self, buf: &mut B) {
+    fn enclose(&mut self, buf: &mut B) -> io::Result<()> {
+        buf.reserve(self.bytes.len())?;
         buf.extend_from_slice(self.bytes);
+        Ok(())
     }
 
     fn extract(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
@@ -360,7 +403,9 @@ impl NoopFramer {
 }
 
 impl<B: IoBufMut> Framer<B> for NoopFramer {
-    fn enclose(&mut self, _buf: &mut B) {}
+    fn enclose(&mut self, _buf: &mut B) -> io::Result<()> {
+        Ok(())
+    }
 
     fn extract(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
         let data: &[u8] = buf;
@@ -380,7 +425,7 @@ mod tests {
     fn length_delimited_enclose_extract() {
         let mut framer = LengthDelimited::new();
         let mut buf = Vec::from(&b"hello"[..]);
-        framer.enclose(&mut buf);
+        framer.enclose(&mut buf).unwrap();
         assert_eq!(&buf[..9], b"\x00\x00\x00\x05hello");
 
         let view = buf.slice(..);
@@ -399,12 +444,42 @@ mod tests {
     }
 
     #[test]
+    fn length_delimited_rejects_payload_that_does_not_fit_field() {
+        let mut framer = LengthDelimited::new().set_length_field_len(1);
+        let mut buf = vec![0; 256];
+        let error = framer.enclose(&mut buf).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(buf.len(), 256);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn length_delimited_rejects_decoded_length_overflow() {
+        let mut framer = LengthDelimited::new().set_length_field_len(8);
+        let view = vec![u8::MAX; 8].slice(..);
+        let error = framer.extract(&view).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn frame_bounds_reject_overflow_and_non_progress() {
+        assert_eq!(
+            Frame::new(usize::MAX, 1, 0).checked_bounds(8).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        assert_eq!(
+            Frame::new(0, 0, 0).checked_bounds(8).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
     fn test_char_delimited() {
         let mut framer = CharDelimited::<'ℝ'>::new();
 
         let mut buf = Vec::new();
         IoBufMutExt::extend_from_slice(&mut buf, b"hello");
-        framer.enclose(&mut buf);
+        framer.enclose(&mut buf).unwrap();
         assert_eq!(&buf[..], "helloℝ".as_bytes());
 
         let view = buf.slice(..);
@@ -418,7 +493,7 @@ mod tests {
     fn line_delimited() {
         let mut framer = LineDelimited::new();
         let mut buf = Vec::from(&b"hello"[..]);
-        framer.enclose(&mut buf);
+        framer.enclose(&mut buf).unwrap();
         assert_eq!(&buf[..], b"hello\n");
 
         let view = buf.slice(..);

@@ -6,6 +6,19 @@ use crate::{
     },
 };
 
+/// Lossless components of a [`FramedWrite`], obtained via [`FramedWrite::into_parts`].
+#[derive(Debug)]
+pub struct FramedWriteParts<W, C, F, B> {
+    /// Underlying transport.
+    pub io: W,
+    /// Payload encoder.
+    pub codec: C,
+    /// Byte-level framer.
+    pub framer: F,
+    /// Reusable write scratch buffer.
+    pub buffer: B,
+}
+
 /// A framed writer that adapts an [`AsyncWrite`] into a [`Sink`] of encoded items.
 ///
 /// Each `send` encodes the item, encloses framing, and immediately `write_all`s
@@ -121,6 +134,32 @@ where
             write: self.write,
         }
     }
+
+    /// Decomposes the writer into its constituent parts.
+    ///
+    /// Returns `Err(self)` if a write is in flight (the buffer has been moved
+    /// into the underlying I/O).
+    pub fn try_into_parts(self) -> Result<FramedWriteParts<W, C, F, B>, Self> {
+        match self.write {
+            Some(buffer) => Ok(FramedWriteParts {
+                io: self.io,
+                codec: self.codec,
+                framer: self.framer,
+                buffer,
+            }),
+            None => Err(self),
+        }
+    }
+
+    /// Rebuilds a writer from previously obtained parts.
+    pub fn from_parts(parts: FramedWriteParts<W, C, F, B>) -> Self {
+        FramedWrite {
+            io: parts.io,
+            codec: parts.codec,
+            framer: parts.framer,
+            write: Some(parts.buffer),
+        }
+    }
 }
 
 impl<W, C, F, B, Item> Sink<Item> for FramedWrite<W, C, F, B>
@@ -140,7 +179,11 @@ where
             self.write = Some(buf);
             return Err(e);
         }
-        self.framer.enclose(&mut buf);
+        if let Err(error) = self.framer.enclose(&mut buf) {
+            buf.clear();
+            self.write = Some(buf);
+            return Err(error.into());
+        }
 
         let (res, mut buf) = self.io.write_all(buf).await.into_parts();
         buf.clear();

@@ -1,3 +1,5 @@
+use std::{io, ops::Range};
+
 use crate::{
     buf::{IoBufMut, IoBufMutExt, Slice},
     io::{
@@ -10,6 +12,23 @@ use crate::{
         },
     },
 };
+
+/// Lossless components of a [`Framed`], obtained via [`Framed::into_parts`].
+#[derive(Debug)]
+pub struct FramedParts<IO, C, F, B> {
+    /// Underlying transport.
+    pub io: IO,
+    /// Payload codec.
+    pub codec: C,
+    /// Byte-level framer.
+    pub framer: F,
+    /// Owned read buffer, including any consumed prefix.
+    pub read_buf: B,
+    /// Initialized unread range within `read_buf`.
+    pub unread: Range<usize>,
+    /// Reusable write scratch buffer.
+    pub write_buf: B,
+}
 
 /// A duplex framed I/O adapter providing both [`Stream`] and [`Sink`] over one I/O object.
 ///
@@ -143,6 +162,45 @@ where
             state: self.state,
         }
     }
+
+    /// Decomposes the adapter into its constituent parts.
+    ///
+    /// This is always successful because reads are not retained across poll
+    /// boundaries (dropping `Stream::next` cancels the read).
+    pub fn into_parts(self) -> FramedParts<IO, C, F, B> {
+        let (read_buf, unread) = self.read.into_parts();
+        FramedParts {
+            io: self.io,
+            codec: self.codec,
+            framer: self.framer,
+            read_buf,
+            unread,
+            write_buf: self.write.expect("Framed write buffer missing during into_parts"),
+        }
+    }
+
+    /// Rebuilds a duplex adapter from previously obtained parts.
+    ///
+    /// Returns `Err(parts)` if the unread range is inconsistent with the buffer.
+    pub fn from_parts(parts: FramedParts<IO, C, F, B>) -> Result<Self, FramedParts<IO, C, F, B>> {
+        // Validate before destructuring so we can return parts on failure.
+        let valid = parts.unread.start <= parts.unread.end
+            && parts.unread.end == parts.read_buf.as_init().len();
+        if !valid {
+            return Err(parts);
+        }
+        let FramedParts { io, codec, framer, read_buf, unread, write_buf } = parts;
+        let read = ReadBuffer::from_parts(read_buf, unread)
+            .expect("framed parts were validated");
+        Ok(Framed {
+            io,
+            codec,
+            framer,
+            read,
+            write: Some(write_buf),
+            state: ReadState::Framing,
+        })
+    }
 }
 
 impl<IO, C, F, B> Stream for Framed<IO, C, F, B>
@@ -225,7 +283,11 @@ where
             self.write = Some(buf);
             return Err(e);
         }
-        self.framer.enclose(&mut buf);
+        if let Err(error) = self.framer.enclose(&mut buf) {
+            buf.clear();
+            self.write = Some(buf);
+            return Err(error.into());
+        }
 
         let (res, mut buf) = self.io.write_all(buf).await.into_parts();
         buf.clear();
@@ -251,7 +313,7 @@ where
     B: IoBufMut + IoBufMutExt,
 {
     async fn fill(&mut self) -> std::io::Result<usize> {
-        let (pending_start, fill) = self.read.prepare_fill();
+        let (pending_start, fill) = self.read.prepare_fill()?;
         let (res, fill) = self.io.read(fill).await.into_parts();
         self.read.finish_fill(fill, pending_start);
         res
@@ -284,13 +346,20 @@ where
             return Ok(None);
         };
 
-        let frame_len = frame.len();
+        let start = self.read.pending().start();
+        let (payload_range, frame_len) = frame.checked_bounds(self.read.pending().len())?;
+        let abs_prefix = start
+            .checked_add(payload_range.start)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
+        let abs_payload_end = start
+            .checked_add(payload_range.end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
+        let frame_end = start
+            .checked_add(frame_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
         let slice = self.read.take_inner();
-        let start = slice.start();
         let buf = slice.into_inner();
 
-        let abs_prefix = start + frame.prefix();
-        let abs_payload_end = abs_prefix + frame.payload();
         let payload = Slice::new(buf, abs_prefix, abs_payload_end);
         let decoded = if at_eof {
             self.codec.decode_eof(&payload)
@@ -299,7 +368,6 @@ where
         };
         let buf = payload.into_inner();
 
-        let frame_end = start + frame_len;
         self.read.restore_from_parts(buf, frame_end);
 
         decoded

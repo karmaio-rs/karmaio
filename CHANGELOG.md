@@ -10,11 +10,13 @@ During the `0.1.0` alpha series, APIs and behavior may change between prerelease
 ### Added
 
 - Added `runtime::{CancellationSource, CancellationToken, FutureExt}` for fail-slow eager cancellation of ordinary I/O futures and helpers. Tokens are copyable and observation-only, one source can cover many operations, nested tokens compose, and lazily submitted multishot streams can be wrapped through `runtime::StreamExt`.
+- Added `FramedReadParts`, `FramedWriteParts`, and `FramedParts` for lossless decomposition of framed adapters. `into_parts()` extracts the transport, codec, framer, and buffers; `from_parts()` validates the unread range and reconstructs the adapter.
 
 ### Changed
 
 - Dropping a submitted one-shot I/O future now requests best-effort platform cancellation before detaching. The runtime retains kernel-owned payloads until terminal completion.
 - Platform cancellation errors are normalized to `OperationCanceled` at the operation boundary and remain classifiable with `is_operation_canceled`.
+- `Framer::enclose` is now fallible (`io::Result<()>`), propagating buffer growth and payload-size errors through `Sink::send` instead of panicking.
 
 ### Removed
 

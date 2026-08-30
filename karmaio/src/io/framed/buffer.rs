@@ -1,6 +1,8 @@
+use std::{io, ops::Range};
+
 use crate::buf::{IoBufMut, IoBufMutExt, Slice};
 
-const DEFAULT_RESERVE: usize = 8 * 1024;
+const DEFAULT_RESERVE: usize = 16;
 
 /// Progress tracker over an owned buffer for framed reads.
 ///
@@ -62,29 +64,30 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
     }
 
     /// Ensures spare capacity for reading more bytes into the uninitialized tail.
-    pub(super) fn reserve(&mut self, additional: usize) {
+    pub(super) fn reserve(&mut self, additional: usize) -> io::Result<()> {
         let slice = self.take_inner();
         let start = slice.start();
         let mut buf = slice.into_inner();
         let init = buf.as_init().len();
         let spare = buf.as_uninit().len().saturating_sub(init);
-        if spare < additional {
-            buf.reserve(additional - spare)
-                .expect("failed to reserve framed read buffer");
+        if spare < additional
+            && let Err(error) = buf.reserve(additional)
+        {
+            self.restore_from_parts(buf, start);
+            return Err(error);
         }
         let init = buf.as_init().len();
         let end = buf.as_uninit().len().max(init);
         let start = start.min(init);
         self.restore_inner(Slice::new(buf, start, end));
+        Ok(())
     }
 
     /// Compacts a large consumed prefix and returns an owned fill slice.
     ///
     /// Returns `(pending_start, fill_slice)`. After the read completes, call
     /// [`Self::finish_fill`] with the same `pending_start` and the number read.
-    pub(super) fn prepare_fill(&mut self) -> (usize, Slice<B>) {
-        self.reserve(DEFAULT_RESERVE);
-
+    pub(super) fn prepare_fill(&mut self) -> io::Result<(usize, Slice<B>)> {
         let slice = self.take_inner();
         let mut pending_start = slice.start();
         let mut buf = slice.into_inner();
@@ -102,16 +105,17 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
             pending_start = 0;
         }
 
-        let init = buf.as_init().len();
-        if init >= buf.as_uninit().len() {
-            buf.reserve(DEFAULT_RESERVE)
-                .expect("failed to reserve framed read buffer");
-        }
+        self.restore_from_parts(buf, pending_start);
+        self.reserve(DEFAULT_RESERVE)?;
+
+        let slice = self.take_inner();
+        let pending_start = slice.start();
+        let mut buf = slice.into_inner();
         let init = buf.as_init().len();
         let end = buf.as_uninit().len().max(init);
         // Fill window is the uninitialized tail [init, capacity).
         let fill = Slice::new(buf, init, end);
-        (pending_start, fill)
+        Ok((pending_start, fill))
     }
 
     /// Restores the read cursor after a fill.
@@ -127,5 +131,104 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
     #[allow(dead_code)]
     pub(super) fn get_ref(&self) -> &B {
         self.pending().get_ref()
+    }
+
+    /// Decomposes the buffer into the owned inner buffer and the unread byte range.
+    pub(super) fn into_parts(mut self) -> (B, Range<usize>) {
+        let slice = self.take_inner();
+        let start = slice.start();
+        let buf = slice.into_inner();
+        let end = buf.as_init().len();
+        (buf, start..end)
+    }
+
+    /// Reconstructs a `ReadBuffer` from a raw buffer and an unread range.
+    ///
+    /// The range must satisfy `start <= end` and `end == buf.as_init().len()`.
+    pub(super) fn from_parts(mut buf: B, unread: Range<usize>) -> io::Result<Self> {
+        let initialized = buf.as_init().len();
+        if unread.start > unread.end || unread.end != initialized {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unread range must end at the initialized buffer length",
+            ));
+        }
+        let end = buf.as_uninit().len().max(initialized);
+        Ok(Self(Some(Slice::new(buf, unread.start, end))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::mem::MaybeUninit;
+
+    use super::*;
+    use crate::buf::{IoBuf, SetLen};
+
+    struct FixedBuffer {
+        bytes: Box<[MaybeUninit<u8>]>,
+        initialized: usize,
+    }
+
+    impl FixedBuffer {
+        fn with_capacity(capacity: usize) -> Self {
+            Self {
+                bytes: Box::new_uninit_slice(capacity),
+                initialized: 0,
+            }
+        }
+
+        fn initialized(capacity: usize) -> Self {
+            let mut buffer = Self::with_capacity(capacity);
+            buffer.bytes.fill(MaybeUninit::new(0));
+            buffer.initialized = capacity;
+            buffer
+        }
+    }
+
+    impl IoBuf for FixedBuffer {
+        fn as_init(&self) -> &[u8] {
+            // Safety: the initialized prefix is maintained by SetLen.
+            unsafe { std::slice::from_raw_parts(self.bytes.as_ptr().cast(), self.initialized) }
+        }
+    }
+
+    impl SetLen for FixedBuffer {
+        unsafe fn set_len(&mut self, len: usize) {
+            assert!(len <= self.bytes.len());
+            self.initialized = len;
+        }
+    }
+
+    impl IoBufMut for FixedBuffer {
+        fn as_uninit(&mut self) -> &mut [MaybeUninit<u8>] {
+            &mut self.bytes
+        }
+    }
+
+    #[test]
+    fn failed_reserve_preserves_the_owned_buffer() {
+        let mut buffer = ReadBuffer::new_with(FixedBuffer::with_capacity(4));
+
+        let error = buffer.reserve(8).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert_eq!(buffer.get_ref().bytes.len(), 4);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn prepare_fill_compacts_before_requesting_growth() {
+        let mut buffer = ReadBuffer::new_with(FixedBuffer::initialized(DEFAULT_RESERVE));
+        let slice = buffer.take_inner();
+        let buf = slice.into_inner();
+        buffer.restore_from_parts(buf, DEFAULT_RESERVE);
+
+        let (pending_start, mut fill) = buffer.prepare_fill().unwrap();
+
+        assert_eq!(pending_start, 0);
+        assert_eq!(fill.start(), 0);
+        assert!(fill.as_init().is_empty());
+        assert_eq!(fill.buf_capacity(), DEFAULT_RESERVE);
     }
 }

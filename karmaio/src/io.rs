@@ -16,8 +16,8 @@ mod stream;
 mod write;
 
 pub use framed::{
-    AnyDelimited, BytesCodec, CharDelimited, Decoder, Encoder, Frame, Framed, FramedRead, FramedWrite, Framer,
-    LengthDelimited, LineDelimited, NoopFramer,
+    AnyDelimited, BytesCodec, CharDelimited, Decoder, Encoder, Frame, Framed, FramedParts, FramedRead,
+    FramedReadParts, FramedWrite, FramedWriteParts, Framer, LengthDelimited, LineDelimited, NoopFramer,
 };
 pub use read::{
     AsyncBufRead, AsyncRead, AsyncReadAt, AsyncReadAtExt, AsyncReadExt, AsyncReadManaged, AsyncReadMulti, BufReader,

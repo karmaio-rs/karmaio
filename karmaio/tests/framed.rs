@@ -4,9 +4,10 @@ use std::collections::VecDeque;
 use std::io;
 
 use karmaio::Runtime;
-use karmaio::buf::{BufResult, IoBufMut};
+use karmaio::buf::{BufResult, IoBufMut, Slice};
 use karmaio::io::{
-    AsyncRead, AsyncWrite, BytesCodec, Framed, FramedRead, FramedWrite, LengthDelimited, LineDelimited, Sink, Stream,
+    AsyncRead, AsyncWrite, BytesCodec, Frame, Framed, FramedParts, FramedRead, FramedReadParts, FramedWrite,
+    FramedWriteParts, Framer, LengthDelimited, LineDelimited, Sink, Stream,
 };
 
 // Scripted mock reader that returns pre-queued chunk results.
@@ -35,6 +36,18 @@ impl AsyncRead for MockRead {
 
 struct MockWrite {
     data: Vec<u8>,
+}
+
+struct InvalidFramer;
+
+impl<B: IoBufMut> Framer<B> for InvalidFramer {
+    fn enclose(&mut self, _buf: &mut B) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn extract(&mut self, _buf: &Slice<B>) -> io::Result<Option<Frame>> {
+        Ok(Some(Frame::new(usize::MAX, 1, 0)))
+    }
 }
 
 impl AsyncWrite for MockWrite {
@@ -143,6 +156,19 @@ fn framed_read_split_across_packets() {
 }
 
 #[test]
+fn invalid_frame_bounds_return_an_error_without_losing_input() {
+    Runtime::new().unwrap().block_on(async {
+        let mock = mock! { Ok(b"x".to_vec()) };
+        let mut framed = FramedRead::new(mock, BytesCodec::new(), InvalidFramer);
+
+        let error = framed.next().await.unwrap().unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(framed.read_buffer(), b"x");
+    });
+}
+
+#[test]
 fn framed_write_length_delimited() {
     let mut rt = Runtime::new().unwrap();
     rt.block_on(async {
@@ -233,4 +259,99 @@ fn framed_length_eof_with_partial_frame_errors() {
         let err = framed.next().await.unwrap().unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     });
+}
+
+#[test]
+fn read_parts_round_trip() {
+    Runtime::new().unwrap().block_on(async {
+        // Two 1-byte frames: 5 bytes each = 10 bytes total, fits in 16-byte reserve.
+        let mock = mock! { Ok(b"\0\0\0\x01A\0\0\0\x01B".to_vec()) };
+        let mut framed = FramedRead::new(mock, BytesCodec::new(), LengthDelimited::new());
+        assert_eq!(framed.next().await.unwrap().unwrap(), b"A");
+
+        let parts = framed.into_parts();
+        assert_eq!(&parts.read_buf[parts.unread.clone()], b"\0\0\0\x01B");
+
+        let mut framed = match FramedRead::from_parts(parts) {
+            Ok(f) => f,
+            Err(_) => panic!("valid parts must reconstruct"),
+        };
+        assert_eq!(framed.next().await.unwrap().unwrap(), b"B");
+        assert!(framed.next().await.is_none());
+    });
+}
+
+#[test]
+fn read_parts_rejects_invalid_range() {
+    let mock = mock! { Ok(vec![]) };
+    let framed = FramedRead::new(mock, BytesCodec::new(), LengthDelimited::new());
+    let mut parts = framed.into_parts();
+    parts.unread = 5..2; // start > end
+    assert!(FramedRead::from_parts(parts).is_err());
+}
+
+#[test]
+fn write_parts_round_trip() {
+    Runtime::new().unwrap().block_on(async {
+        let mut framed =
+            FramedWrite::new(MockWrite { data: Vec::new() }, BytesCodec::new(), LengthDelimited::new());
+        framed.send(b"hi".to_vec()).await.unwrap();
+
+        let parts = match framed.try_into_parts() {
+            Ok(p) => p,
+            Err(_) => panic!("writer must be settled"),
+        };
+        assert!(parts.buffer.is_empty());
+
+        let mut framed = FramedWrite::from_parts(parts);
+        framed.send(b"there".to_vec()).await.unwrap();
+        framed.close().await.unwrap();
+
+        // Recover the writer and verify via a fresh reader.
+        let parts = match framed.try_into_parts() {
+            Ok(p) => p,
+            Err(_) => panic!("writer must be settled"),
+        };
+        let mock = mock! { Ok(parts.io.data) };
+        let mut reader = FramedRead::new(mock, BytesCodec::new(), LengthDelimited::new());
+        assert_eq!(reader.next().await.unwrap().unwrap(), b"hi");
+        assert_eq!(reader.next().await.unwrap().unwrap(), b"there");
+    });
+}
+
+#[test]
+fn duplex_parts_round_trip() {
+    Runtime::new().unwrap().block_on(async {
+        // Write side: encode and write to a buffer.
+        let mut w = MockWrite { data: Vec::new() };
+        {
+            let mut framed = Framed::new(&mut w, BytesCodec::new(), LengthDelimited::new());
+            framed.send(b"A".to_vec()).await.unwrap();
+            framed.send(b"B".to_vec()).await.unwrap();
+            framed.flush().await.unwrap();
+        }
+        assert_eq!(&w.data[..], b"\0\0\0\x01A\0\0\0\x01B");
+
+        // Read side: decompose and recompose, verifying buffer preservation.
+        let mock = mock! { Ok(w.data.clone()) };
+        let mut framed = Framed::new(mock, BytesCodec::new(), LengthDelimited::new());
+        assert_eq!(framed.next().await.unwrap().unwrap(), b"A");
+
+        let parts = framed.into_parts();
+        let mut framed = match Framed::from_parts(parts) {
+            Ok(f) => f,
+            Err(_) => panic!("valid parts must reconstruct"),
+        };
+        assert_eq!(framed.next().await.unwrap().unwrap(), b"B");
+        assert!(framed.next().await.is_none());
+    });
+}
+
+#[test]
+fn duplex_parts_rejects_invalid_range() {
+    let mock = mock! { Ok(vec![]) };
+    let framed = Framed::new(mock, BytesCodec::new(), LengthDelimited::new());
+    let mut parts = framed.into_parts();
+    parts.unread = 5..2;
+    assert!(Framed::from_parts(parts).is_err());
 }

@@ -24,6 +24,6 @@ mod framed_write;
 
 pub use codec::{BytesCodec, Decoder, Encoder};
 pub use frame::{AnyDelimited, CharDelimited, Frame, Framer, LengthDelimited, LineDelimited, NoopFramer};
-pub use framed_read::FramedRead;
-pub use framed_rw::Framed;
-pub use framed_write::FramedWrite;
+pub use framed_read::{FramedRead, FramedReadParts};
+pub use framed_rw::{Framed, FramedParts};
+pub use framed_write::{FramedWrite, FramedWriteParts};

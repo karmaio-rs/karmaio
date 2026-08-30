@@ -1,3 +1,5 @@
+use std::{io, ops::Range};
+
 use crate::{
     buf::{IoBufMut, IoBufMutExt, Slice},
     io::{
@@ -17,6 +19,21 @@ pub(super) enum ReadState {
     Paused,
     /// The last operation failed; the next poll recovers to paused.
     Errored,
+}
+
+/// Lossless components of a [`FramedRead`], obtained via [`FramedRead::into_parts`].
+#[derive(Debug)]
+pub struct FramedReadParts<R, C, F, B> {
+    /// Underlying transport.
+    pub io: R,
+    /// Payload decoder.
+    pub codec: C,
+    /// Byte-level framer.
+    pub framer: F,
+    /// Owned read buffer, including any consumed prefix.
+    pub read_buf: B,
+    /// Initialized unread range within `read_buf`.
+    pub unread: Range<usize>,
 }
 
 /// A framed reader that adapts an [`AsyncRead`] into a [`Stream`] of decoded items.
@@ -142,6 +159,43 @@ where
             state: self.state,
         }
     }
+
+    /// Decomposes the reader into its constituent parts.
+    ///
+    /// This is always successful because reads are not retained across poll
+    /// boundaries (dropping `Stream::next` cancels the read).
+    pub fn into_parts(self) -> FramedReadParts<R, C, F, B> {
+        let (read_buf, unread) = self.read.into_parts();
+        FramedReadParts {
+            io: self.io,
+            codec: self.codec,
+            framer: self.framer,
+            read_buf,
+            unread,
+        }
+    }
+
+    /// Rebuilds a reader from previously obtained parts.
+    ///
+    /// Returns `Err(parts)` if the unread range is inconsistent with the buffer.
+    pub fn from_parts(parts: FramedReadParts<R, C, F, B>) -> Result<Self, FramedReadParts<R, C, F, B>> {
+        // Validate before destructuring so we can return parts on failure.
+        let valid = parts.unread.start <= parts.unread.end
+            && parts.unread.end == parts.read_buf.as_init().len();
+        if !valid {
+            return Err(parts);
+        }
+        let FramedReadParts { io, codec, framer, read_buf, unread } = parts;
+        let read = ReadBuffer::from_parts(read_buf, unread)
+            .expect("framed-read parts were validated");
+        Ok(FramedRead {
+            io,
+            codec,
+            framer,
+            read,
+            state: ReadState::Framing,
+        })
+    }
 }
 
 impl<R, C, F, B> Stream for FramedRead<R, C, F, B>
@@ -215,7 +269,7 @@ where
     B: IoBufMut + IoBufMutExt,
 {
     async fn fill(&mut self) -> std::io::Result<usize> {
-        let (pending_start, fill) = self.read.prepare_fill();
+        let (pending_start, fill) = self.read.prepare_fill()?;
         let (res, fill) = self.io.read(fill).await.into_parts();
         self.read.finish_fill(fill, pending_start);
         res
@@ -253,14 +307,21 @@ where
             return Ok(None);
         };
 
-        let frame_len = frame.len();
+        let start = self.read.pending().start();
+        let (payload_range, frame_len) = frame.checked_bounds(self.read.pending().len())?;
+        let abs_prefix = start
+            .checked_add(payload_range.start)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
+        let abs_payload_end = start
+            .checked_add(payload_range.end)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
+        let frame_end = start
+            .checked_add(frame_len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
         let slice = self.read.take_inner();
-        let start = slice.start();
         let buf = slice.into_inner();
 
         // Frame offsets are relative to the pending view (absolute = start + offset).
-        let abs_prefix = start + frame.prefix();
-        let abs_payload_end = abs_prefix + frame.payload();
         let payload = Slice::new(buf, abs_prefix, abs_payload_end);
         let decoded = if at_eof {
             self.codec.decode_eof(&payload)
@@ -269,7 +330,6 @@ where
         };
         let buf = payload.into_inner();
 
-        let frame_end = start + frame_len;
         self.read.restore_from_parts(buf, frame_end);
 
         decoded

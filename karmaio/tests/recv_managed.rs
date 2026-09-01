@@ -4,13 +4,13 @@
 
 #![cfg(all(target_os = "linux", feature = "net", feature = "macros"))]
 
-use std::io::Write;
-use std::net::SocketAddr;
-use std::thread;
+use std::{io::Write, net::SocketAddr, thread, time::Duration};
 
 use karmaio::io::AsyncReadManaged;
 use karmaio::net::tcp::TcpListener;
 use karmaio::net::udp::UdpSocket;
+use karmaio::runtime::{CancellationSource, FutureExt, is_operation_canceled, spawn_local};
+use karmaio::time::sleep;
 
 #[karmaio::test]
 async fn tcp_recv_managed_reads_payload() {
@@ -39,6 +39,90 @@ async fn tcp_recv_managed_reads_payload() {
 
     drop(client.join().expect("client"));
     client2.join().expect("client2");
+}
+
+#[karmaio::test(buffer_pool_size = 1, buffer_pool_buffer_len = 1)]
+async fn owned_read_half_returns_exact_ranges_and_recycles_leases() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let mut stream = std::net::TcpStream::connect(addr).expect("connect");
+        stream.write_all(b"ab").expect("write");
+    });
+
+    let (stream, _) = listener.accept().await.expect("accept");
+    let (mut read_half, write_half) = stream.into_split();
+    let first = read_half
+        .read_managed(0)
+        .await
+        .expect("first read")
+        .expect("first byte");
+    assert_eq!(&first[..], b"a");
+    first.release();
+
+    let second = read_half
+        .read_managed(0)
+        .await
+        .expect("second read")
+        .expect("second byte");
+    assert_eq!(&second[..], b"b");
+    drop(second);
+    assert!(read_half.read_managed(0).await.expect("EOF read").is_none());
+
+    drop(read_half);
+    drop(write_half);
+    client.join().expect("client");
+}
+
+#[karmaio::test]
+async fn owned_read_half_managed_read_observes_cancellation() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = thread::spawn(move || std::net::TcpStream::connect(addr).expect("connect"));
+
+    let (stream, _) = listener.accept().await.expect("accept");
+    let (mut read_half, write_half) = stream.into_split();
+    let source = CancellationSource::new();
+    let token = source.token();
+    spawn_local(async move {
+        sleep(Duration::from_millis(20)).await;
+        source.cancel();
+    });
+
+    let error = read_half
+        .read_managed(0)
+        .with_cancellation(token)
+        .await
+        .expect_err("managed read should be canceled");
+    assert!(is_operation_canceled(&error), "{error:?}");
+
+    drop(read_half);
+    drop(write_half);
+    drop(client.join().expect("client"));
+}
+
+#[karmaio::test]
+async fn owned_read_half_managed_read_reports_connection_error() {
+    let listener = TcpListener::bind("127.0.0.1:0".parse::<SocketAddr>().unwrap()).unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = thread::spawn(move || {
+        let stream = std::net::TcpStream::connect(addr).expect("connect");
+        socket2::SockRef::from(&stream)
+            .set_linger(Some(Duration::ZERO))
+            .expect("set linger");
+    });
+
+    let (stream, _) = listener.accept().await.expect("accept");
+    let (mut read_half, write_half) = stream.into_split();
+    client.join().expect("client");
+    let error = read_half.read_managed(0).await.expect_err("reset should be reported");
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+    ));
+
+    drop(read_half);
+    drop(write_half);
 }
 
 #[karmaio::test]

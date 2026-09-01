@@ -6,6 +6,9 @@ use crate::{
     io::{AsyncRead, AsyncWrite},
 };
 
+#[cfg(target_os = "linux")]
+use crate::{buf::PooledBuf, io::AsyncReadManaged};
+
 pub(super) fn split<'a, T>(stream: &'a T) -> (ReadHalf<'a, T>, WriteHalf<'a, T>)
 where
     &'a T: AsyncRead + AsyncWrite,
@@ -140,6 +143,15 @@ impl<T> AsyncRead for OwnedReadHalf<T> {
     async fn read_vectored<V: IoVectoredBufMut>(&mut self, bufs: V) -> BufResult<usize, V> {
         let (result, bufs) = self.inner.recvmsg(bufs).await.into_parts();
         BufResult(result.map(|(n, _)| n), bufs)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl<T> AsyncReadManaged for OwnedReadHalf<T> {
+    type Buffer = PooledBuf;
+
+    async fn read_managed(&mut self, len: usize) -> std::io::Result<Option<Self::Buffer>> {
+        self.inner.recv_managed(len).await
     }
 }
 

@@ -26,6 +26,10 @@ pub mod process;
 #[cfg_attr(docsrs, doc(cfg(feature = "signal")))]
 pub mod signal;
 
+#[cfg(feature = "tls-rustls")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tls-rustls")))]
+pub mod tls;
+
 pub(crate) mod driver;
 pub(crate) mod slab;
 pub(crate) mod task;

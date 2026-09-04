@@ -9,6 +9,7 @@ During the `0.1.0` alpha series, APIs and behavior may change between prerelease
 
 ### Added
 
+- Added feature-gated, completion-native Rustls 0.23 client and server TLS streams with bounded owned buffers, native bounded vectored reads and writes, write-through encrypted I/O, per-connection ALPN, connection metadata and key exporters, truncation detection, graceful `close_notify`, and cancellation-aware terminal states.
 - Added `runtime::{CancellationSource, CancellationToken, FutureExt}` for fail-slow eager cancellation of ordinary I/O futures and helpers. Tokens are copyable and observation-only, one source can cover many operations, nested tokens compose, and lazily submitted multishot streams can be wrapped through `runtime::StreamExt`.
 - Added `FramedReadParts`, `FramedWriteParts`, and `FramedParts` for lossless decomposition of framed adapters. `into_parts()` extracts the transport, codec, framer, and buffers; `from_parts()` validates the unread range and reconstructs the adapter.
 

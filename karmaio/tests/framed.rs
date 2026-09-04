@@ -6,8 +6,8 @@ use std::io;
 use karmaio::Runtime;
 use karmaio::buf::{BufResult, IoBufMut, Slice};
 use karmaio::io::{
-    AsyncRead, AsyncWrite, BytesCodec, Frame, Framed, FramedParts, FramedRead, FramedReadParts, FramedWrite,
-    FramedWriteParts, Framer, LengthDelimited, LineDelimited, Sink, Stream,
+    AsyncRead, AsyncWrite, BytesCodec, Frame, Framed, FramedRead, FramedWrite, Framer, LengthDelimited, LineDelimited,
+    Sink, Stream,
 };
 
 // Scripted mock reader that returns pre-queued chunk results.
@@ -286,15 +286,20 @@ fn read_parts_rejects_invalid_range() {
     let mock = mock! { Ok(vec![]) };
     let framed = FramedRead::new(mock, BytesCodec::new(), LengthDelimited::new());
     let mut parts = framed.into_parts();
-    parts.unread = 5..2; // start > end
+    let start = 5;
+    let end = 2;
+    parts.unread = start..end; // start > end
     assert!(FramedRead::from_parts(parts).is_err());
 }
 
 #[test]
 fn write_parts_round_trip() {
     Runtime::new().unwrap().block_on(async {
-        let mut framed =
-            FramedWrite::new(MockWrite { data: Vec::new() }, BytesCodec::new(), LengthDelimited::new());
+        let mut framed = FramedWrite::new(
+            MockWrite { data: Vec::new() },
+            BytesCodec::new(),
+            LengthDelimited::new(),
+        );
         framed.send(b"hi".to_vec()).await.unwrap();
 
         let parts = match framed.try_into_parts() {
@@ -352,6 +357,8 @@ fn duplex_parts_rejects_invalid_range() {
     let mock = mock! { Ok(vec![]) };
     let framed = Framed::new(mock, BytesCodec::new(), LengthDelimited::new());
     let mut parts = framed.into_parts();
-    parts.unread = 5..2;
+    let start = 5;
+    let end = 2;
+    parts.unread = start..end;
     assert!(Framed::from_parts(parts).is_err());
 }

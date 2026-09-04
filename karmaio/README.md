@@ -20,7 +20,11 @@ The core runtime (`Runtime`, tasks, timers, `io` traits, buffers, and the platfo
 | `signal`  | `karmaio::signal` (Ctrl-C and Unix signals)                             |
 | `bytes`   | `IoBuf` / `IoBufMut` impls for `bytes::{Bytes, BytesMut}`               |
 | `memmap2` | `IoBuf` / `IoBufMut` impls for `memmap2::{Mmap, MmapMut}`               |
-| `full`    | All of the above                                                        |
+| `tls`     | Rustls TLS with `ring` and TLS 1.2                                     |
+| `tls-ring` | Rustls TLS with the `ring` provider                                   |
+| `tls-aws-lc-rs` | Rustls TLS with the AWS-LC provider                              |
+| `tls12`   | TLS 1.2 for either Rustls provider                                     |
+| `full`    | All subsystems, selecting `tls` rather than both TLS providers          |
 | `default` | Empty (nothing enabled)                                                 |
 
 ### Recommended dependency lines
@@ -37,7 +41,28 @@ karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net"] }
 
 # Filesystem + signals.
 karmaio = { version = "0.1.0-alpha.1", features = ["fs", "signal"] }
+
+# TCP and batteries-included Rustls TLS.
+karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net", "tls"] }
 ```
+
+## TLS
+
+`karmaio::tls` drives Rustls directly over Karmaio's owned-buffer I/O traits. The `tls` convenience feature selects `ring`, TLS 1.3, and TLS 1.2; applications can instead select `tls-ring` or `tls-aws-lc-rs`, with optional `tls12`.
+TLS does not imply `net` or `bytes`.
+
+Applications own verification policy. Supply an `Arc<ClientConfig>` or `Arc<ServerConfig>` with an explicit cryptographic provider, trust roots,
+identity, SNI, and ALPN policy. Karmaio does not install a global provider, discover roots, or offer an insecure verifier.
+
+TLS streams preserve the completion model and add no `Send` requirement. They are deliberately not splittable because reads may need to write protocol messages.
+Vectored reads fill caller components in order, and successful scalar and vectored writes are write-through and bounded.
+Graceful shutdown sends `close_notify`.
+A raw transport EOF without peer `close_notify` is reported as `UnexpectedEof` after buffered plaintext is delivered. `into_parts` is abrupt and performs no TLS or transport shutdown.
+
+Cancellation scopes propagate to the underlying operation and return caller buffers through `BufResult`.
+For established I/O, request cancellation and await the same future instead of dropping a timed-out future when buffer recovery matters.
+If an established I/O future is dropped in flight, later stream operations fail closed because transport progress is ambiguous.
+See the workspace `tls_client` and `tls_server` examples.
 
 ## Linux multishot I/O (6.12+)
 

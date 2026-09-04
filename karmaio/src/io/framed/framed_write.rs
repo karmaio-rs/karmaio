@@ -6,7 +6,7 @@ use crate::{
     },
 };
 
-/// Lossless components of a [`FramedWrite`], obtained via [`FramedWrite::into_parts`].
+/// Lossless components of a [`FramedWrite`], obtained via [`FramedWrite::try_into_parts`].
 #[derive(Debug)]
 pub struct FramedWriteParts<W, C, F, B> {
     /// Underlying transport.

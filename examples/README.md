@@ -30,6 +30,8 @@ cargo run --example <example_name>
 | **hello_world** | TCP client; pairs with `echo_tcp` / `echo_tcp_multi` on `127.0.0.1:8080`. |
 | **udp_echo** | UDP echo server on `127.0.0.1:8080`. |
 | **udp_client** | UDP client; pairs with `udp_echo`. |
+| **tls_server** | Rustls TLS echo server with explicit provider, DER identity, and ALPN. |
+| **tls_client** | Certificate-verifying Rustls TLS client with SNI and ALPN. |
 
 ### Tasks & runtime
 
@@ -74,6 +76,13 @@ nc 127.0.0.1 8081                     # terminal 2
 # UDP
 cargo run --example udp_echo          # terminal 1
 cargo run --example udp_client        # terminal 2
+
+# TLS with the checked-in test-only localhost identity
+cargo run --example tls_server -- \
+  ../karmaio/tests/fixtures/tls/localhost.der \
+  ../karmaio/tests/fixtures/tls/localhost-key.der
+cargo run --example tls_client -- \
+  ../karmaio/tests/fixtures/tls/ca.der
 ```
 
 ## Notes
@@ -85,3 +94,4 @@ cargo run --example udp_client        # terminal 2
 - Dropping an in-progress I/O future (e.g. via `timeout`) detaches from the result; kernel work may still complete. See runtime docs for details.
 - The **signal** example may need signals sent from another terminal (or Ctrl-C).
 - **process** uses `echo` / `cat` / `ls` (Unix-style); adjust if you are on a minimal environment.
+- The TLS DER identity is public test material. Never use it in a deployed service.

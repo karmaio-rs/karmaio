@@ -7,7 +7,7 @@ license = "MIT OR Apache-2.0"
 
 [features]
 default = ["full"]
-full = ["fs", "macros", "net", "process", "signal", "bytes", "memmap2"]
+full = ["fs", "macros", "net", "process", "signal", "bytes", "memmap2", "tls"]
 fs = ["karmaio/fs"]
 macros = ["karmaio/macros"]
 net = ["karmaio/net"]
@@ -15,6 +15,7 @@ process = ["karmaio/process"]
 signal = ["karmaio/signal"]
 bytes = ["karmaio/bytes"]
 memmap2 =["karmaio/memmap2"]
+tls = ["karmaio/tls"]
 
 [dependencies]
 karmaio = { path = "../karmaio", default-features = false }
@@ -86,3 +87,13 @@ required-features = ["macros", "net"]
 [[example]]
 name = "spawn_tasks"
 path = "spawn_tasks.rs"
+
+[[example]]
+name = "tls_client"
+path = "tls_client.rs"
+required-features = ["macros", "net", "tls"]
+
+[[example]]
+name = "tls_server"
+path = "tls_server.rs"
+required-features = ["macros", "net", "tls"]

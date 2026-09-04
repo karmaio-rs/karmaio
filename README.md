@@ -18,7 +18,11 @@ Heavy subsystems are feature-gated so consumers can trim compile time and binary
 | `signal`  | Ctrl-C and Unix signal handling                      |
 | `bytes`   | `IoBuf` / `IoBufMut` for `bytes::{Bytes, BytesMut}`  |
 | `memmap2` | `IoBuf` / `IoBufMut` for `memmap2::{Mmap, MmapMut}`  |
-| `full`    | All of the above                                     |
+| `tls`     | Rustls TLS with `ring` and TLS 1.2                    |
+| `tls-ring` | Rustls TLS with the `ring` provider                  |
+| `tls-aws-lc-rs` | Rustls TLS with the AWS-LC provider             |
+| `tls12`   | TLS 1.2 for either Rustls provider                    |
+| `full`    | All subsystems, selecting `tls` for TLS                |
 | `default` | Empty                                                |
 
 ```toml
@@ -30,7 +34,20 @@ karmaio = "0.1.0-alpha.1"
 
 # Networking + attribute macros.
 karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net"] }
+
+# Networking + batteries-included Rustls TLS.
+karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net", "tls"] }
 ```
+
+TLS is driven directly over Karmaio's owned-buffer I/O traits.
+The convenience feature does not itself imply `net` or `bytes`; advanced users can choose `tls-ring` or `tls-aws-lc-rs` and add `tls12` independently.
+Callers provide fully configured Rustls client or server configurations, including roots, identity, SNI, and ALPN policy.
+Karmaio does not mutate Rustls's global provider.
+
+TLS streams are intentionally not splittable. Vectored reads fill caller components in order; scalar and vectored writes are bounded and write-through.
+Shutdown sends `close_notify`, and a transport EOF without the peer's `close_notify` is surfaced as `UnexpectedEof`.
+Cancellation returns the original caller-owned buffer and conservatively poisons the stream when wire progress may be ambiguous.
+Dropping an established I/O future while it awaits the transport also makes later operations fail closed. See the `tls_client` and `tls_server` examples.
 
 See the [crate documentation](https://docs.rs/karmaio), the [examples](https://github.com/karmaio-rs/karmaio/tree/main/examples), and the [changelog](CHANGELOG.md) for more details.
 

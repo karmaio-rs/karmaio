@@ -180,14 +180,18 @@ where
     /// Returns `Err(parts)` if the unread range is inconsistent with the buffer.
     pub fn from_parts(parts: FramedReadParts<R, C, F, B>) -> Result<Self, FramedReadParts<R, C, F, B>> {
         // Validate before destructuring so we can return parts on failure.
-        let valid = parts.unread.start <= parts.unread.end
-            && parts.unread.end == parts.read_buf.as_init().len();
+        let valid = parts.unread.start <= parts.unread.end && parts.unread.end == parts.read_buf.as_init().len();
         if !valid {
             return Err(parts);
         }
-        let FramedReadParts { io, codec, framer, read_buf, unread } = parts;
-        let read = ReadBuffer::from_parts(read_buf, unread)
-            .expect("framed-read parts were validated");
+        let FramedReadParts {
+            io,
+            codec,
+            framer,
+            read_buf,
+            unread,
+        } = parts;
+        let read = ReadBuffer::from_parts(read_buf, unread).expect("framed-read parts were validated");
         Ok(FramedRead {
             io,
             codec,

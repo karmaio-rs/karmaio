@@ -1,5 +1,7 @@
 //! TCP loopback round-trip for length-delimited framed I/O.
 
+#![cfg(all(feature = "macros", feature = "net"))]
+
 use std::net::SocketAddr;
 
 use karmaio::io::{BytesCodec, Framed, LengthDelimited, Sink, Stream};

@@ -1,3 +1,5 @@
+#![cfg(feature = "tls-ring")]
+
 use std::any::Any;
 use std::cell::RefCell;
 use std::collections::VecDeque;

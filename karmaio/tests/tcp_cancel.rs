@@ -1,5 +1,7 @@
 //! Eager cancellation for TCP one-shot reads and writes.
 
+#![cfg(all(feature = "macros", feature = "net"))]
+
 use std::{net::SocketAddr, time::Duration};
 
 use karmaio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

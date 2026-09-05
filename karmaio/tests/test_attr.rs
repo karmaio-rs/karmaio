@@ -1,3 +1,5 @@
+#![cfg(feature = "macros")]
+
 // Verifies that #[karmaio::test] drives an async test on a karmaio runtime.
 #[karmaio::test]
 async fn block_on_runs_the_body() {

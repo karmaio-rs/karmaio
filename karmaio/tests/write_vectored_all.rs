@@ -1,5 +1,7 @@
 //! Integration coverage for `write_vectored_all`.
 
+#![cfg(all(feature = "macros", feature = "net"))]
+
 use std::{net::SocketAddr, time::Duration};
 
 use karmaio::io::{AsyncReadExt, AsyncWriteExt};

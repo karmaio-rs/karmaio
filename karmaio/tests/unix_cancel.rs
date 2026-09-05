@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "macros", feature = "net"))]
 
 //! Eager cancellation for Unix stream one-shot reads and writes.
 

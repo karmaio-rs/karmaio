@@ -9,6 +9,8 @@ license.workspace = true
 
 version.workspace = true
 publish = ["crates-io"]
+# Integration tests and their fixtures remain available from the release tag.
+exclude = ["/tests/"]
 
 categories = ["asynchronous", "network-programming"]
 keywords = ["io", "thread-per-core", "io-uring", "async", "futures"]
@@ -95,70 +97,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
 ] }
-
-[[test]]
-name = "test_attr"
-required-features = ["macros"]
-
-[[test]]
-name = "framed_tcp"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "owned_split_contract"
-required-features = ["net"]
-
-[[test]]
-name = "tcp_owned_split"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "tcp_cancel"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "udp_cancel"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "unix_owned_split"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "unix_cancel"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "accept_multi"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "recv_managed"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "recv_multi"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "recv_from_managed"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "fs"
-required-features = ["fs"]
-
-[[test]]
-name = "write_vectored_all"
-required-features = ["macros", "net"]
-
-[[test]]
-name = "tls"
-required-features = ["tls-ring"]
-
-[[test]]
-name = "tls_cancel"
-required-features = ["macros", "net", "tls-ring"]
 
 [package.metadata.docs.rs]
 all-features = true

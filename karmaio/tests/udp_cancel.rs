@@ -1,5 +1,7 @@
 //! Eager cancellation for UDP datagram reads and writes.
 
+#![cfg(all(feature = "macros", feature = "net"))]
+
 use std::{net::SocketAddr, time::Duration};
 
 use karmaio::net::udp::UdpSocket;

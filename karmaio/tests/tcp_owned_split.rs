@@ -1,5 +1,7 @@
 //! Owned TCP stream splitting: `into_split`, reunification, and half lifecycle.
 
+#![cfg(all(feature = "macros", feature = "net"))]
+
 use std::{cell::Cell, net::SocketAddr, rc::Rc};
 
 use karmaio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};

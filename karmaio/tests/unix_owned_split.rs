@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(all(unix, feature = "macros", feature = "net"))]
 
 //! Owned Unix stream splitting: `into_split`, reunification, and half lifecycle.
 

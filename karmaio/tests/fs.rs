@@ -1,3 +1,5 @@
+#![cfg(feature = "fs")]
+
 use std::{
     collections::BTreeSet,
     future::{Future, poll_fn},

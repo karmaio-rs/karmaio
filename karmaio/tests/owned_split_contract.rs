@@ -1,5 +1,7 @@
 //! Public owned-split capability tests using an external mock transport.
 
+#![cfg(feature = "net")]
+
 use karmaio::{
     buf::{BufResult, IoBuf, IoBufMut},
     io::{AsyncRead, AsyncWrite},

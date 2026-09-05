@@ -1,3 +1,5 @@
+#![cfg(all(feature = "macros", feature = "net", feature = "tls-ring"))]
+
 use std::cell::Cell;
 use std::io;
 use std::net::SocketAddr;

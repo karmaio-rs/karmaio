@@ -3,7 +3,7 @@ resolver = "3"
 members = ["karmaio", "karmaio-macros", "examples"]
 
 [workspace.package]
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 authors = ["Tarak Sharma <tarak@taraksharma.com>"]
 edition = "2024"
 rust-version = "1.95"

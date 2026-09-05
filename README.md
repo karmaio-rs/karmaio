@@ -28,16 +28,16 @@ Heavy subsystems are feature-gated so consumers can trim compile time and binary
 
 ```toml
 # Full public API.
-karmaio = { version = "0.1.0-alpha.3", features = ["full"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["full"] }
 
 # Core runtime only (default).
-karmaio = "0.1.0-alpha.3"
+karmaio = "0.1.0-alpha.4"
 
 # Networking + attribute macros.
-karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["macros", "net"] }
 
 # Networking + batteries-included Rustls TLS.
-karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net", "tls"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["macros", "net", "tls"] }
 ```
 
 TLS is driven directly over Karmaio's owned-buffer I/O traits.

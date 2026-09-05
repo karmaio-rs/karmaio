@@ -73,7 +73,7 @@ socket2 = { version = "0.6", features = ["all"], optional = true }
 rustls = { version = "0.23.43", default-features = false, features = ["std"], optional = true }
 
 # Internal package dependeices for redistribution
-karmaio-macros = { path = "../karmaio-macros", version = "=0.1.0-alpha.3", optional = true }
+karmaio-macros = { path = "../karmaio-macros", version = "=0.1.0-alpha.4", optional = true }
 
 # Unix platform dependencies
 [target.'cfg(unix)'.dependencies]

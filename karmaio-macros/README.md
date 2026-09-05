@@ -7,7 +7,7 @@ This crate is an implementation detail of `karmaio` and is not intended to be us
 Enable the `macros` feature on `karmaio` instead:
 
 ```toml
-karmaio = { version = "0.1.0-alpha.3", features = ["macros"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["macros"] }
 ```
 
 That exposes the `#[karmaio::main]` and `#[karmaio::test]` attribute macros.

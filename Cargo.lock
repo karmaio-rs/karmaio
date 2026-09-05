@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "karmaio"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "bytes",
  "io-uring",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "karmaio-macros"
-version = "0.1.0-alpha.3"
+version = "0.1.0-alpha.4"
 dependencies = [
  "proc-macro2",
  "quote",

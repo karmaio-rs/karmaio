@@ -32,19 +32,19 @@ The core runtime (`Runtime`, tasks, timers, `io` traits, buffers, and the platfo
 
 ```toml
 # Full public API (apps / demos).
-karmaio = { version = "0.1.0-alpha.3", features = ["full"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["full"] }
 
 # Core runtime only.
-karmaio = "0.1.0-alpha.3"
+karmaio = "0.1.0-alpha.4"
 
 # Networking + attribute macros.
-karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["macros", "net"] }
 
 # Filesystem + signals.
-karmaio = { version = "0.1.0-alpha.3", features = ["fs", "signal"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["fs", "signal"] }
 
 # TCP and batteries-included Rustls TLS.
-karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net", "tls"] }
+karmaio = { version = "0.1.0-alpha.4", features = ["macros", "net", "tls"] }
 ```
 
 ## TLS

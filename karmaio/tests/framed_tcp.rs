@@ -15,7 +15,7 @@ async fn length_delimited_tcp_round_trip() {
 
     let server = spawn_local(async move {
         let (socket, _) = listener.accept().await.unwrap();
-        let mut framed = Framed::new(socket, BytesCodec::new(), LengthDelimited::new());
+        let mut framed = Framed::with_duplex(socket, BytesCodec::new(), LengthDelimited::new());
 
         let first = framed.next().await.unwrap().unwrap();
         assert_eq!(first, b"hello");
@@ -27,7 +27,7 @@ async fn length_delimited_tcp_round_trip() {
     });
 
     let stream = TcpStream::connect(addr).await.unwrap();
-    let mut framed = Framed::new(stream, BytesCodec::new(), LengthDelimited::new());
+    let mut framed = Framed::with_duplex(stream, BytesCodec::new(), LengthDelimited::new());
     framed.send(b"hello".to_vec()).await.unwrap();
     framed.send(b"world".to_vec()).await.unwrap();
     framed.flush().await.unwrap();

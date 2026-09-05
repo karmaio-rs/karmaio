@@ -6,6 +6,8 @@ use crate::{
     io::{AsyncRead, AsyncWrite},
 };
 
+pub use crate::io::IntoOwnedSplit;
+
 #[cfg(target_os = "linux")]
 use crate::{buf::PooledBuf, io::AsyncReadManaged};
 
@@ -77,32 +79,6 @@ impl<T> Deref for WriteHalf<'_, T> {
 // ---------------------------------------------------------------------------
 // Owned splitting
 // ---------------------------------------------------------------------------
-
-/// Consumes a duplex value and produces independently owned read and write halves.
-///
-/// Each half owns the underlying resource strongly enough to outlive the
-/// original stream value, so halves can be moved into separately supervised
-/// `'static` local tasks and used concurrently.
-///
-/// Neither half requires `Send` or `Sync` merely to satisfy this trait;
-/// the halves work on the local, share-nothing runtime.
-///
-/// Implementations must guarantee:
-///
-/// - Each half owns the underlying resource strongly enough to outlive the original stream value.
-/// - Dropping one half does not close the underlying resource while the other
-///   half or an in-flight operation still owns it.
-pub trait IntoOwnedSplit: Sized {
-    /// The type of the read half, which implements [`AsyncRead`].
-    type ReadHalf: AsyncRead + 'static;
-
-    /// The type of the write half, which implements [`AsyncWrite`].
-    type WriteHalf: AsyncWrite + 'static;
-
-    /// Consumes `self` and returns a read half and a write half that can be
-    /// used independently and concurrently.
-    fn into_split(self) -> (Self::ReadHalf, Self::WriteHalf);
-}
 
 /// Extends [`IntoOwnedSplit`] for transports that can reconstruct the original
 /// value from matching owned halves.

@@ -1,6 +1,9 @@
 use std::io;
 
-use crate::buf::{IoBuf, IoBufMut, IoBufMutExt, Slice};
+use crate::{
+    buf::{IoBuf, IoBufMut, IoBufMutExt, Slice},
+    io::framed::buffer::append,
+};
 
 /// Encodes typed values into an owned buffer (payload only; framing is separate).
 ///
@@ -63,7 +66,7 @@ impl<B: IoBufMut + IoBufMutExt> Encoder<Vec<u8>, B> for BytesCodec {
     type Error = io::Error;
 
     fn encode(&mut self, item: Vec<u8>, buf: &mut B) -> Result<(), Self::Error> {
-        buf.extend_from_slice(&item);
+        append(buf, &item)?;
         Ok(())
     }
 }

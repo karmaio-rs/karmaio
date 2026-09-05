@@ -28,7 +28,7 @@ async fn main() -> std::io::Result<()> {
         println!("accepted connection from {peer}");
 
         spawn_local(async move {
-            let mut framed = Framed::new(socket, BytesCodec::new(), LengthDelimited::new());
+            let mut framed = Framed::with_duplex(socket, BytesCodec::new(), LengthDelimited::new());
 
             while let Some(item) = framed.next().await {
                 match item {

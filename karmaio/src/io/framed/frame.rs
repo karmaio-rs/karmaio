@@ -1,6 +1,11 @@
 use std::io;
 
-use crate::buf::{IoBuf, IoBufExt, IoBufMut, IoBufMutExt, Slice};
+use crate::{
+    buf::{IoBuf, IoBufExt, IoBufMut, IoBufMutExt, Slice},
+    io::framed::buffer::append,
+};
+
+const DEFAULT_MAX_FRAME_LENGTH: usize = 8 * 1024 * 1024;
 
 /// An extracted frame describing where the payload sits inside a buffer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +118,7 @@ pub trait Framer<B: IoBufMut> {
 pub struct LengthDelimited {
     length_field_len: usize,
     length_field_is_big_endian: bool,
+    max_frame_length: usize,
 }
 
 impl Default for LengthDelimited {
@@ -120,6 +126,7 @@ impl Default for LengthDelimited {
         Self {
             length_field_len: 4,
             length_field_is_big_endian: true,
+            max_frame_length: DEFAULT_MAX_FRAME_LENGTH,
         }
     }
 }
@@ -143,7 +150,7 @@ impl LengthDelimited {
     ///
     /// # Panics
     ///
-    /// Panics if `len_field_len` is greater than 8.
+    /// Panics unless `len_field_len` is between 1 and 8, inclusive.
     pub fn set_length_field_len(mut self, len_field_len: usize) -> Self {
         assert!(
             len_field_len > 0 && len_field_len <= Self::MAX_LFL,
@@ -165,6 +172,19 @@ impl LengthDelimited {
         self.length_field_is_big_endian = big_endian;
         self
     }
+
+    /// Returns the largest payload accepted from or written to the wire.
+    #[inline]
+    pub fn max_frame_length(&self) -> usize {
+        self.max_frame_length
+    }
+
+    /// Sets the largest payload accepted from or written to the wire.
+    #[inline]
+    pub fn set_max_frame_length(mut self, max_frame_length: usize) -> Self {
+        self.max_frame_length = max_frame_length;
+        self
+    }
 }
 
 impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
@@ -174,6 +194,12 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
 
         let len_u64 = u64::try_from(len)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame payload length exceeds u64"))?;
+        if len > self.max_frame_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frame payload length exceeds configured maximum",
+            ));
+        }
         let max_payload = if lfl == Self::MAX_LFL {
             u64::MAX
         } else {
@@ -191,20 +217,31 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "enclosed frame length overflow"))?;
 
         buf.reserve(lfl)?;
+        if buf.as_uninit().len() < enclosed_len {
+            return Err(io::Error::other(
+                "buffer reserve did not provide space for the framed payload",
+            ));
+        }
         // Shift payload right to make room for the length prefix.
         buf.copy_within(0..len, lfl);
-        // Safety: copy_within initialized the shifted payload and the prefix is
-        // written immediately below before the enlarged length is observed.
-        unsafe { buf.set_len(enclosed_len) };
-        debug_assert!(IoBuf::as_init(buf).len() >= enclosed_len);
 
-        let mut len_bytes = [0u8; Self::MAX_LFL];
-        if self.length_field_is_big_endian {
-            len_bytes[Self::MAX_LFL - lfl..].copy_from_slice(&len_u64.to_be_bytes()[Self::MAX_LFL - lfl..]);
-            buf.as_mut_slice()[..lfl].copy_from_slice(&len_bytes[Self::MAX_LFL - lfl..]);
+        let len_bytes = if self.length_field_is_big_endian {
+            len_u64.to_be_bytes()
         } else {
-            len_bytes[..lfl].copy_from_slice(&len_u64.to_le_bytes()[..lfl]);
-            buf.as_mut_slice()[..lfl].copy_from_slice(&len_bytes[..lfl]);
+            len_u64.to_le_bytes()
+        };
+        let prefix = if self.length_field_is_big_endian {
+            &len_bytes[Self::MAX_LFL - lfl..]
+        } else {
+            &len_bytes[..lfl]
+        };
+
+        // Safety: the prefix destination is in the uniquely borrowed buffer,
+        // `copy_within` initialized the shifted payload, and `set_len` is only
+        // called after every byte in the enlarged initialized range was written.
+        unsafe {
+            std::ptr::copy_nonoverlapping(prefix.as_ptr(), buf.as_uninit().as_mut_ptr().cast::<u8>(), lfl);
+            buf.set_len(enclosed_len);
         }
         Ok(())
     }
@@ -219,13 +256,21 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
         }
 
         let mut len_bytes = [0u8; Self::MAX_LFL];
-        let payload_len = if self.length_field_is_big_endian {
+        let encoded_len = if self.length_field_is_big_endian {
             len_bytes[Self::MAX_LFL - lfl..].copy_from_slice(&data[..lfl]);
-            u64::from_be_bytes(len_bytes) as usize
+            u64::from_be_bytes(len_bytes)
         } else {
             len_bytes[..lfl].copy_from_slice(&data[..lfl]);
-            u64::from_le_bytes(len_bytes) as usize
+            u64::from_le_bytes(len_bytes)
         };
+        let payload_len = usize::try_from(encoded_len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "decoded payload length exceeds usize"))?;
+        if payload_len > self.max_frame_length {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "decoded frame length exceeds configured maximum",
+            ));
+        }
 
         let frame_len = lfl
             .checked_add(payload_len)
@@ -255,19 +300,53 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for LengthDelimited {
     }
 }
 
-/// Delimiter that uses a single character encoded as UTF-8.\
+/// Delimiter that uses a single character encoded as UTF-8.
 ///
 /// If you need to use a multi-byte delimiter or other encodings, consider using [`AnyDelimited`].
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct CharDelimited<const C: char> {
     char_buf: [u8; 4],
+    next_index: usize,
+    max_length: usize,
+}
+
+impl<const C: char> Default for CharDelimited<C> {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl<const C: char> CharDelimited<C> {
     /// Creates a new character-delimited framer.
     #[inline]
     pub fn new() -> Self {
-        Self { char_buf: [0; 4] }
+        Self {
+            char_buf: [0; 4],
+            next_index: 0,
+            max_length: DEFAULT_MAX_FRAME_LENGTH,
+        }
+    }
+
+    /// Creates a delimiter framer with a maximum inbound payload length.
+    #[inline]
+    pub fn new_with_max_length(max_length: usize) -> Self {
+        Self {
+            max_length,
+            ..Self::new()
+        }
+    }
+
+    /// Returns the maximum inbound payload length.
+    #[inline]
+    pub fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    /// Sets the maximum inbound payload length.
+    #[inline]
+    pub fn set_max_length(mut self, max_length: usize) -> Self {
+        self.max_length = max_length;
+        self
     }
 
     fn delimiter_bytes(&mut self) -> &[u8] {
@@ -285,23 +364,19 @@ impl<B: IoBufMut + IoBufMutExt, const C: char> Framer<B> for CharDelimited<C> {
             tmp[..n].copy_from_slice(bytes);
             (tmp, n)
         };
-        buf.reserve(delim.1)?;
-        buf.extend_from_slice(&delim.0[..delim.1]);
-        Ok(())
+        append(buf, &delim.0[..delim.1])
     }
 
     fn extract(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
         let data: &[u8] = buf;
-        let delim = self.delimiter_bytes();
-        let delim_len = delim.len();
-        if data.is_empty() {
-            return Ok(None);
-        }
-        if let Some(pos) = data.windows(delim_len).position(|w| w == delim) {
-            Ok(Some(Frame::new(0, pos, delim_len)))
-        } else {
-            Ok(None)
-        }
+        let (delimiter, delim_len) = {
+            let delim = self.delimiter_bytes();
+            let mut delimiter = [0; 4];
+            delimiter[..delim.len()].copy_from_slice(delim);
+            (delimiter, delim.len())
+        };
+        let delim = &delimiter[..delim_len];
+        extract_delimited(data, delim, &mut self.next_index, self.max_length)
     }
 
     fn extract_eof(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
@@ -310,9 +385,14 @@ impl<B: IoBufMut + IoBufMutExt, const C: char> Framer<B> for CharDelimited<C> {
         }
         let data: &[u8] = buf;
         if data.is_empty() {
+            self.next_index = 0;
             Ok(None)
+        } else if data.len() > self.max_length {
+            self.next_index = 0;
+            Err(delimited_frame_too_large())
         } else {
             // Final line without trailing delimiter.
+            self.next_index = 0;
             Ok(Some(Frame::new(0, data.len(), 0)))
         }
     }
@@ -322,33 +402,62 @@ impl<B: IoBufMut + IoBufMutExt, const C: char> Framer<B> for CharDelimited<C> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct AnyDelimited<'a> {
     bytes: &'a [u8],
+    next_index: usize,
+    max_length: usize,
 }
 
 impl<'a> AnyDelimited<'a> {
     /// Creates a new delimiter framer with the given delimiter bytes.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes` is empty because an empty byte sequence cannot make
+    /// framing progress.
     #[inline]
     pub fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes }
+        assert!(!bytes.is_empty(), "delimiter must not be empty");
+        Self {
+            bytes,
+            next_index: 0,
+            max_length: DEFAULT_MAX_FRAME_LENGTH,
+        }
+    }
+
+    /// Creates a delimiter framer with a maximum inbound payload length.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `bytes` is empty.
+    #[inline]
+    pub fn new_with_max_length(bytes: &'a [u8], max_length: usize) -> Self {
+        Self {
+            max_length,
+            ..Self::new(bytes)
+        }
+    }
+
+    /// Returns the maximum inbound payload length.
+    #[inline]
+    pub fn max_length(&self) -> usize {
+        self.max_length
+    }
+
+    /// Sets the maximum inbound payload length.
+    #[inline]
+    pub fn set_max_length(mut self, max_length: usize) -> Self {
+        self.max_length = max_length;
+        self
     }
 }
 
 impl<B: IoBufMut + IoBufMutExt> Framer<B> for AnyDelimited<'_> {
     fn enclose(&mut self, buf: &mut B) -> io::Result<()> {
-        buf.reserve(self.bytes.len())?;
-        buf.extend_from_slice(self.bytes);
-        Ok(())
+        append(buf, self.bytes)
     }
 
     fn extract(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
         let data: &[u8] = buf;
-        if data.is_empty() || self.bytes.is_empty() {
-            return Ok(None);
-        }
-        if let Some(pos) = data.windows(self.bytes.len()).position(|w| w == self.bytes) {
-            Ok(Some(Frame::new(0, pos, self.bytes.len())))
-        } else {
-            Ok(None)
-        }
+        extract_delimited(data, self.bytes, &mut self.next_index, self.max_length)
     }
 
     fn extract_eof(&mut self, buf: &Slice<B>) -> io::Result<Option<Frame>> {
@@ -357,11 +466,57 @@ impl<B: IoBufMut + IoBufMutExt> Framer<B> for AnyDelimited<'_> {
         }
         let data: &[u8] = buf;
         if data.is_empty() {
+            self.next_index = 0;
             Ok(None)
+        } else if data.len() > self.max_length {
+            self.next_index = 0;
+            Err(delimited_frame_too_large())
         } else {
+            self.next_index = 0;
             Ok(Some(Frame::new(0, data.len(), 0)))
         }
     }
+}
+
+fn extract_delimited(
+    data: &[u8],
+    delimiter: &[u8],
+    next_index: &mut usize,
+    max_length: usize,
+) -> io::Result<Option<Frame>> {
+    if data.is_empty() {
+        return Ok(None);
+    }
+
+    let delimiter_len = delimiter.len();
+    let read_to = data.len().min(max_length.saturating_add(delimiter_len));
+    let search_from = (*next_index).min(read_to);
+    if let Some(offset) = data[search_from..read_to]
+        .windows(delimiter_len)
+        .position(|window| window == delimiter)
+    {
+        let position = search_from + offset;
+        *next_index = 0;
+        return Ok(Some(Frame::new(0, position, delimiter_len)));
+    }
+
+    if data.len() > max_length {
+        let possible_delimiter_start = (1..delimiter_len)
+            .rev()
+            .find(|&overlap| data.ends_with(&delimiter[..overlap]))
+            .map(|overlap| data.len() - overlap);
+        if possible_delimiter_start.is_none_or(|start| start > max_length) {
+            *next_index = 0;
+            return Err(delimited_frame_too_large());
+        }
+    }
+
+    *next_index = read_to.saturating_sub(delimiter_len.saturating_sub(1));
+    Ok(None)
+}
+
+fn delimited_frame_too_large() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, "delimited frame exceeds configured maximum")
 }
 
 /// Newline (`\n`) delimited framing.
@@ -397,6 +552,7 @@ impl NoopFramer {
     /// Sets the maximum chunk size.
     #[inline]
     pub fn set_max_size(mut self, max_size: usize) -> Self {
+        assert!(max_size > 0, "no-op frame size must be non-zero");
         self.max_size = max_size;
         self
     }
@@ -450,6 +606,85 @@ mod tests {
         let error = framer.enclose(&mut buf).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
         assert_eq!(buf.len(), 256);
+    }
+
+    #[test]
+    fn length_delimited_enforces_configured_maximum() {
+        let mut framer = LengthDelimited::new().set_max_frame_length(3);
+        let mut payload = b"four".to_vec();
+        assert_eq!(
+            framer.enclose(&mut payload).unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        let view = b"\0\0\0\x04four".to_vec().slice(..);
+        assert_eq!(framer.extract(&view).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn delimiter_scan_resumes_near_the_previous_end() {
+        let mut framer = AnyDelimited::new(b"END");
+        let first = b"abcdefghijEN".to_vec().slice(..);
+        assert!(framer.extract(&first).unwrap().is_none());
+        assert_eq!(framer.next_index, 10);
+
+        let second = b"abcdefghijEND".to_vec().slice(..);
+        assert_eq!(framer.extract(&second).unwrap(), Some(Frame::new(0, 10, 3)));
+        assert_eq!(framer.next_index, 0);
+    }
+
+    #[test]
+    fn delimiter_enforces_configured_maximum() {
+        let mut framer = AnyDelimited::new_with_max_length(b"\n", 3);
+        let view = b"four".to_vec().slice(..);
+        assert_eq!(framer.extract(&view).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn byte_delimiter_allows_a_fragment_after_the_maximum_payload() {
+        let mut framer = AnyDelimited::new_with_max_length(b"END", 3);
+        let partial = b"abcE".to_vec().slice(..);
+        assert!(framer.extract(&partial).unwrap().is_none());
+
+        let complete = b"abcEND".to_vec().slice(..);
+        assert_eq!(framer.extract(&complete).unwrap(), Some(Frame::new(0, 3, 3)));
+    }
+
+    #[test]
+    fn character_delimiter_allows_a_fragment_after_the_maximum_payload() {
+        let mut framer = CharDelimited::<'ℝ'>::new_with_max_length(3);
+        let delimiter = "ℝ".as_bytes();
+
+        let mut partial = b"abc".to_vec();
+        partial.extend_from_slice(&delimiter[..2]);
+        assert!(framer.extract(&partial.slice(..)).unwrap().is_none());
+
+        let mut complete = b"abc".to_vec();
+        complete.extend_from_slice(delimiter);
+        assert_eq!(framer.extract(&complete.slice(..)).unwrap(), Some(Frame::new(0, 3, 3)));
+    }
+
+    #[test]
+    fn fragmented_delimiter_does_not_hide_an_oversized_payload() {
+        let mut framer = AnyDelimited::new_with_max_length(b"END", 3);
+        let view = b"abcdE".to_vec().slice(..);
+        assert_eq!(framer.extract(&view).unwrap_err().kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn eof_rejects_a_partial_delimiter_beyond_the_maximum_payload() {
+        let mut framer = AnyDelimited::new_with_max_length(b"END", 3);
+        let view = b"abcE".to_vec().slice(..);
+        assert_eq!(
+            framer.extract_eof(&view).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "delimiter must not be empty")]
+    fn delimiter_rejects_an_empty_sequence() {
+        let _ = AnyDelimited::new(b"");
     }
 
     #[cfg(target_pointer_width = "64")]
@@ -510,6 +745,12 @@ mod tests {
         let view = buf.slice(..);
         let frame = framer.extract(&view).unwrap().unwrap();
         assert_eq!(frame, Frame::new(0, 3, 0));
+    }
+
+    #[test]
+    #[should_panic(expected = "no-op frame size must be non-zero")]
+    fn noop_framer_rejects_zero_maximum() {
+        let _ = NoopFramer::new().set_max_size(0);
     }
 
     #[test]

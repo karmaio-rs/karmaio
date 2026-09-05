@@ -1,23 +1,26 @@
-use std::{io, ops::Range};
+use std::{future::Future, io, ops::Range, task::Poll};
 
 use crate::{
-    buf::{IoBufMut, IoBufMutExt, Slice},
+    buf::{IoBuf, IoBufMut, IoBufMutExt},
     io::{
-        AsyncRead, AsyncWrite, AsyncWriteExt, Sink, Stream,
+        AsyncRead, AsyncWrite, IntoOwnedSplit, Sink, Stream,
         framed::{
             buffer::ReadBuffer,
             codec::{Decoder, Encoder},
-            frame::{Frame, Framer},
-            framed_read::ReadState,
+            frame::Framer,
+            framed_read::{DecodeState, ReadIoState, next_item, settle_read},
+            framed_write::{WriteIoState, close_write, flush_write, send_item, settle_write},
         },
     },
 };
 
-/// Lossless components of a [`Framed`], obtained via [`Framed::into_parts`].
+/// Buffered components of a settled [`Framed`].
 #[derive(Debug)]
-pub struct FramedParts<IO, C, F, B> {
-    /// Underlying transport.
-    pub io: IO,
+pub struct FramedParts<R, W, C, F, B> {
+    /// Underlying reader.
+    pub reader: R,
+    /// Underlying writer.
+    pub writer: W,
     /// Payload codec.
     pub codec: C,
     /// Byte-level framer.
@@ -26,123 +29,216 @@ pub struct FramedParts<IO, C, F, B> {
     pub read_buf: B,
     /// Initialized unread range within `read_buf`.
     pub unread: Range<usize>,
-    /// Reusable write scratch buffer.
+    /// Reusable write scratch buffer, retaining the encoded frame after a
+    /// failed write.
     pub write_buf: B,
 }
 
-/// A duplex framed I/O adapter providing both [`Stream`] and [`Sink`] over one I/O object.
+/// Result of settling and decomposing a [`Framed`].
+#[derive(Debug)]
+pub struct SettledFramedParts<R, W, C, F, B> {
+    /// Recovered framed components.
+    pub parts: FramedParts<R, W, C, F, B>,
+    /// Result of a retained read, if one was active.
+    pub read_result: io::Result<()>,
+    /// Result of a retained write, if one was active.
+    pub write_result: io::Result<()>,
+}
+
+/// A completion-native framed adapter with independent reader and writer halves.
 ///
-/// Uses a [`Framer`] for byte layout and a codec for payload encode/decode. The owned
-/// buffer type defaults to `Vec<u8>` but can be any `B: IoBufMut + IoBufMutExt`.
-pub struct Framed<IO, C, F, B = Vec<u8>> {
-    io: IO,
+/// Each direction retains its own submitted operation, A cancelled read therefore does not prevent a write from making progress, and vice versa.
+///
+/// The reader and writer must provide independent progress. In particular,
+/// they should not be two handles that lock one duplex value for the lifetime
+/// of an asynchronous operation. Karmaio's TLS streams do not currently meet
+/// this requirement and are therefore not supported by this combined adapter.
+pub struct Framed<R, W, C, F, B = Vec<u8>> {
     codec: C,
     framer: F,
-    read: ReadBuffer<B>,
-    write: Option<B>,
-    state: ReadState,
+    read: ReadIoState<R, B>,
+    write: WriteIoState<W, B>,
+    state: DecodeState,
 }
 
-impl<IO, C, F> Framed<IO, C, F, Vec<u8>> {
-    /// Creates a new framed duplex with default buffer capacities.
-    pub fn new(io: IO, codec: C, framer: F) -> Self {
+impl<R, W, C, F> Framed<R, W, C, F, Vec<u8>> {
+    /// Creates an adapter over independently owned reader and writer halves.
+    pub fn new(reader: R, writer: W, codec: C, framer: F) -> Self {
         Self {
-            io,
             codec,
             framer,
-            read: ReadBuffer::new(),
-            write: Some(Vec::new()),
-            state: ReadState::Framing,
+            read: ReadIoState::Idle {
+                io: reader,
+                buffer: ReadBuffer::new(),
+            },
+            write: WriteIoState::Idle {
+                io: writer,
+                buffer: Vec::new(),
+            },
+            state: DecodeState::Framing,
         }
     }
 
-    /// Creates a new framed duplex with the given initial buffer capacity (both sides).
-    pub fn with_capacity(io: IO, codec: C, framer: F, capacity: usize) -> Self {
+    /// Creates an adapter with the given initial read and write capacities.
+    pub fn with_capacity(reader: R, writer: W, codec: C, framer: F, capacity: usize) -> Self {
         Self {
-            io,
             codec,
             framer,
-            read: ReadBuffer::with_capacity(capacity),
-            write: Some(Vec::with_capacity(capacity)),
-            state: ReadState::Framing,
+            read: ReadIoState::Idle {
+                io: reader,
+                buffer: ReadBuffer::with_capacity(capacity),
+            },
+            write: WriteIoState::Idle {
+                io: writer,
+                buffer: Vec::with_capacity(capacity),
+            },
+            state: DecodeState::Framing,
         }
     }
 }
 
-impl<IO, C, F, B> Framed<IO, C, F, B>
+impl<C, F> Framed<(), (), C, F, Vec<u8>> {
+    /// Splits a duplex transport and creates an adapter over its owned halves.
+    ///
+    /// [`IntoOwnedSplit`] is reserved for transports whose halves can make
+    /// independent progress. Karmaio TLS streams intentionally do not
+    /// implement it. Wrapping an unsplittable stream in a lock is not suitable
+    /// here because a retained read could prevent the write side from ever
+    /// acquiring that lock.
+    pub fn with_duplex<IO>(io: IO, codec: C, framer: F) -> Framed<IO::ReadHalf, IO::WriteHalf, C, F>
+    where
+        IO: IntoOwnedSplit,
+    {
+        let (reader, writer) = io.into_split();
+        Framed::new(reader, writer, codec, framer)
+    }
+
+    /// Splits a duplex transport and creates an adapter with initial buffer capacities.
+    ///
+    /// This has the same independent-progress requirement as
+    /// [`Self::with_duplex`].
+    pub fn with_duplex_capacity<IO>(
+        io: IO,
+        codec: C,
+        framer: F,
+        capacity: usize,
+    ) -> Framed<IO::ReadHalf, IO::WriteHalf, C, F>
+    where
+        IO: IntoOwnedSplit,
+    {
+        let (reader, writer) = io.into_split();
+        Framed::with_capacity(reader, writer, codec, framer, capacity)
+    }
+}
+
+impl<R, W, C, F, B> Framed<R, W, C, F, B>
 where
     B: IoBufMut + IoBufMutExt,
 {
-    /// Creates a new framed duplex using the provided read and write buffers.
-    pub fn with_buffer(io: IO, codec: C, framer: F, read_buf: B, write_buf: B) -> Self {
+    /// Creates an adapter using caller-provided read and write buffers.
+    pub fn with_buffer(reader: R, writer: W, codec: C, framer: F, read_buf: B, write_buf: B) -> Self {
         Self {
-            io,
             codec,
             framer,
-            read: ReadBuffer::new_with(read_buf),
-            write: Some(write_buf),
-            state: ReadState::Framing,
+            read: ReadIoState::Idle {
+                io: reader,
+                buffer: ReadBuffer::new_with(read_buf),
+            },
+            write: WriteIoState::Idle {
+                io: writer,
+                buffer: write_buf,
+            },
+            state: DecodeState::Framing,
         }
     }
 
-    /// Returns a reference to the underlying I/O object.
+    /// Returns the reader while no read is in progress.
     #[inline]
-    pub fn get_ref(&self) -> &IO {
-        &self.io
+    pub fn reader_ref(&self) -> Option<&R> {
+        self.read.io()
     }
 
-    /// Returns a mutable reference to the underlying I/O object.
+    /// Returns the reader mutably while no read is in progress.
     #[inline]
-    pub fn get_mut(&mut self) -> &mut IO {
-        &mut self.io
+    pub fn reader_mut(&mut self) -> Option<&mut R> {
+        self.read.io_mut()
     }
 
-    /// Consumes the framed adapter, returning the underlying I/O object.
+    /// Returns the writer while no write is in progress.
     #[inline]
-    pub fn into_inner(self) -> IO {
-        self.io
+    pub fn writer_ref(&self) -> Option<&W> {
+        self.write.io()
     }
 
-    /// Returns a reference to the codec.
+    /// Returns the writer mutably while no write is in progress.
+    #[inline]
+    pub fn writer_mut(&mut self) -> Option<&mut W> {
+        self.write.io_mut()
+    }
+
+    /// Returns whether an owned-buffer read is retained by the adapter.
+    #[inline]
+    pub fn is_reading(&self) -> bool {
+        self.read.is_reading()
+    }
+
+    /// Returns whether an owned-buffer write is retained by the adapter.
+    #[inline]
+    pub fn is_writing(&self) -> bool {
+        self.write.is_writing()
+    }
+
+    /// Returns the codec.
     #[inline]
     pub fn codec(&self) -> &C {
         &self.codec
     }
 
-    /// Returns a mutable reference to the codec.
+    /// Returns the codec mutably.
     #[inline]
     pub fn codec_mut(&mut self) -> &mut C {
         &mut self.codec
     }
 
-    /// Returns a reference to the framer.
+    /// Returns the framer.
     #[inline]
     pub fn framer(&self) -> &F {
         &self.framer
     }
 
-    /// Returns a mutable reference to the framer.
+    /// Returns the framer mutably.
     #[inline]
     pub fn framer_mut(&mut self) -> &mut F {
         &mut self.framer
     }
 
-    /// Returns a view of the pending read buffer.
+    /// Returns unread bytes while no read is in progress.
     #[inline]
-    pub fn read_buffer(&self) -> &[u8] {
-        self.read.pending()
+    pub fn read_buffer(&self) -> Option<&[u8]> {
+        self.read.buffer().map(|buffer| &buffer.pending()[..])
     }
 
-    /// Returns a view of the write scratch buffer.
+    /// Returns unread bytes mutably while no read is in progress.
     #[inline]
-    pub fn write_buffer(&self) -> &[u8] {
-        self.write.as_ref().map(|b| b.as_init()).unwrap_or(&[])
+    pub fn read_buffer_mut(&mut self) -> Option<&mut [u8]> {
+        self.read.buffer_mut().map(ReadBuffer::pending_mut)
     }
 
-    /// Maps the codec to another type, preserving buffers and framer.
-    pub fn map_codec<C2>(self, map: impl FnOnce(C) -> C2) -> Framed<IO, C2, F, B> {
+    /// Returns the write scratch bytes while no write is in progress.
+    #[inline]
+    pub fn write_buffer(&self) -> Option<&[u8]> {
+        self.write.buffer().map(IoBuf::as_init)
+    }
+
+    /// Returns the write scratch buffer mutably while no write is in progress.
+    #[inline]
+    pub fn write_buffer_mut(&mut self) -> Option<&mut B> {
+        self.write.buffer_mut()
+    }
+
+    /// Maps the codec while preserving retained operations.
+    pub fn map_codec<C2>(self, map: impl FnOnce(C) -> C2) -> Framed<R, W, C2, F, B> {
         Framed {
-            io: self.io,
             codec: map(self.codec),
             framer: self.framer,
             read: self.read,
@@ -151,10 +247,9 @@ where
         }
     }
 
-    /// Maps the framer to another type, preserving buffers and codec.
-    pub fn map_framer<F2>(self, map: impl FnOnce(F) -> F2) -> Framed<IO, C, F2, B> {
+    /// Maps the framer while preserving retained operations.
+    pub fn map_framer<F2>(self, map: impl FnOnce(F) -> F2) -> Framed<R, W, C, F2, B> {
         Framed {
-            io: self.io,
             codec: self.codec,
             framer: map(self.framer),
             read: self.read,
@@ -163,117 +258,95 @@ where
         }
     }
 
-    /// Decomposes the adapter into its constituent parts.
-    ///
-    /// This is always successful because reads are not retained across poll
-    /// boundaries (dropping `Stream::next` cancels the read).
-    pub fn into_parts(self) -> FramedParts<IO, C, F, B> {
-        let (read_buf, unread) = self.read.into_parts();
-        FramedParts {
-            io: self.io,
-            codec: self.codec,
-            framer: self.framer,
-            read_buf,
-            unread,
-            write_buf: self.write.expect("Framed write buffer missing during into_parts"),
+    /// Decomposes the adapter immediately if neither direction is active.
+    pub fn try_into_parts(self) -> Result<FramedParts<R, W, C, F, B>, Self> {
+        if self.read.is_reading() || self.write.is_writing() {
+            return Err(self);
         }
+        Ok(self.into_parts_unchecked())
     }
 
-    /// Rebuilds a duplex adapter from previously obtained parts.
+    /// Rebuilds a settled adapter from buffered components.
     ///
-    /// Returns `Err(parts)` if the unread range is inconsistent with the buffer.
-    pub fn from_parts(parts: FramedParts<IO, C, F, B>) -> Result<Self, FramedParts<IO, C, F, B>> {
-        // Validate before destructuring so we can return parts on failure.
+    /// Transient EOF and read-error state is reset
+    pub fn from_parts(parts: FramedParts<R, W, C, F, B>) -> Result<Self, FramedParts<R, W, C, F, B>> {
         let valid = parts.unread.start <= parts.unread.end && parts.unread.end == parts.read_buf.as_init().len();
         if !valid {
             return Err(parts);
         }
         let FramedParts {
-            io,
+            reader,
+            writer,
             codec,
             framer,
             read_buf,
             unread,
             write_buf,
         } = parts;
-        let read = ReadBuffer::from_parts(read_buf, unread).expect("framed parts were validated");
-        Ok(Framed {
-            io,
+        let buffer = ReadBuffer::from_parts(read_buf, unread).expect("framed parts were validated");
+        Ok(Self {
             codec,
             framer,
-            read,
-            write: Some(write_buf),
-            state: ReadState::Framing,
+            read: ReadIoState::Idle { io: reader, buffer },
+            write: WriteIoState::Idle {
+                io: writer,
+                buffer: write_buf,
+            },
+            state: DecodeState::Framing,
         })
     }
-}
 
-impl<IO, C, F, B> Stream for Framed<IO, C, F, B>
-where
-    IO: AsyncRead,
-    C: Decoder<B>,
-    F: Framer<B>,
-    B: IoBufMut + IoBufMutExt,
-{
-    type Item = Result<C::Item, C::Error>;
+    fn into_parts_unchecked(self) -> FramedParts<R, W, C, F, B> {
+        let ReadIoState::Idle { io: reader, buffer } = self.read else {
+            unreachable!("framed reader was not settled")
+        };
+        let WriteIoState::Idle {
+            io: writer,
+            buffer: write_buf,
+        } = self.write
+        else {
+            unreachable!("framed writer was not settled")
+        };
+        let (read_buf, unread) = buffer.into_parts();
+        FramedParts {
+            reader,
+            writer,
+            codec: self.codec,
+            framer: self.framer,
+            read_buf,
+            unread,
+            write_buf,
+        }
+    }
 
-    async fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            match self.state {
-                ReadState::Errored => {
-                    self.state = ReadState::Paused;
-                    return None;
-                }
-                ReadState::Paused => match self.fill().await {
-                    Ok(0) => return None,
-                    Ok(_) => self.state = ReadState::Framing,
-                    Err(e) => {
-                        self.state = ReadState::Errored;
-                        return Some(Err(e.into()));
-                    }
-                },
-                ReadState::Pausing => match self.try_decode_eof() {
-                    Ok(Some(item)) => return Some(Ok(item)),
-                    Ok(None) => {
-                        self.state = ReadState::Paused;
-                        return None;
-                    }
-                    Err(e) => {
-                        self.state = ReadState::Errored;
-                        return Some(Err(e));
-                    }
-                },
-                ReadState::Framing => {
-                    if !self.read.is_empty() {
-                        match self.try_decode() {
-                            Ok(Some(item)) => return Some(Ok(item)),
-                            Ok(None) => {}
-                            Err(e) => {
-                                self.state = ReadState::Errored;
-                                return Some(Err(e));
-                            }
-                        }
-                    }
-
-                    match self.fill().await {
-                        Ok(0) => {
-                            self.state = ReadState::Pausing;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            self.state = ReadState::Errored;
-                            return Some(Err(e.into()));
-                        }
-                    }
-                }
-            }
+    /// Settles retained operations in both directions and recovers all components.
+    pub async fn into_parts(mut self) -> SettledFramedParts<R, W, C, F, B> {
+        let (read_result, write_result) = join(settle_read(&mut self.read), settle_write(&mut self.write)).await;
+        SettledFramedParts {
+            parts: self.into_parts_unchecked(),
+            read_result: read_result.transpose().map(|_| ()),
+            write_result: write_result.unwrap_or(Ok(())),
         }
     }
 }
 
-impl<IO, C, F, B, Item> Sink<Item> for Framed<IO, C, F, B>
+impl<R, W, C, F, B> Stream for Framed<R, W, C, F, B>
 where
-    IO: AsyncWrite,
+    R: AsyncRead + 'static,
+    C: Decoder<B>,
+    F: Framer<B>,
+    B: IoBufMut + IoBufMutExt + 'static,
+{
+    type Item = Result<C::Item, C::Error>;
+
+    async fn next(&mut self) -> Option<Self::Item> {
+        next_item(&mut self.read, &mut self.state, &mut self.codec, &mut self.framer).await
+    }
+}
+
+impl<R, W, C, F, B, Item> Sink<Item> for Framed<R, W, C, F, B>
+where
+    W: AsyncWrite + 'static,
     C: Encoder<Item, B>,
     F: Framer<B>,
     B: IoBufMut + IoBufMutExt + 'static,
@@ -281,100 +354,47 @@ where
     type Error = C::Error;
 
     async fn send(&mut self, item: Item) -> Result<(), Self::Error> {
-        let mut buf = self.write.take().expect("Framed write buffer missing during encode");
-        buf.clear();
-        if let Err(e) = self.codec.encode(item, &mut buf) {
-            buf.clear();
-            self.write = Some(buf);
-            return Err(e);
-        }
-        if let Err(error) = self.framer.enclose(&mut buf) {
-            buf.clear();
-            self.write = Some(buf);
-            return Err(error.into());
-        }
-
-        let (res, mut buf) = self.io.write_all(buf).await.into_parts();
-        buf.clear();
-        self.write = Some(buf);
-        res.map(|_| ()).map_err(Into::into)
+        send_item(&mut self.write, &mut self.codec, &mut self.framer, item).await
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        self.io.flush().await.map_err(Into::into)
+        flush_write(&mut self.write).await.map_err(Into::into)
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
-        self.flush().await?;
-        self.io.shutdown().await.map_err(Into::into)
+        close_write(&mut self.write).await.map_err(Into::into)
     }
 }
 
-impl<IO, C, F, B> Framed<IO, C, F, B>
+async fn join<A, B>(left: A, right: B) -> (A::Output, B::Output)
 where
-    IO: AsyncRead,
-    C: Decoder<B>,
-    F: Framer<B>,
-    B: IoBufMut + IoBufMutExt,
+    A: Future,
+    B: Future,
 {
-    async fn fill(&mut self) -> std::io::Result<usize> {
-        let (pending_start, fill) = self.read.prepare_fill()?;
-        let (res, fill) = self.io.read(fill).await.into_parts();
-        self.read.finish_fill(fill, pending_start);
-        res
-    }
+    let mut left = std::pin::pin!(left);
+    let mut right = std::pin::pin!(right);
+    let mut left_output = None;
+    let mut right_output = None;
 
-    fn try_decode(&mut self) -> Result<Option<C::Item>, C::Error> {
-        let frame = {
-            let pending = self.read.pending();
-            self.framer.extract(pending)?
-        };
-        self.decode_frame(frame, false)
-    }
-
-    fn try_decode_eof(&mut self) -> Result<Option<C::Item>, C::Error> {
-        if !self.read.is_empty()
-            && let Some(item) = self.try_decode()?
+    std::future::poll_fn(|context| {
+        if left_output.is_none()
+            && let Poll::Ready(output) = left.as_mut().poll(context)
         {
-            return Ok(Some(item));
+            left_output = Some(output);
         }
-
-        let frame = {
-            let pending = self.read.pending();
-            self.framer.extract_eof(pending)?
-        };
-        self.decode_frame(frame, true)
-    }
-
-    fn decode_frame(&mut self, frame: Option<Frame>, at_eof: bool) -> Result<Option<C::Item>, C::Error> {
-        let Some(frame) = frame else {
-            return Ok(None);
-        };
-
-        let start = self.read.pending().start();
-        let (payload_range, frame_len) = frame.checked_bounds(self.read.pending().len())?;
-        let abs_prefix = start
-            .checked_add(payload_range.start)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
-        let abs_payload_end = start
-            .checked_add(payload_range.end)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
-        let frame_end = start
-            .checked_add(frame_len)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "frame offset overflow"))?;
-        let slice = self.read.take_inner();
-        let buf = slice.into_inner();
-
-        let payload = Slice::new(buf, abs_prefix, abs_payload_end);
-        let decoded = if at_eof {
-            self.codec.decode_eof(&payload)
-        } else {
-            self.codec.decode(&payload).map(Some)
-        };
-        let buf = payload.into_inner();
-
-        self.read.restore_from_parts(buf, frame_end);
-
-        decoded
-    }
+        if right_output.is_none()
+            && let Poll::Ready(output) = right.as_mut().poll(context)
+        {
+            right_output = Some(output);
+        }
+        match (left_output.take(), right_output.take()) {
+            (Some(left), Some(right)) => Poll::Ready((left, right)),
+            (left, right) => {
+                left_output = left;
+                right_output = right;
+                Poll::Pending
+            }
+        }
+    })
+    .await
 }

@@ -12,16 +12,19 @@
 mod framed;
 mod read;
 mod sink;
+mod split;
 mod stream;
 mod write;
 
 pub use framed::{
     AnyDelimited, BytesCodec, CharDelimited, Decoder, Encoder, Frame, Framed, FramedParts, FramedRead, FramedReadParts,
-    FramedWrite, FramedWriteParts, Framer, LengthDelimited, LineDelimited, NoopFramer,
+    FramedWrite, FramedWriteParts, Framer, LengthDelimited, LineDelimited, NoopFramer, SettledFramedParts,
+    SettledFramedReadParts, SettledFramedWriteParts,
 };
 pub use read::{
     AsyncBufRead, AsyncRead, AsyncReadAt, AsyncReadAtExt, AsyncReadExt, AsyncReadManaged, AsyncReadMulti, BufReader,
 };
 pub use sink::{Sink, SinkExt};
+pub use split::IntoOwnedSplit;
 pub use stream::{Stream, StreamExt};
 pub use write::{AsyncWrite, AsyncWriteAt, AsyncWriteAtExt, AsyncWriteExt, BufWriter};

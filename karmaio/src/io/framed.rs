@@ -14,6 +14,21 @@
 //! The buffer type parameter defaults to `Vec<u8>` but is generic over
 //! [`crate::buf::IoBufMut`] + [`crate::buf::IoBufMutExt`] so future buffer types
 //! (e.g. `bytes::BytesMut`) can plug in without changing codec APIs.
+//!
+//! # Duplex transports
+//!
+//! [`Framed`] requires reader and writer halves that can make progress
+//! independently. [`crate::tls::ClientTlsStream`] and
+//! [`crate::tls::ServerTlsStream`] do not currently provide such halves, so
+//! they cannot be used with combined [`Framed`]. A lock-backed split is not a
+//! substitute in a completion-based runtime: a pending read would hold the
+//! lock across its operation and could prevent a required write indefinitely.
+//! Use a directional [`FramedRead`] or [`FramedWrite`] when only one direction
+//! is needed. Combined framed TLS requires future TLS-level duplex support.
+
+use std::{future::Future, pin::Pin};
+
+pub(super) type PinBoxFuture<T> = Pin<Box<dyn Future<Output = T>>>;
 
 mod buffer;
 mod codec;
@@ -24,6 +39,6 @@ mod framed_write;
 
 pub use codec::{BytesCodec, Decoder, Encoder};
 pub use frame::{AnyDelimited, CharDelimited, Frame, Framer, LengthDelimited, LineDelimited, NoopFramer};
-pub use framed_read::{FramedRead, FramedReadParts};
-pub use framed_rw::{Framed, FramedParts};
-pub use framed_write::{FramedWrite, FramedWriteParts};
+pub use framed_read::{FramedRead, FramedReadParts, SettledFramedReadParts};
+pub use framed_rw::{Framed, FramedParts, SettledFramedParts};
+pub use framed_write::{FramedWrite, FramedWriteParts, SettledFramedWriteParts};

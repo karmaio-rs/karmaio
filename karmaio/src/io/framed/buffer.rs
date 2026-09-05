@@ -1,8 +1,33 @@
 use std::{io, ops::Range};
 
-use crate::buf::{IoBufMut, IoBufMutExt, Slice};
+use crate::buf::{IoBuf, IoBufMut, IoBufMutExt, Slice};
 
 const DEFAULT_RESERVE: usize = 16;
+
+pub(super) fn append<B: IoBufMut>(buffer: &mut B, bytes: &[u8]) -> io::Result<()> {
+    let initialized = IoBuf::as_init(buffer).len();
+    let end = initialized
+        .checked_add(bytes.len())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "framed buffer length overflow"))?;
+    buffer.reserve(bytes.len())?;
+    if end > IoBufMut::as_uninit(buffer).len() {
+        return Err(io::Error::other(
+            "buffer reserve did not provide the requested capacity",
+        ));
+    }
+
+    // Safety: the destination range is inside the uniquely borrowed buffer,
+    // and all bytes marked initialized are written by the copy.
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr(),
+            IoBufMut::as_uninit(buffer).as_mut_ptr().cast::<u8>().add(initialized),
+            bytes.len(),
+        );
+        buffer.set_len(end);
+    }
+    Ok(())
+}
 
 /// Progress tracker over an owned buffer for framed reads.
 ///
@@ -36,6 +61,11 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
     #[inline]
     pub(super) fn pending(&self) -> &Slice<B> {
         self.0.as_ref().expect("ReadBuffer in inconsistent state")
+    }
+
+    #[inline]
+    pub(super) fn pending_mut(&mut self) -> &mut [u8] {
+        self.0.as_mut().expect("ReadBuffer in inconsistent state")
     }
 
     #[inline]
@@ -128,7 +158,7 @@ impl<B: IoBufMut + IoBufMutExt> ReadBuffer<B> {
     }
 
     /// Returns the underlying buffer, escaping the cursor view.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(super) fn get_ref(&self) -> &B {
         self.pending().get_ref()
     }

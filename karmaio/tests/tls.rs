@@ -345,9 +345,9 @@ fn client_stream_handles_fragmentation_buffer_identity_and_shutdown() {
         let outbound = vec![42; 20 * 1024];
         let outbound_pointer = outbound.as_ptr();
         let BufResult(result, outbound) = stream.write(outbound).await;
-        assert_eq!(result.unwrap(), 16 * 1024);
+        assert_eq!(result.unwrap(), outbound.len());
         assert_eq!(outbound.as_ptr(), outbound_pointer);
-        assert_eq!(handle.take_plaintext(), vec![42; 16 * 1024]);
+        assert_eq!(handle.take_plaintext(), outbound);
 
         handle.send_plaintext(b"fragmented response");
         let inbound = Vec::with_capacity(64);
@@ -553,6 +553,10 @@ fn transport_failures_poison_only_the_required_directions() {
         let BufResult(result, _) = stream.write(b"write still works".to_vec()).await;
         assert_eq!(result.unwrap(), 17);
         assert_eq!(handle.take_plaintext(), b"write still works");
+        assert_eq!(
+            stream.into_parts().err().unwrap().kind(),
+            io::ErrorKind::ConnectionReset
+        );
 
         let (transport, handle) = ScriptedTransport::server(server, 64, 64);
         let name = ServerName::try_from("localhost").unwrap();
@@ -568,6 +572,10 @@ fn transport_failures_poison_only_the_required_directions() {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
         let BufResult(result, _) = stream.read(Vec::with_capacity(1)).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        assert_eq!(
+            stream.into_parts().err().unwrap().kind(),
+            io::ErrorKind::ConnectionAborted
+        );
     });
 }
 
@@ -674,6 +682,7 @@ fn dropping_in_flight_transport_operations_poison_both_directions() {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
         let BufResult(result, _) = stream.write(vec![1]).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(stream.into_parts().err().unwrap().kind(), io::ErrorKind::Other);
 
         let (transport, handle, name) = connect(server.clone());
         let mut stream = TlsConnector::new(client.clone())
@@ -688,6 +697,7 @@ fn dropping_in_flight_transport_operations_poison_both_directions() {
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
         let BufResult(result, _) = stream.write(vec![1]).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(stream.into_parts().err().unwrap().kind(), io::ErrorKind::Other);
 
         let (transport, handle, name) = connect(server.clone());
         let mut stream = TlsConnector::new(client.clone())
@@ -700,6 +710,7 @@ fn dropping_in_flight_transport_operations_poison_both_directions() {
         drop(future);
         let BufResult(result, _) = stream.write(vec![1]).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(stream.into_parts().err().unwrap().kind(), io::ErrorKind::Other);
 
         let (transport, handle, name) = connect(server);
         let mut stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
@@ -709,11 +720,12 @@ fn dropping_in_flight_transport_operations_poison_both_directions() {
         drop(future);
         let BufResult(result, _) = stream.write(vec![1]).await;
         assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        assert_eq!(stream.into_parts().err().unwrap().kind(), io::ErrorKind::Other);
     });
 }
 
 #[test]
-fn vectored_write_consumes_components_up_to_one_record() {
+fn vectored_write_consumes_all_components_within_rustls_capacity() {
     let (client, server) = configs();
     let (transport, handle) = ScriptedTransport::server(server, 64, 64);
     let mut runtime = Runtime::new().unwrap();
@@ -723,14 +735,11 @@ fn vectored_write_consumes_components_up_to_one_record() {
         let mut stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
         let buffers = [b"header: value\r\n".to_vec(), vec![7; 16 * 1024], b"ignored".to_vec()];
         let pointers = buffers.each_ref().map(|buffer| buffer.as_ptr());
+        let expected = buffers.iter().flatten().copied().collect::<Vec<_>>();
         let BufResult(result, buffers) = stream.write_vectored(buffers).await;
-        assert_eq!(result.unwrap(), 16 * 1024);
+        assert_eq!(result.unwrap(), expected.len());
         assert_eq!(buffers.each_ref().map(|buffer| buffer.as_ptr()), pointers);
-
-        let plaintext = handle.take_plaintext();
-        assert_eq!(&plaintext[..15], b"header: value\r\n");
-        assert_eq!(plaintext.len(), 16 * 1024);
-        assert!(plaintext[15..].iter().all(|byte| *byte == 7));
+        assert_eq!(handle.take_plaintext(), expected);
     });
 }
 
@@ -788,7 +797,7 @@ fn vectored_write_all_advances_across_tls_record_boundaries() {
     runtime.block_on(async {
         let name = ServerName::try_from("localhost").unwrap();
         let mut stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
-        let buffers = [b"prefix".to_vec(), vec![9; 20 * 1024], b"suffix".to_vec()];
+        let buffers = [b"prefix".to_vec(), vec![9; 96 * 1024], b"suffix".to_vec()];
         let pointers = buffers.each_ref().map(|buffer| buffer.as_ptr());
         let expected = buffers.iter().flatten().copied().collect::<Vec<_>>();
         let BufResult(result, buffers) = stream.write_vectored_all(buffers).await;

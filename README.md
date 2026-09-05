@@ -19,6 +19,7 @@ Heavy subsystems are feature-gated so consumers can trim compile time and binary
 | `bytes`   | `IoBuf` / `IoBufMut` for `bytes::{Bytes, BytesMut}`  |
 | `memmap2` | `IoBuf` / `IoBufMut` for `memmap2::{Mmap, MmapMut}`  |
 | `tls`     | Rustls TLS with `ring` and TLS 1.2                    |
+| `tls-rustls` | Rustls TLS without selecting a cryptographic provider |
 | `tls-ring` | Rustls TLS with the `ring` provider                  |
 | `tls-aws-lc-rs` | Rustls TLS with the AWS-LC provider             |
 | `tls12`   | TLS 1.2 for either Rustls provider                    |
@@ -27,16 +28,16 @@ Heavy subsystems are feature-gated so consumers can trim compile time and binary
 
 ```toml
 # Full public API.
-karmaio = { version = "0.1.0-alpha.1", features = ["full"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["full"] }
 
 # Core runtime only (default).
-karmaio = "0.1.0-alpha.1"
+karmaio = "0.1.0-alpha.3"
 
 # Networking + attribute macros.
-karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net"] }
 
 # Networking + batteries-included Rustls TLS.
-karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net", "tls"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net", "tls"] }
 ```
 
 TLS is driven directly over Karmaio's owned-buffer I/O traits.
@@ -48,6 +49,7 @@ TLS streams are intentionally not splittable. Vectored reads fill caller compone
 Shutdown sends `close_notify`, and a transport EOF without the peer's `close_notify` is surfaced as `UnexpectedEof`.
 Cancellation returns the original caller-owned buffer and conservatively poisons the stream when wire progress may be ambiguous.
 Dropping an established I/O future while it awaits the transport also makes later operations fail closed. See the `tls_client` and `tls_server` examples.
+`into_parts` performs no shutdown and refuses to extract state after either direction fails.
 
 See the [crate documentation](https://docs.rs/karmaio), the [examples](https://github.com/karmaio-rs/karmaio/tree/main/examples), and the [changelog](CHANGELOG.md) for more details.
 

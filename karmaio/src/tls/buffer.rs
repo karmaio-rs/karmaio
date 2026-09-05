@@ -1,8 +1,6 @@
 use std::io::{self, IoSlice, Write};
 
 pub(crate) const CIPHERTEXT_CAPACITY: usize = 18 * 1024;
-pub(crate) const PLAINTEXT_CAPACITY: usize = 16 * 1024;
-pub(crate) const RUSTLS_BUFFER_LIMIT: usize = 64 * 1024;
 
 /// A synchronous writer that can initialize only the spare capacity of a
 /// reusable allocation. It never grows the allocation.

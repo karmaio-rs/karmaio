@@ -348,7 +348,7 @@ async fn cancel_read_generated_key_update_write_returns_the_read_buffer() {
             while !send_update.get() {
                 sleep(Duration::from_millis(1)).await;
             }
-            let (mut socket, mut connection) = stream.into_parts();
+            let (mut socket, mut connection) = stream.into_parts().unwrap();
             connection.refresh_traffic_keys().unwrap();
             let mut output = Vec::new();
             while connection.wants_write() {
@@ -402,7 +402,7 @@ async fn cancel_fatal_alert_drain_preserves_the_protocol_error() {
             while !send_invalid_record.get() {
                 sleep(Duration::from_millis(1)).await;
             }
-            let (mut socket, _) = stream.into_parts();
+            let (mut socket, _) = stream.into_parts().unwrap();
             // An unencrypted, unknown handshake message is invalid after the
             // TLS 1.3 handshake and causes Rustls to queue a fatal alert.
             let invalid_record = vec![22, 3, 3, 0, 4, 0xff, 0, 0, 0];

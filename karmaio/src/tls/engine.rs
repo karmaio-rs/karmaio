@@ -1,4 +1,4 @@
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, BufRead, Cursor, Write};
 use std::mem;
 
 use rustls::{Connection, HandshakeKind, ProtocolVersion, SupportedCipherSuite};
@@ -7,7 +7,7 @@ use crate::buf::{BufResult, IoBuf, IoBufExt, IoBufMut, IoVectoredBuf, IoVectored
 use crate::io::{AsyncRead, AsyncWrite};
 use crate::runtime::is_operation_canceled;
 
-use super::buffer::{CIPHERTEXT_CAPACITY, FixedWriter, PLAINTEXT_CAPACITY, RUSTLS_BUFFER_LIMIT};
+use super::buffer::{CIPHERTEXT_CAPACITY, FixedWriter};
 use super::error::Failure;
 
 #[derive(Clone, Copy, Debug)]
@@ -39,15 +39,13 @@ pub(crate) struct Engine<S> {
     input_start: usize,
     output: Vec<u8>,
     output_start: usize,
-    plaintext: Vec<u8>,
     transport_eof: bool,
     read_state: ReadState,
     write_state: WriteState,
 }
 
 impl<S> Engine<S> {
-    pub(crate) fn new(io: S, mut connection: Connection) -> Self {
-        connection.set_buffer_limit(Some(RUSTLS_BUFFER_LIMIT));
+    pub(crate) fn new(io: S, connection: Connection) -> Self {
         Self {
             io,
             connection,
@@ -55,7 +53,6 @@ impl<S> Engine<S> {
             input_start: 0,
             output: Vec::with_capacity(CIPHERTEXT_CAPACITY),
             output_start: 0,
-            plaintext: vec![0; PLAINTEXT_CAPACITY],
             transport_eof: false,
             read_state: ReadState::Open,
             write_state: WriteState::Open,
@@ -66,8 +63,14 @@ impl<S> Engine<S> {
         (&self.io, &self.connection)
     }
 
-    pub(crate) fn into_parts(self) -> (S, Connection) {
-        (self.io, self.connection)
+    pub(crate) fn into_parts(self) -> io::Result<(S, Connection)> {
+        if let ReadState::Failed(failure) = self.read_state {
+            return Err(failure.error());
+        }
+        if let WriteState::Failed(failure) = self.write_state {
+            return Err(failure.error());
+        }
+        Ok((self.io, self.connection))
     }
 
     pub(crate) fn alpn_protocol(&self) -> Option<&[u8]> {
@@ -301,15 +304,12 @@ impl<S: AsyncRead + AsyncWrite> Engine<S> {
         }
     }
 
-    async fn read_plaintext(&mut self, capacity: usize) -> io::Result<usize> {
-        if capacity == 0 {
-            return Ok(0);
-        }
+    async fn wait_for_plaintext(&mut self) -> io::Result<bool> {
         if let Some(error) = self.read_failure() {
             return Err(error);
         }
         if matches!(self.read_state, ReadState::PeerClosed) {
-            return Ok(0);
+            return Ok(false);
         }
 
         let mut processed_input = false;
@@ -317,13 +317,12 @@ impl<S: AsyncRead + AsyncWrite> Engine<S> {
             if processed_input && let Err(error) = self.drain_output().await {
                 return Err(error);
             }
-            let limit = capacity.min(PLAINTEXT_CAPACITY);
-            match self.connection.reader().read(&mut self.plaintext[..limit]) {
-                Ok(0) => {
+            match self.connection.reader().into_first_chunk() {
+                Ok([]) => {
                     self.read_state = ReadState::PeerClosed;
-                    return Ok(0);
+                    return Ok(false);
                 }
-                Ok(read) => return Ok(read),
+                Ok(_) => return Ok(true),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => {
                     self.fail_read(&error);
@@ -349,50 +348,113 @@ impl<S: AsyncRead + AsyncWrite> Engine<S> {
         }
     }
 
+    /// Copies every plaintext chunk that Rustls already has available, up to
+    /// `capacity`, without retaining a Rustls borrow across an await point.
+    fn copy_plaintext(&mut self, capacity: usize, mut copy: impl FnMut(&[u8])) -> io::Result<usize> {
+        let mut copied = 0;
+        while copied < capacity {
+            let (consumed, chunk_len) = match self.connection.reader().into_first_chunk() {
+                Ok([]) => {
+                    self.read_state = ReadState::PeerClosed;
+                    break;
+                }
+                Ok(chunk) => {
+                    let consumed = chunk.len().min(capacity - copied);
+                    copy(&chunk[..consumed]);
+                    (consumed, chunk.len())
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock && copied > 0 => break,
+                // Preserve a terminal error until the next call when buffered
+                // plaintext was returned first.
+                Err(_) if copied > 0 => break,
+                Err(error) => return Err(error),
+            };
+
+            self.connection.reader().consume(consumed);
+            copied += consumed;
+            if consumed < chunk_len {
+                break;
+            }
+        }
+        Ok(copied)
+    }
+
     pub(crate) async fn read<B: IoBufMut>(&mut self, mut buffer: B) -> BufResult<usize, B> {
         let capacity = buffer.as_uninit().len();
-        let result = self.read_plaintext(capacity).await;
-        if let Ok(read) = result {
-            // Safety: Rustls initialized plaintext[..read], the caller owns a
-            // writable region of at least `capacity`, and the two allocations
-            // cannot overlap.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    self.plaintext.as_ptr(),
-                    buffer.as_uninit().as_mut_ptr().cast::<u8>(),
-                    read,
-                );
-                buffer.set_len(read);
+        if capacity == 0 {
+            return BufResult(Ok(0), buffer);
+        }
+
+        let result = match self.wait_for_plaintext().await {
+            Ok(false) => Ok(0),
+            Ok(true) => {
+                let destination = buffer.as_uninit().as_mut_ptr().cast::<u8>();
+                let mut offset = 0;
+                let result = self.copy_plaintext(capacity, |plaintext| {
+                    // Safety: Rustls initialized `plaintext`, the caller owns
+                    // the `capacity`-byte destination, and chunks are copied
+                    // into consecutive, non-overlapping ranges.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(plaintext.as_ptr(), destination.add(offset), plaintext.len());
+                    }
+                    offset += plaintext.len();
+                });
+                if let Err(error) = &result {
+                    self.fail_read(error);
+                }
+                result
             }
+            Err(error) => Err(error),
+        };
+        if let Ok(read) = result {
+            // Safety: `copy_plaintext` initialized exactly the aggregate
+            // prefix `read` of the destination.
+            unsafe { buffer.set_len(read) };
         }
         BufResult(result, buffer)
     }
 
     pub(crate) async fn read_vectored<V: IoVectoredBufMut>(&mut self, mut buffers: V) -> BufResult<usize, V> {
         let capacity = buffers.total_capacity();
-        let result = self.read_plaintext(capacity).await;
-        if let Ok(read) = result {
-            let mut copied = 0;
-            for destination in buffers.iter_uninit_slice() {
-                if copied == read {
-                    break;
+        if capacity == 0 {
+            return BufResult(Ok(0), buffers);
+        }
+
+        let result = match self.wait_for_plaintext().await {
+            Ok(false) => Ok(0),
+            Ok(true) => {
+                let mut destinations = buffers.iter_uninit_slice();
+                let mut destination = destinations.next();
+                let mut offset = 0;
+                let result = self.copy_plaintext(capacity, |mut plaintext| {
+                    while !plaintext.is_empty() {
+                        let target = destination.as_deref_mut().expect("aggregate capacity is consistent");
+                        let count = plaintext.len().min(target.len() - offset);
+                        // Safety: Rustls initialized `plaintext`, and this
+                        // component owns `count` writable bytes at `offset`.
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                plaintext.as_ptr(),
+                                target.as_mut_ptr().cast::<u8>().add(offset),
+                                count,
+                            );
+                        }
+                        plaintext = &plaintext[count..];
+                        offset += count;
+                        if offset == target.len() {
+                            destination = destinations.next();
+                            offset = 0;
+                        }
+                    }
+                });
+                if let Err(error) = &result {
+                    self.fail_read(error);
                 }
-                let count = destination.len().min(read - copied);
-                if count == 0 {
-                    continue;
-                }
-                // Safety: Rustls initialized plaintext[..read], this component
-                // owns `count` writable bytes, and the allocations cannot overlap.
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        self.plaintext.as_ptr().add(copied),
-                        destination.as_mut_ptr().cast::<u8>(),
-                        count,
-                    );
-                }
-                copied += count;
+                result
             }
-            debug_assert_eq!(copied, read);
+            Err(error) => Err(error),
+        };
+        if let Ok(read) = result {
             // Safety: the loop initialized exactly the aggregate prefix `read`.
             unsafe { SetLen::set_len(&mut buffers, read) };
         }
@@ -419,8 +481,7 @@ impl<S: AsyncRead + AsyncWrite> Engine<S> {
             return BufResult(Err(error), buffer);
         }
 
-        let limit = buffer.as_init().len().min(PLAINTEXT_CAPACITY);
-        let accepted = match self.connection.writer().write(&buffer.as_init()[..limit]) {
+        let accepted = match self.connection.writer().write(buffer.as_init()) {
             Ok(0) => {
                 let error = io::Error::new(io::ErrorKind::WriteZero, "Rustls accepted zero plaintext bytes");
                 self.fail_both(&error);
@@ -440,16 +501,11 @@ impl<S: AsyncRead + AsyncWrite> Engine<S> {
     }
 
     pub(crate) async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
-        let mut length = 0;
+        let mut has_plaintext = false;
         for buffer in buffers.iter_slice() {
-            let count = buffer.len().min(PLAINTEXT_CAPACITY - length);
-            self.plaintext[length..length + count].copy_from_slice(&buffer[..count]);
-            length += count;
-            if length == PLAINTEXT_CAPACITY {
-                break;
-            }
+            has_plaintext |= !buffer.is_empty();
         }
-        if length == 0 {
+        if !has_plaintext {
             return BufResult(Ok(0), buffers);
         }
         if let Some(error) = self.write_failure() {
@@ -468,18 +524,35 @@ impl<S: AsyncRead + AsyncWrite> Engine<S> {
             return BufResult(Err(error), buffers);
         }
 
-        let accepted = match self.connection.writer().write(&self.plaintext[..length]) {
-            Ok(0) => {
-                let error = io::Error::new(io::ErrorKind::WriteZero, "Rustls accepted zero plaintext bytes");
-                self.fail_both(&error);
-                return BufResult(Err(error), buffers);
+        let mut accepted = 0;
+        let mut write_error = None;
+        for buffer in buffers.iter_slice() {
+            if buffer.is_empty() {
+                continue;
             }
-            Ok(accepted) => accepted,
-            Err(error) => {
-                self.fail_both(&error);
-                return BufResult(Err(error), buffers);
+            match self.connection.writer().write(buffer) {
+                Ok(0) => break,
+                Ok(written) => {
+                    accepted += written;
+                    if written < buffer.len() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    write_error = Some(error);
+                    break;
+                }
             }
-        };
+        }
+        if let Some(error) = write_error {
+            self.fail_both(&error);
+            return BufResult(Err(error), buffers);
+        }
+        if accepted == 0 {
+            let error = io::Error::new(io::ErrorKind::WriteZero, "Rustls accepted zero plaintext bytes");
+            self.fail_both(&error);
+            return BufResult(Err(error), buffers);
+        }
 
         match self.drain_output().await {
             Ok(()) => BufResult(Ok(accepted), buffers),

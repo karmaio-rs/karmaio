@@ -11,10 +11,10 @@
 //!
 //! Writes are write-through: success means every TLS record generated for the
 //! accepted plaintext reached the wrapped [`AsyncWrite`](crate::io::AsyncWrite).
-//! Scalar and vectored calls accept at most 16 KiB; vectored input is gathered
-//! into fixed initialized staging. Vectored reads distribute up to 16 KiB of
-//! decrypted plaintext across caller components in order. Rustls and adapter
-//! queues are bounded.
+//! Vectored writes feed caller components directly into Rustls, and vectored
+//! reads distribute decrypted plaintext directly across caller components in
+//! order. Adapter-owned ciphertext queues use fixed-capacity allocations;
+//! Rustls retains control of its own buffering policy.
 //!
 //! A peer `close_notify` becomes a clean `Ok(0)` after buffered plaintext is
 //! delivered. A transport EOF without that alert becomes

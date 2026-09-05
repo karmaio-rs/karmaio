@@ -21,6 +21,7 @@ The core runtime (`Runtime`, tasks, timers, `io` traits, buffers, and the platfo
 | `bytes`   | `IoBuf` / `IoBufMut` impls for `bytes::{Bytes, BytesMut}`               |
 | `memmap2` | `IoBuf` / `IoBufMut` impls for `memmap2::{Mmap, MmapMut}`               |
 | `tls`     | Rustls TLS with `ring` and TLS 1.2                                     |
+| `tls-rustls` | Rustls TLS without selecting a cryptographic provider               |
 | `tls-ring` | Rustls TLS with the `ring` provider                                   |
 | `tls-aws-lc-rs` | Rustls TLS with the AWS-LC provider                              |
 | `tls12`   | TLS 1.2 for either Rustls provider                                     |
@@ -31,19 +32,19 @@ The core runtime (`Runtime`, tasks, timers, `io` traits, buffers, and the platfo
 
 ```toml
 # Full public API (apps / demos).
-karmaio = { version = "0.1.0-alpha.1", features = ["full"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["full"] }
 
 # Core runtime only.
-karmaio = "0.1.0-alpha.1"
+karmaio = "0.1.0-alpha.3"
 
 # Networking + attribute macros.
-karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net"] }
 
 # Filesystem + signals.
-karmaio = { version = "0.1.0-alpha.1", features = ["fs", "signal"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["fs", "signal"] }
 
 # TCP and batteries-included Rustls TLS.
-karmaio = { version = "0.1.0-alpha.1", features = ["macros", "net", "tls"] }
+karmaio = { version = "0.1.0-alpha.3", features = ["macros", "net", "tls"] }
 ```
 
 ## TLS
@@ -55,9 +56,9 @@ Applications own verification policy. Supply an `Arc<ClientConfig>` or `Arc<Serv
 identity, SNI, and ALPN policy. Karmaio does not install a global provider, discover roots, or offer an insecure verifier.
 
 TLS streams preserve the completion model and add no `Send` requirement. They are deliberately not splittable because reads may need to write protocol messages.
-Vectored reads fill caller components in order, and successful scalar and vectored writes are write-through and bounded.
+Vectored I/O operates directly on caller components, and successful scalar and vectored writes are write-through. Adapter-owned ciphertext buffers have fixed capacity, while Rustls retains its default internal buffering policy.
 Graceful shutdown sends `close_notify`.
-A raw transport EOF without peer `close_notify` is reported as `UnexpectedEof` after buffered plaintext is delivered. `into_parts` is abrupt and performs no TLS or transport shutdown.
+A raw transport EOF without peer `close_notify` is reported as `UnexpectedEof` after buffered plaintext is delivered. `into_parts` is abrupt, performs no TLS or transport shutdown, and refuses to extract state after either direction fails.
 
 Cancellation scopes propagate to the underlying operation and return caller buffers through `BufResult`.
 For established I/O, request cancellation and await the same future instead of dropping a timed-out future when buffer recovery matters.

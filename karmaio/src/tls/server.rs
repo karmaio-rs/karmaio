@@ -124,10 +124,15 @@ impl<S> TlsStream<S> {
 
     /// Extracts the transport and Rustls state without sending `close_notify`
     /// or shutting down the transport.
-    pub fn into_parts(self) -> (S, ServerConnection) {
-        let (stream, connection) = self.engine.into_parts();
+    ///
+    /// # Errors
+    ///
+    /// Returns an error and drops both parts if either direction has failed or
+    /// an in-flight transport operation was abandoned.
+    pub fn into_parts(self) -> io::Result<(S, ServerConnection)> {
+        let (stream, connection) = self.engine.into_parts()?;
         match connection {
-            Connection::Server(connection) => (stream, connection),
+            Connection::Server(connection) => Ok((stream, connection)),
             Connection::Client(_) => unreachable!("server TLS stream contains a client connection"),
         }
     }

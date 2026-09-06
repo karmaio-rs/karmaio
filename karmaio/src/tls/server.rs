@@ -8,9 +8,10 @@ use rustls::pki_types::CertificateDer;
 use rustls::{Connection, HandshakeKind, ProtocolVersion, ServerConfig, ServerConnection, SupportedCipherSuite};
 
 use crate::buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut};
-use crate::io::{AsyncRead, AsyncWrite};
+use crate::io::{AsyncRead, AsyncWrite, IntoOwnedSplit, ReuniteError, ReuniteOwned};
 
 use super::engine::Engine;
+use super::split;
 
 /// Accepts server-side TLS connections using a shared Rustls configuration.
 #[derive(Clone)]
@@ -75,28 +76,28 @@ impl<S> TlsStream<S> {
 
     /// Returns the negotiated ALPN protocol, if the peers selected one.
     pub fn alpn_protocol(&self) -> Option<&[u8]> {
-        self.engine.alpn_protocol()
+        self.get_ref().1.alpn_protocol()
     }
 
     /// Returns the authenticated client certificate chain, if client
     /// authentication was configured and completed.
     pub fn peer_certificates(&self) -> Option<&[CertificateDer<'static>]> {
-        self.engine.peer_certificates()
+        self.get_ref().1.peer_certificates()
     }
 
     /// Returns the negotiated TLS protocol version.
     pub fn protocol_version(&self) -> Option<ProtocolVersion> {
-        self.engine.protocol_version()
+        self.get_ref().1.protocol_version()
     }
 
     /// Returns the negotiated cipher suite.
     pub fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite> {
-        self.engine.negotiated_cipher_suite()
+        self.get_ref().1.negotiated_cipher_suite()
     }
 
     /// Returns whether the connection used a full or resumed handshake.
     pub fn handshake_kind(&self) -> Option<HandshakeKind> {
-        self.engine.handshake_kind()
+        self.get_ref().1.handshake_kind()
     }
 
     /// Returns the server name supplied by the client through SNI.
@@ -119,7 +120,7 @@ impl<S> TlsStream<S> {
         label: &[u8],
         context: Option<&[u8]>,
     ) -> Result<T, rustls::Error> {
-        self.engine.export_keying_material(output, label, context)
+        self.get_ref().1.export_keying_material(output, label, context)
     }
 
     /// Extracts the transport and Rustls state without sending `close_notify`
@@ -135,6 +136,133 @@ impl<S> TlsStream<S> {
             Connection::Server(connection) => Ok((stream, connection)),
             Connection::Client(_) => unreachable!("server TLS stream contains a client connection"),
         }
+    }
+}
+
+impl<S: IntoOwnedSplit + 'static> TlsStream<S> {
+    /// Splits the TLS stream into independently progressing owned halves.
+    ///
+    /// After splitting, reads queue protocol-generated TLS output for the
+    /// write half to drain during its next write, flush, or shutdown. Inspect
+    /// connection metadata before splitting or after reuniting the halves.
+    pub fn into_split(self) -> (OwnedReadHalf<S>, OwnedWriteHalf<S>) {
+        <Self as IntoOwnedSplit>::into_split(self)
+    }
+}
+
+/// Owned read half of a server TLS stream.
+///
+/// Reads decrypt input without performing transport writes. Rustls control
+/// output is left for the matching write half. Dropping this half abandons the
+/// TLS read direction but does not invalidate the write direction.
+pub struct OwnedReadHalf<S: IntoOwnedSplit> {
+    inner: split::ReadHalf<S::ReadHalf>,
+}
+
+impl<S: IntoOwnedSplit> fmt::Debug for OwnedReadHalf<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ServerTlsReadHalf").finish_non_exhaustive()
+    }
+}
+
+impl<S: IntoOwnedSplit> AsyncRead for OwnedReadHalf<S> {
+    #[inline]
+    async fn read<B: IoBufMut>(&mut self, buffer: B) -> BufResult<usize, B> {
+        self.inner.read(buffer).await
+    }
+
+    #[inline]
+    async fn read_vectored<V: IoVectoredBufMut>(&mut self, buffers: V) -> BufResult<usize, V> {
+        self.inner.read_vectored(buffers).await
+    }
+}
+
+impl<S: ReuniteOwned> OwnedReadHalf<S> {
+    /// Returns whether `other` came from the same TLS split operation.
+    pub fn is_pair_of(&self, other: &OwnedWriteHalf<S>) -> bool {
+        split::is_pair_of(&self.inner, &other.inner)
+    }
+
+    /// Attempts to reconstruct the server TLS stream from matching halves.
+    ///
+    /// On failure, both halves are returned unchanged and remain usable. A
+    /// reunion can fail when the halves do not match or the underlying
+    /// transport still has detached ownership.
+    pub fn reunite(self, other: OwnedWriteHalf<S>) -> Result<TlsStream<S>, ReuniteError<Self, OwnedWriteHalf<S>>> {
+        split::reunite::<S>(self.inner, other.inner)
+            .map(|engine| TlsStream { engine })
+            .map_err(|error| error.map_halves(|inner| Self { inner }, |inner| OwnedWriteHalf { inner }))
+    }
+}
+
+/// Owned write half of a server TLS stream.
+///
+/// Writes and flushes first send any control output queued by the read half.
+/// Call [`AsyncWrite::shutdown`] for a graceful `close_notify`; dropping this
+/// half without shutdown is an abrupt TLS close.
+pub struct OwnedWriteHalf<S: IntoOwnedSplit> {
+    inner: split::WriteHalf<S::WriteHalf>,
+}
+
+impl<S: IntoOwnedSplit> fmt::Debug for OwnedWriteHalf<S> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_struct("ServerTlsWriteHalf").finish_non_exhaustive()
+    }
+}
+
+impl<S: IntoOwnedSplit> AsyncWrite for OwnedWriteHalf<S> {
+    #[inline]
+    async fn write<B: IoBuf>(&mut self, buffer: B) -> BufResult<usize, B> {
+        self.inner.write(buffer).await
+    }
+
+    #[inline]
+    async fn write_vectored<V: IoVectoredBuf>(&mut self, buffers: V) -> BufResult<usize, V> {
+        self.inner.write_vectored(buffers).await
+    }
+
+    #[inline]
+    async fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush().await
+    }
+
+    #[inline]
+    async fn shutdown(&mut self) -> io::Result<()> {
+        self.inner.shutdown().await
+    }
+}
+
+impl<S: ReuniteOwned> OwnedWriteHalf<S> {
+    /// Returns whether `other` came from the same TLS split operation.
+    pub fn is_pair_of(&self, other: &OwnedReadHalf<S>) -> bool {
+        other.is_pair_of(self)
+    }
+
+    /// Attempts to reconstruct the server TLS stream from matching halves.
+    ///
+    /// On failure, both halves are returned unchanged and remain usable. See
+    /// [`OwnedReadHalf::reunite`] for the matching and quiescence requirements.
+    pub fn reunite(self, other: OwnedReadHalf<S>) -> Result<TlsStream<S>, ReuniteError<OwnedReadHalf<S>, Self>> {
+        other.reunite(self)
+    }
+}
+
+impl<S: IntoOwnedSplit + 'static> IntoOwnedSplit for TlsStream<S> {
+    type ReadHalf = OwnedReadHalf<S>;
+    type WriteHalf = OwnedWriteHalf<S>;
+
+    fn into_split(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        let (read, write) = split::split(self.engine);
+        (OwnedReadHalf { inner: read }, OwnedWriteHalf { inner: write })
+    }
+}
+
+impl<S: ReuniteOwned + 'static> ReuniteOwned for TlsStream<S> {
+    fn reunite(
+        read: Self::ReadHalf,
+        write: Self::WriteHalf,
+    ) -> Result<Self, ReuniteError<Self::ReadHalf, Self::WriteHalf>> {
+        read.reunite(write)
     }
 }
 

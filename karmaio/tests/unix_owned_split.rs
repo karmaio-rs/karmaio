@@ -4,8 +4,7 @@
 
 use std::{cell::Cell, os::unix::net::SocketAddr as UnixSocketAddr, path::PathBuf, rc::Rc};
 
-use karmaio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use karmaio::net::split::{ReuniteErrorKind, ReuniteOwned};
+use karmaio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReuniteErrorKind, ReuniteOwned};
 use karmaio::net::unix::{UnixListener, UnixStream};
 use karmaio::runtime::spawn_local;
 

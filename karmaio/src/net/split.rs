@@ -3,10 +3,8 @@ use std::{fmt, marker::PhantomData, net::Shutdown, ops::Deref};
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
-    io::{AsyncRead, AsyncWrite},
+    io::{AsyncRead, AsyncWrite, ReuniteError},
 };
-
-pub use crate::io::IntoOwnedSplit;
 
 #[cfg(target_os = "linux")]
 use crate::{buf::PooledBuf, io::AsyncReadManaged};
@@ -79,21 +77,6 @@ impl<T> Deref for WriteHalf<'_, T> {
 // ---------------------------------------------------------------------------
 // Owned splitting
 // ---------------------------------------------------------------------------
-
-/// Extends [`IntoOwnedSplit`] for transports that can reconstruct the original
-/// value from matching owned halves.
-///
-/// Reunification succeeds only for halves from the same original value and
-/// only when no incompatible ownership remains. Implementations should return
-/// an error that preserves both halves when reunification fails.
-pub trait ReuniteOwned: IntoOwnedSplit {
-    /// The error returned when the halves cannot be reunited.
-    type ReuniteError;
-
-    /// Attempts to reunite matching owned halves into the original value.
-    ///
-    fn reunite(read: Self::ReadHalf, write: Self::WriteHalf) -> Result<Self, Self::ReuniteError>;
-}
 
 /// Owned read half of a stream, created by [`IntoOwnedSplit::into_split`].
 ///
@@ -178,90 +161,17 @@ impl<T> Drop for OwnedWriteHalf<T> {
     }
 }
 
-/// The semantic reason a reunification attempt failed.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[non_exhaustive]
-pub enum ReuniteErrorKind {
-    /// The halves originated from different split operations.
-    Mismatched,
-    /// Matching halves cannot yet be reunited because another owner remains.
-    NotQuiescent,
-}
-
-impl fmt::Display for ReuniteErrorKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Mismatched => write!(f, "halves originated from different split operations"),
-            Self::NotQuiescent => write!(f, "matching halves are not yet quiescent"),
-        }
-    }
-}
-
-/// A failed reunification that preserves both owned halves.
-///
-/// Use [`Self::kind`] to choose whether to correct the pairing or wait for
-/// outstanding ownership to end, then recover the halves with
-/// [`Self::into_halves`].
-#[derive(Debug)]
-pub struct ReuniteError<R, W> {
-    kind: ReuniteErrorKind,
-    read: R,
-    write: W,
-}
-
-impl<R, W> ReuniteError<R, W> {
-    /// Creates an error for halves from different split operations.
-    pub fn mismatched(read: R, write: W) -> Self {
-        Self {
-            kind: ReuniteErrorKind::Mismatched,
-            read,
-            write,
-        }
-    }
-
-    /// Creates an error for matching halves that cannot yet be reunited.
-    pub fn not_quiescent(read: R, write: W) -> Self {
-        Self {
-            kind: ReuniteErrorKind::NotQuiescent,
-            read,
-            write,
-        }
-    }
-
-    /// Returns the reason the reunification attempt failed.
-    pub fn kind(&self) -> ReuniteErrorKind {
-        self.kind
-    }
-
-    /// Borrows the preserved read and write halves.
-    pub fn halves(&self) -> (&R, &W) {
-        (&self.read, &self.write)
-    }
-
-    /// Consumes the error and returns the preserved read and write halves.
-    pub fn into_halves(self) -> (R, W) {
-        (self.read, self.write)
-    }
-}
-
-impl<R, W> fmt::Display for ReuniteError<R, W> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "cannot reunite owned halves: {}", self.kind)
-    }
-}
-
-impl<R: fmt::Debug, W: fmt::Debug> std::error::Error for ReuniteError<R, W> {}
-
 // `Socket` is crate-internal, so this convenience method is available only
-// for Karmaio stream types. Generic transports use [`ReuniteOwned::reunite`]
-// instead.
+// for Karmaio stream types. Generic transports use
+// [`ReuniteOwned::reunite`](crate::io::ReuniteOwned::reunite) instead.
 #[allow(private_bounds)]
 impl<T: From<Socket>> OwnedReadHalf<T> {
     /// Attempts to put the two halves of a stream back together, recovering
     /// the original stream value.
     ///
     /// Succeeds only if both halves originated from the same
-    /// [`IntoOwnedSplit::into_split`] call and no detached in-flight
+    /// [`IntoOwnedSplit::into_split`](crate::io::IntoOwnedSplit::into_split)
+    /// call and no detached in-flight
     /// operation still owns the socket. On failure, both halves are returned
     /// unchanged and remain usable.
     pub fn reunite(self, other: OwnedWriteHalf<T>) -> Result<T, ReuniteError<OwnedReadHalf<T>, OwnedWriteHalf<T>>> {

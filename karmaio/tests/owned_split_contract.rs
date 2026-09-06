@@ -4,8 +4,7 @@
 
 use karmaio::{
     buf::{BufResult, IoBuf, IoBufMut},
-    io::{AsyncRead, AsyncWrite},
-    net::split::{IntoOwnedSplit, ReuniteError, ReuniteErrorKind, ReuniteOwned},
+    io::{AsyncRead, AsyncWrite, IntoOwnedSplit, ReuniteError, ReuniteErrorKind, ReuniteOwned},
 };
 
 #[derive(Debug, PartialEq, Eq)]
@@ -58,9 +57,10 @@ impl IntoOwnedSplit for SplitOnlyDuplex {
 }
 
 impl ReuniteOwned for TestDuplex {
-    type ReuniteError = ReuniteError<Self::ReadHalf, Self::WriteHalf>;
-
-    fn reunite(read: Self::ReadHalf, write: Self::WriteHalf) -> Result<Self, Self::ReuniteError> {
+    fn reunite(
+        read: Self::ReadHalf,
+        write: Self::WriteHalf,
+    ) -> Result<Self, ReuniteError<Self::ReadHalf, Self::WriteHalf>> {
         if read.0 == write.0 {
             Ok(Self(read.0))
         } else {
@@ -73,7 +73,10 @@ fn split_generic<S: IntoOwnedSplit>(stream: S) -> (S::ReadHalf, S::WriteHalf) {
     stream.into_split()
 }
 
-fn reunite_generic<S: ReuniteOwned>(read: S::ReadHalf, write: S::WriteHalf) -> Result<S, S::ReuniteError> {
+fn reunite_generic<S: ReuniteOwned>(
+    read: S::ReadHalf,
+    write: S::WriteHalf,
+) -> Result<S, ReuniteError<S::ReadHalf, S::WriteHalf>> {
     S::reunite(read, write)
 }
 

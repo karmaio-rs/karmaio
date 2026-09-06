@@ -32,6 +32,7 @@ cargo run --example <example_name>
 | **udp_client** | UDP client; pairs with `udp_echo`. |
 | **tls_server** | Rustls TLS echo server with explicit provider, DER identity, and ALPN. |
 | **tls_client** | Certificate-verifying Rustls TLS client with SNI and ALPN. |
+| **tls_split_client** | TLS client using independently progressing owned halves, with reads in a local task. |
 
 ### Tasks & runtime
 
@@ -82,6 +83,10 @@ cargo run --example tls_server -- \
   ../karmaio/tests/fixtures/tls/localhost.der \
   ../karmaio/tests/fixtures/tls/localhost-key.der
 cargo run --example tls_client -- \
+  ../karmaio/tests/fixtures/tls/ca.der
+
+# Use tls_split_client instead to exercise completion-native owned halves.
+cargo run --example tls_split_client -- \
   ../karmaio/tests/fixtures/tls/ca.der
 ```
 

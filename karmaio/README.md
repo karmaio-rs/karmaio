@@ -55,7 +55,7 @@ TLS does not imply `net` or `bytes`.
 Applications own verification policy. Supply an `Arc<ClientConfig>` or `Arc<ServerConfig>` with an explicit cryptographic provider, trust roots,
 identity, SNI, and ALPN policy. Karmaio does not install a global provider, discover roots, or offer an insecure verifier.
 
-TLS streams preserve the completion model and add no `Send` requirement. They are deliberately not splittable because reads may need to write protocol messages.
+TLS streams preserve the completion model and add no `Send` requirement. When the transport implements `IntoOwnedSplit`, client and server TLS streams produce independently progressing owned halves without an async mutex. Split reads leave protocol-generated output for the next write, flush, or shutdown; matching halves can be reunited when the transport implements `ReuniteOwned`.
 Vectored I/O operates directly on caller components, and successful scalar and vectored writes are write-through. Adapter-owned ciphertext buffers have fixed capacity, while Rustls retains its default internal buffering policy.
 Graceful shutdown sends `close_notify`.
 A raw transport EOF without peer `close_notify` is reported as `UnexpectedEof` after buffered plaintext is delivered. `into_parts` is abrupt, performs no TLS or transport shutdown, and refuses to extract state after either direction fails.
@@ -63,7 +63,8 @@ A raw transport EOF without peer `close_notify` is reported as `UnexpectedEof` a
 Cancellation scopes propagate to the underlying operation and return caller buffers through `BufResult`.
 For established I/O, request cancellation and await the same future instead of dropping a timed-out future when buffer recovery matters.
 If an established I/O future is dropped in flight, later stream operations fail closed because transport progress is ambiguous.
-See the workspace `tls_client` and `tls_server` examples.
+Dropping a split write half without calling `shutdown` is an abrupt TLS close.
+See the workspace `tls_client`, `tls_split_client`, and `tls_server` examples.
 
 ## Linux multishot I/O (6.12+)
 

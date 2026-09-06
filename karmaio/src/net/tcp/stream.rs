@@ -10,10 +10,8 @@ use crate::{
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
-    io::{AsyncRead, AsyncWrite},
-    net::split::{
-        IntoOwnedSplit, OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, ReuniteOwned, WriteHalf, split,
-    },
+    io::{AsyncRead, AsyncWrite, IntoOwnedSplit, ReuniteError, ReuniteOwned},
+    net::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf, split},
 };
 
 #[cfg(windows)]
@@ -307,9 +305,10 @@ impl IntoOwnedSplit for TcpStream {
 }
 
 impl ReuniteOwned for TcpStream {
-    type ReuniteError = ReuniteError<OwnedReadHalf<Self>, OwnedWriteHalf<Self>>;
-
-    fn reunite(read: Self::ReadHalf, write: Self::WriteHalf) -> Result<Self, Self::ReuniteError> {
+    fn reunite(
+        read: Self::ReadHalf,
+        write: Self::WriteHalf,
+    ) -> Result<Self, ReuniteError<Self::ReadHalf, Self::WriteHalf>> {
         read.reunite(write)
     }
 }

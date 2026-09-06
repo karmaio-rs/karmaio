@@ -10,10 +10,8 @@ use crate::{
 use crate::{
     buf::{BufResult, IoBuf, IoBufMut, IoVectoredBuf, IoVectoredBufMut},
     driver::helpers::socket::Socket,
-    io::{AsyncRead, AsyncWrite},
-    net::split::{
-        IntoOwnedSplit, OwnedReadHalf, OwnedWriteHalf, ReadHalf, ReuniteError, ReuniteOwned, WriteHalf, split,
-    },
+    io::{AsyncRead, AsyncWrite, IntoOwnedSplit, ReuniteError, ReuniteOwned},
+    net::split::{OwnedReadHalf, OwnedWriteHalf, ReadHalf, WriteHalf, split},
 };
 
 /// A Unix stream connected to a remote Unix domain socket endpoint.
@@ -235,9 +233,10 @@ impl IntoOwnedSplit for UnixStream {
 }
 
 impl ReuniteOwned for UnixStream {
-    type ReuniteError = ReuniteError<OwnedReadHalf<Self>, OwnedWriteHalf<Self>>;
-
-    fn reunite(read: Self::ReadHalf, write: Self::WriteHalf) -> Result<Self, Self::ReuniteError> {
+    fn reunite(
+        read: Self::ReadHalf,
+        write: Self::WriteHalf,
+    ) -> Result<Self, ReuniteError<Self::ReadHalf, Self::WriteHalf>> {
         read.reunite(write)
     }
 }

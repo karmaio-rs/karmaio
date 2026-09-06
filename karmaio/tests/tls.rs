@@ -12,7 +12,9 @@ use std::task::Poll;
 
 use karmaio::Runtime;
 use karmaio::buf::{BufResult, IoBuf, IoBufMut, Slice};
-use karmaio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use karmaio::io::{
+    AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, IntoOwnedSplit, ReuniteError, ReuniteErrorKind, ReuniteOwned,
+};
 use karmaio::tls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use karmaio::tls::rustls::{
     ClientConfig, ClientConnection, Connection, HandshakeKind, ProtocolVersion, RootCertStore, ServerConfig,
@@ -76,6 +78,7 @@ struct ScriptState {
     peer_closed: bool,
     input_allocation: Option<usize>,
     output_allocation: Option<usize>,
+    reunite_ready: bool,
 }
 
 impl ScriptState {
@@ -159,6 +162,10 @@ impl ScriptHandle {
     fn take_plaintext(&self) -> Vec<u8> {
         std::mem::take(&mut self.0.borrow_mut().plaintext)
     }
+
+    fn set_reunite_ready(&self, ready: bool) {
+        self.0.borrow_mut().reunite_ready = ready;
+    }
 }
 
 struct ScriptedTransport {
@@ -188,6 +195,7 @@ impl ScriptedTransport {
             peer_closed: false,
             input_allocation: None,
             output_allocation: None,
+            reunite_ready: true,
         }));
         (Self { state: state.clone() }, ScriptHandle(state))
     }
@@ -203,6 +211,33 @@ impl ScriptedTransport {
     fn server(config: Arc<ServerConfig>, read_limit: usize, write_limit: usize) -> (Self, ScriptHandle) {
         let peer = ServerConnection::new(config).unwrap();
         Self::new(Connection::Server(peer), read_limit, write_limit)
+    }
+}
+
+impl IntoOwnedSplit for ScriptedTransport {
+    type ReadHalf = Self;
+    type WriteHalf = Self;
+
+    fn into_split(self) -> (Self::ReadHalf, Self::WriteHalf) {
+        let read = Self {
+            state: Rc::clone(&self.state),
+        };
+        (read, self)
+    }
+}
+
+impl ReuniteOwned for ScriptedTransport {
+    fn reunite(
+        read: Self::ReadHalf,
+        write: Self::WriteHalf,
+    ) -> Result<Self, ReuniteError<Self::ReadHalf, Self::WriteHalf>> {
+        if !Rc::ptr_eq(&read.state, &write.state) {
+            return Err(ReuniteError::mismatched(read, write));
+        }
+        if !read.state.borrow().reunite_ready {
+            return Err(ReuniteError::not_quiescent(read, write));
+        }
+        Ok(read)
     }
 }
 
@@ -316,6 +351,339 @@ async fn poll_pending_once<F: Future>(mut future: Pin<&mut F>) {
         Poll::Ready(_) => panic!("operation unexpectedly completed"),
     })
     .await;
+}
+
+#[test]
+fn client_owned_write_progresses_while_read_is_pending() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        handle.0.borrow_mut().pending_read = true;
+
+        let read_operation = read.read(Vec::with_capacity(32));
+        let mut read_operation = std::pin::pin!(read_operation);
+        poll_pending_once(read_operation.as_mut()).await;
+
+        let BufResult(result, payload) = write.write(b"independent client write".to_vec()).await;
+        assert_eq!(result.unwrap(), payload.len());
+        assert_eq!(handle.take_plaintext(), payload);
+    });
+}
+
+#[test]
+fn matching_client_halves_reunite_repeatedly() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (read, write) = stream.into_split();
+        assert!(read.is_pair_of(&write));
+        assert!(write.is_pair_of(&read));
+
+        let stream = read.reunite(write).unwrap();
+        let (read, write) = stream.into_split();
+        let mut stream = write.reunite(read).unwrap();
+        let BufResult(result, _) = stream.write(b"after repeated reunion".to_vec()).await;
+        assert_eq!(result.unwrap(), 22);
+        assert_eq!(handle.take_plaintext(), b"after repeated reunion");
+    });
+}
+
+#[test]
+fn mismatched_client_halves_are_recoverable() {
+    let (client, server) = configs();
+    let (first_transport, _first_handle) = ScriptedTransport::server(Arc::clone(&server), 64, 64);
+    let (second_transport, _second_handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let first_name = ServerName::try_from("localhost").unwrap();
+        let first = TlsConnector::new(Arc::clone(&client))
+            .connect(first_name, first_transport)
+            .await
+            .unwrap();
+        let second_name = ServerName::try_from("localhost").unwrap();
+        let second = TlsConnector::new(client)
+            .connect(second_name, second_transport)
+            .await
+            .unwrap();
+        let (first_read, first_write) = first.into_split();
+        let (second_read, second_write) = second.into_split();
+
+        let error = first_read.reunite(second_write).unwrap_err();
+        assert_eq!(error.kind(), ReuniteErrorKind::Mismatched);
+        let (first_read, second_write) = error.into_halves();
+        first_read.reunite(first_write).unwrap();
+        second_read.reunite(second_write).unwrap();
+    });
+}
+
+#[test]
+fn transport_not_quiescent_reunion_preserves_tls_halves() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (read, write) = stream.into_split();
+        handle.set_reunite_ready(false);
+
+        let error = read.reunite(write).unwrap_err();
+        assert_eq!(error.kind(), ReuniteErrorKind::NotQuiescent);
+        let (read, write) = error.into_halves();
+
+        handle.set_reunite_ready(true);
+        read.reunite(write).unwrap();
+    });
+}
+
+#[test]
+fn split_vectored_io_preserves_buffers_across_fragmented_transport() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 3, 5);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+
+        let outbound = [b"split ".to_vec(), b"vectored ".to_vec(), b"write".to_vec()];
+        let pointers = outbound.each_ref().map(|buffer| buffer.as_ptr());
+        let BufResult(result, outbound) = write.write_vectored(outbound).await;
+        assert_eq!(result.unwrap(), 20);
+        assert_eq!(outbound.each_ref().map(|buffer| buffer.as_ptr()), pointers);
+        assert_eq!(handle.take_plaintext(), b"split vectored write");
+
+        handle.send_plaintext(b"split vectored read");
+        let inbound = [Vec::with_capacity(2), Vec::with_capacity(7), Vec::with_capacity(32)];
+        let pointers = inbound.each_ref().map(|buffer| buffer.as_ptr());
+        let BufResult(result, inbound) = read.read_vectored(inbound).await;
+        assert_eq!(result.unwrap(), 19);
+        assert_eq!(inbound.each_ref().map(|buffer| buffer.as_ptr()), pointers);
+        assert_eq!(inbound.each_ref().map(Vec::len), [2, 7, 10]);
+        assert_eq!(
+            inbound.iter().flatten().copied().collect::<Vec<_>>(),
+            b"split vectored read"
+        );
+    });
+}
+
+#[test]
+fn split_close_and_half_drop_lifecycle_is_directional() {
+    let (client, server) = configs();
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let connect = |server| {
+            let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+            let name = ServerName::try_from("localhost").unwrap();
+            (transport, handle, name)
+        };
+
+        let (transport, handle, name) = connect(Arc::clone(&server));
+        let stream = TlsConnector::new(Arc::clone(&client))
+            .connect(name, transport)
+            .await
+            .unwrap();
+        handle.send_plaintext(b"final response");
+        handle.close_cleanly();
+        let (mut read, mut write) = stream.into_split();
+        write.shutdown().await.unwrap();
+        assert!(handle.0.borrow().peer_closed);
+        assert_eq!(handle.0.borrow().shutdown_calls, 1);
+        let BufResult(result, plaintext) = read.read(Vec::with_capacity(32)).await;
+        assert_eq!(result.unwrap(), 14);
+        assert_eq!(plaintext, b"final response");
+        let BufResult(result, _) = read.read(Vec::with_capacity(1)).await;
+        assert_eq!(result.unwrap(), 0);
+
+        let (transport, handle, name) = connect(Arc::clone(&server));
+        let stream = TlsConnector::new(Arc::clone(&client))
+            .connect(name, transport)
+            .await
+            .unwrap();
+        let (mut read, mut write) = stream.into_split();
+        handle.set_eof();
+        let BufResult(result, _) = read.read(Vec::with_capacity(1)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        let BufResult(result, _) = write.write(b"write after read EOF".to_vec()).await;
+        assert_eq!(result.unwrap(), 20);
+        assert_eq!(handle.take_plaintext(), b"write after read EOF");
+
+        let (transport, handle, name) = connect(Arc::clone(&server));
+        let stream = TlsConnector::new(Arc::clone(&client))
+            .connect(name, transport)
+            .await
+            .unwrap();
+        let (read, mut write) = stream.into_split();
+        drop(read);
+        let BufResult(result, _) = write.write(b"write-only survivor".to_vec()).await;
+        assert_eq!(result.unwrap(), 19);
+        assert_eq!(handle.take_plaintext(), b"write-only survivor");
+
+        let (transport, handle, name) = connect(server);
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (mut read, write) = stream.into_split();
+        drop(write);
+        handle.send_plaintext(b"read-only survivor");
+        let BufResult(result, plaintext) = read.read(Vec::with_capacity(32)).await;
+        assert_eq!(result.unwrap(), 18);
+        assert_eq!(plaintext, b"read-only survivor");
+    });
+}
+
+#[test]
+fn split_shutdown_remains_closed_after_read_activity() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        handle.0.borrow_mut().peer.refresh_traffic_keys().unwrap();
+        handle.send_plaintext(b"after key update");
+        write.shutdown().await.unwrap();
+
+        let calls_after_shutdown = {
+            let state = handle.0.borrow();
+            (state.write_calls, state.flush_calls, state.shutdown_calls)
+        };
+        let (result, plaintext) = read.read_exact(vec![0; 16]).await.into_parts();
+        result.unwrap();
+        assert_eq!(plaintext, b"after key update");
+
+        let BufResult(result, _) = write.write(vec![1]).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+
+        handle.0.borrow_mut().pending_read = true;
+        let mut pending_read = Box::pin(read.read(Vec::with_capacity(1)));
+        poll_pending_once(pending_read.as_mut()).await;
+        drop(pending_read);
+        let BufResult(result, _) = write.write(vec![1]).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        write.flush().await.unwrap();
+        write.shutdown().await.unwrap();
+
+        let state = handle.0.borrow();
+        assert_eq!(
+            (state.write_calls, state.flush_calls, state.shutdown_calls),
+            calls_after_shutdown
+        );
+    });
+}
+
+#[test]
+fn unsplit_shutdown_remains_closed_after_an_abandoned_read() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let mut stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        stream.shutdown().await.unwrap();
+        let calls_after_shutdown = {
+            let state = handle.0.borrow();
+            (state.write_calls, state.flush_calls, state.shutdown_calls)
+        };
+
+        handle.0.borrow_mut().pending_read = true;
+        let mut pending_read = Box::pin(stream.read(Vec::with_capacity(1)));
+        poll_pending_once(pending_read.as_mut()).await;
+        drop(pending_read);
+
+        let BufResult(result, _) = stream.write(vec![1]).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+        stream.flush().await.unwrap();
+        stream.shutdown().await.unwrap();
+
+        let state = handle.0.borrow();
+        assert_eq!(
+            (state.write_calls, state.flush_calls, state.shutdown_calls),
+            calls_after_shutdown
+        );
+    });
+}
+
+#[test]
+fn abandoned_split_operation_remains_terminal_through_reunion() {
+    let (client, server) = configs();
+    let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (mut read, write) = stream.into_split();
+        handle.0.borrow_mut().pending_read = true;
+        handle.set_reunite_ready(false);
+
+        let mut operation = Box::pin(read.read(Vec::with_capacity(8)));
+        poll_pending_once(operation.as_mut()).await;
+        drop(operation);
+
+        let error = read.reunite(write).unwrap_err();
+        assert_eq!(error.kind(), ReuniteErrorKind::NotQuiescent);
+        let (read, write) = error.into_halves();
+        handle.set_reunite_ready(true);
+        let mut stream = read.reunite(write).unwrap();
+
+        let BufResult(result, _) = stream.read(Vec::with_capacity(1)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+        let BufResult(result, _) = stream.write(vec![1]).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Other);
+    });
+}
+
+#[test]
+fn split_transport_failures_follow_directional_sticky_policy() {
+    let (client, server) = configs();
+    let mut runtime = Runtime::new().unwrap();
+
+    runtime.block_on(async {
+        let (transport, handle) = ScriptedTransport::server(Arc::clone(&server), 64, 64);
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(Arc::clone(&client))
+            .connect(name, transport)
+            .await
+            .unwrap();
+        let (mut read, mut write) = stream.into_split();
+        handle.0.borrow_mut().read_error = Some(io::ErrorKind::ConnectionReset);
+
+        let BufResult(result, _) = read.read(Vec::with_capacity(8)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+        let BufResult(result, _) = read.read(Vec::with_capacity(8)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionReset);
+        let BufResult(result, _) = write.write(b"survives read failure".to_vec()).await;
+        assert_eq!(result.unwrap(), 21);
+        assert_eq!(handle.take_plaintext(), b"survives read failure");
+
+        let (transport, handle) = ScriptedTransport::server(server, 64, 64);
+        let name = ServerName::try_from("localhost").unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let (mut read, mut write) = stream.into_split();
+        handle.0.borrow_mut().write_error = Some(io::ErrorKind::ConnectionAborted);
+
+        let BufResult(result, _) = write.write(b"ambiguous".to_vec()).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        let BufResult(result, _) = write.write(vec![1]).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+        let BufResult(result, _) = read.read(Vec::with_capacity(1)).await;
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::ConnectionAborted);
+    });
 }
 
 #[test]
@@ -590,11 +958,16 @@ fn tls12_handshake_and_payload_succeed_when_enabled() {
 
     runtime.block_on(async {
         let name = ServerName::try_from("localhost").unwrap();
-        let mut stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
+        let stream = TlsConnector::new(client).connect(name, transport).await.unwrap();
         assert_eq!(stream.get_ref().1.protocol_version(), Some(ProtocolVersion::TLSv1_2));
-        let BufResult(result, _) = stream.write(b"tls12".to_vec()).await;
+        let (mut read, mut write) = stream.into_split();
+        let BufResult(result, _) = write.write(b"tls12".to_vec()).await;
         assert_eq!(result.unwrap(), 5);
         assert_eq!(handle.take_plaintext(), b"tls12");
+        handle.send_plaintext(b"response");
+        let BufResult(result, plaintext) = read.read(Vec::with_capacity(16)).await;
+        assert_eq!(result.unwrap(), 8);
+        assert_eq!(plaintext, b"response");
     });
 }
 

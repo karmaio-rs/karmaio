@@ -94,6 +94,11 @@ path = "tls_client.rs"
 required-features = ["macros", "net", "tls"]
 
 [[example]]
+name = "tls_split_client"
+path = "tls_split_client.rs"
+required-features = ["macros", "net", "tls"]
+
+[[example]]
 name = "tls_server"
 path = "tls_server.rs"
 required-features = ["macros", "net", "tls"]

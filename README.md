@@ -45,10 +45,12 @@ The convenience feature does not itself imply `net` or `bytes`; advanced users c
 Callers provide fully configured Rustls client or server configurations, including roots, identity, SNI, and ALPN policy.
 Karmaio does not mutate Rustls's global provider.
 
-TLS streams are intentionally not splittable. Vectored reads fill caller components in order; scalar and vectored writes are bounded and write-through.
+TLS streams support completion-native owned splitting whenever their transport implements `IntoOwnedSplit`. The halves make independent transport progress without an async mutex: split reads decrypt input and leave any Rustls control output for the next write, flush, or shutdown. Matching halves can be recovered through `ReuniteOwned` when the transport supports reunion.
+Vectored reads fill caller components in order; scalar and vectored writes are bounded and write-through. Rustls retains its default internal buffering policy.
 Shutdown sends `close_notify`, and a transport EOF without the peer's `close_notify` is surfaced as `UnexpectedEof`.
 Cancellation returns the original caller-owned buffer and conservatively poisons the stream when wire progress may be ambiguous.
 Dropping an established I/O future while it awaits the transport also makes later operations fail closed. See the `tls_client` and `tls_server` examples.
+Dropping a split write half without calling `shutdown` is an abrupt TLS close. See the `tls_split_client` example for concurrent use from local tasks.
 `into_parts` performs no shutdown and refuses to extract state after either direction fails.
 
 See the [crate documentation](https://docs.rs/karmaio), the [examples](https://github.com/karmaio-rs/karmaio/tree/main/examples), and the [changelog](CHANGELOG.md) for more details.

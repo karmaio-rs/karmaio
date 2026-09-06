@@ -7,6 +7,14 @@ During the `0.1.0` alpha series, APIs and behavior may change between prerelease
 
 ## [Unreleased]
 
+### Added
+
+- Added completion-native owned splitting for TLS streams with role-specific read and write halves.
+
+### Changed
+
+- Moved the transport-neutral `ReuniteOwned`, `ReuniteError`, and `ReuniteErrorKind` API to `karmaio::io`
+
 ## [0.1.0-alpha.4] - 2026-09-05
 
 ### Added
